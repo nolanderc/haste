@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/*", "examples/*"]
+
+# Build dependencies with optimizations
+[profile.dev.package."*"]
+opt-level = 2

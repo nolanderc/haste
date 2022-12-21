@@ -2,6 +2,7 @@ use non_max::NonMaxU32;
 
 mod arena;
 pub mod interner;
+pub mod query_cache;
 mod shard_map;
 
 pub use haste_macros::*;
@@ -23,6 +24,10 @@ pub struct Id {
 impl Id {
     pub(crate) fn new(raw: NonMaxU32) -> Self {
         Self { raw }
+    }
+
+    pub(crate) fn try_from_usize(index: usize) -> Option<Self> {
+        Some(Self::new(NonMaxU32::new(u32::try_from(index).ok()?)?))
     }
 }
 

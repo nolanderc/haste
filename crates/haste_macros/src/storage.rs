@@ -5,15 +5,22 @@ use syn::spanned::Spanned;
 use crate::meta::ArgumentOptions;
 
 pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
-    let args = crate::meta::parse_args(
-        meta,
+    if !meta.is_empty() {
+        return Err(syn::Error::new(
+            meta.span(),
+            "unexpected attribute arguments",
+        ));
+    }
+
+    let mut strukt = syn::parse2::<syn::ItemStruct>(input)?;
+
+    let args = crate::meta::extract_attrs(
+        &mut strukt.attrs,
         ArgumentOptions {
             db: true,
             ..Default::default()
         },
     )?;
-
-    let mut strukt = syn::parse2::<syn::ItemStruct>(input)?;
 
     if !strukt.generics.params.is_empty() {
         return Err(syn::Error::new(

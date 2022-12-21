@@ -1,41 +1,86 @@
+use quote::format_ident;
 use syn::spanned::Spanned;
 
-pub struct Field<'a> {
+pub struct FieldInfo<'a> {
+    pub arguments: FieldArguments,
     pub index: syn::Index,
+    pub vis: &'a syn::Visibility,
     pub member: syn::Member,
     pub ty: &'a syn::Type,
 }
 
-pub fn field_info(fields: &syn::Fields) -> syn::Result<Vec<Field>> {
-    let mut info = Vec::with_capacity(fields.len());
+#[derive(Default)]
+pub struct FieldArguments {
+    pub clone: bool,
+}
 
-    match fields {
-        syn::Fields::Unnamed(_) if fields.len() != 1 => {
-            return Err(syn::Error::new(
-                fields.span(),
-                "may only have a single unnamed field",
-            ))
+impl<'a> FieldInfo<'a> {
+    pub fn getter(&self) -> syn::Ident {
+        match &self.member {
+            syn::Member::Named(ident) => ident.clone(),
+            syn::Member::Unnamed(index) => {
+                if index.index == 0 {
+                    format_ident!("get", span = index.span)
+                } else {
+                    format_ident!("get_{}", index.index, span = index.span)
+                }
+            }
         }
-        _ => {}
     }
 
-    for (index, field) in fields.iter().enumerate() {
-        let index = syn::Index {
-            index: index as _,
-            span: field.span(),
-        };
+    pub fn extract(fields: &mut syn::Fields) -> syn::Result<Vec<FieldInfo>> {
+        let mut info = Vec::with_capacity(fields.len());
 
-        let member = match &field.ident {
-            Some(ident) => syn::Member::Named(ident.clone()),
-            None => syn::Member::Unnamed(index.clone()),
-        };
+        match fields {
+            syn::Fields::Unnamed(_) if fields.len() != 1 => {
+                return Err(syn::Error::new(
+                    fields.span(),
+                    "may only have a single unnamed field",
+                ))
+            }
+            _ => {}
+        }
 
-        info.push(Field {
-            index,
-            member,
-            ty: &field.ty,
-        });
+        for (index, field) in fields.iter_mut().enumerate() {
+            let span = match &field.ident {
+                Some(ident) => ident.span(),
+                None => field.ty.span(),
+            };
+
+            let index = syn::Index {
+                index: index as _,
+                span,
+            };
+
+            let member = match &field.ident {
+                Some(ident) => syn::Member::Named(ident.clone()),
+                None => syn::Member::Unnamed(index.clone()),
+            };
+
+            let arguments = FieldArguments::from_attrs(&mut field.attrs)?;
+
+            info.push(FieldInfo {
+                arguments,
+                index,
+                vis: &field.vis,
+                member,
+                ty: &field.ty,
+            });
+        }
+
+        Ok(info)
     }
+}
 
-    Ok(info)
+impl FieldArguments {
+    fn from_attrs(attrs: &mut Vec<syn::Attribute>) -> syn::Result<Self> {
+        let mut args = Self::default();
+        let mut parser = crate::meta::AttrParser::default();
+
+        parser.expect_flag("clone", |enable| args.clone = enable);
+
+        parser.parse(attrs)?;
+
+        Ok(args)
+    }
 }

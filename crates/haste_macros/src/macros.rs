@@ -5,6 +5,7 @@ extern crate proc_macro;
 mod common;
 mod intern;
 mod meta;
+mod query;
 mod storage;
 
 #[proc_macro_attribute]
@@ -15,6 +16,11 @@ pub fn storage(meta: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn intern(meta: TokenStream, input: TokenStream) -> TokenStream {
     attribute_macro_handler(intern::intern_impl, meta.into(), input.into()).into()
+}
+
+#[proc_macro_attribute]
+pub fn query(meta: TokenStream, input: TokenStream) -> TokenStream {
+    attribute_macro_handler(query::query_impl, meta.into(), input.into()).into()
 }
 
 fn attribute_macro_handler(

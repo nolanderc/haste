@@ -1,5 +1,3 @@
-use haste::{DatabaseExt, Query};
-
 pub trait Db: haste::Database + haste::HasStorage<Storage> {}
 
 #[derive(Default)]
@@ -29,7 +27,7 @@ impl haste::HasStorage<Storage> for Database {
 
 #[haste::storage]
 #[derive(Default)]
-pub struct Storage(Text, Fib, Person);
+pub struct Storage(Text, fib, Person, fact);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,36 +42,19 @@ struct PersonData {
     age: u32,
 }
 
-struct Fib;
-
-impl haste::Ingredient for Fib {
-    type Container = haste::query_cache::HashQueryCache<Self>;
-
-    type Storage = crate::Storage;
-
-    type Database = dyn crate::Db;
-}
-
-impl haste::Query for Fib {
-    type Input = u64;
-
-    type Output = u64;
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn execute(db: &Self::Database, input: Self::Input) -> Self::Output {
-        if input < 2 {
-            return input;
-        }
-        db.execute_cached::<Fib>(input - 1) + db.execute_cached::<Fib>(input - 2)
+#[haste::query]
+fn fib(db: &dyn crate::Db, n: u64) -> u64 {
+    if n < 2 {
+        return n;
     }
+    fib(db, n - 1) + fib(db, n - 2)
 }
 
 fn main() {
     let db = Database::default();
 
-    for i in 0..30 {
-        let result = Fib::execute(&db, i);
-        eprintln!("fib {} = {}", i, result);
+    for i in 0..10 {
+        eprintln!("fib {} = {}", i, fib(&db, i));
     }
 
     let a = Text::new(&db, TextData("hello".into()));
@@ -88,4 +69,12 @@ fn main() {
     assert_eq!(person.age(&db), 37);
 
     eprintln!("done");
+}
+
+#[haste::query]
+fn fact(db: &dyn crate::Db, n: u64) -> u64 {
+    if n == 0 {
+        return 1;
+    }
+    fact(db, n - 1) * n
 }

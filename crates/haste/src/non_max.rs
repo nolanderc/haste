@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 /// A `u32` with the inveriant that it can never be `u32::MAX`.
 ///
 /// This is similar to a [`NonZeroU32`] in that it uses a specific bit-pattern for
-/// niche-optimizations. That is, this type guarantees that 
+/// niche-optimizations. That is, this type guarantees that
 ///
 /// ```
 /// # use std::mem::size_of;
@@ -43,6 +43,11 @@ impl std::fmt::Display for NonMaxU32 {
 }
 
 impl NonMaxU32 {
+    pub const ZERO: Self = match Self::new(0) {
+        Some(value) => value,
+        None => unreachable!(),
+    };
+
     pub const fn new(value: u32) -> Option<Self> {
         match NonZeroU32::new(!value) {
             None => None,

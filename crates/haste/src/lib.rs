@@ -1,16 +1,18 @@
-use non_max::NonMaxU32;
-
 mod arena;
 pub mod interner;
 pub mod query_cache;
+mod runtime;
 mod shard_map;
+mod storage;
 
 pub use haste_macros::*;
+pub use query_cache::*;
+pub use runtime::*;
+pub use storage::*;
 
 pub mod non_max;
 
-#[derive(Default)]
-pub struct Runtime {}
+use non_max::NonMaxU32;
 
 /// A generic value that uniquely identifies a resource within some ingredient.
 ///
@@ -37,12 +39,6 @@ pub trait Database {
     fn runtime(&self) -> &Runtime;
 }
 
-/// Stores the containers for all ingredients in a database.
-pub trait Storage {
-    /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
-    type DynDatabase: Database + ?Sized;
-}
-
 /// Implemented by databases which contain a specific type of storage.
 pub trait HasStorage<S: Storage>: Database {
     fn storage(&self) -> &S;
@@ -51,7 +47,7 @@ pub trait HasStorage<S: Storage>: Database {
 
 pub trait Ingredient {
     /// Type which contains all information required by the ingredient.
-    type Container;
+    type Container: Container;
 
     /// The storage within which this ingredient exists.
     type Storage: Storage<DynDatabase = Self::Database> + HasIngredient<Self>;
@@ -72,10 +68,6 @@ pub trait Query: Ingredient {
     fn execute(db: &Self::Database, input: Self::Input) -> Self::Output;
 }
 
-pub trait QueryCache<Q: Query> {
-    fn get_or_execute<'a>(&'a self, db: &Q::Database, input: Q::Input) -> &'a Q::Output;
-}
-
 pub trait Intern: Ingredient {
     type Value: Eq + std::hash::Hash;
 
@@ -89,10 +81,12 @@ pub trait Interner<T> {
         Self: 'a;
 
     fn intern(&self, value: T) -> Id;
-    fn get(&self, id: Id) -> Self::Value<'_>;
+    fn get(&self, id: Id, runtime: &Runtime) -> Self::Value<'_>;
 }
 
-/// Extends databases with methods for working with [`Ingredient`]s
+/// Extends databases with generic methods for working with [`Ingredient`]s.
+///
+/// These cannot be included directly in [`Database`] as these methods are not object safe.
 pub trait DatabaseExt: Database {
     fn intern<T>(&self, value: T::Value) -> T
     where
@@ -119,7 +113,7 @@ pub trait DatabaseExt: Database {
         let id = interned.id();
         let storage = self.storage();
         let interner = storage.container();
-        interner.get(id)
+        interner.get(id, self.runtime())
     }
 
     fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> &'db Q::Output

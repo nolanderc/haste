@@ -9,9 +9,15 @@ mod memory;
 
 pub struct RawArena<T> {
     ptr: NonNull<T>,
-    len: AtomicUsize,
+    reserved: AtomicUsize,
     committed: AtomicUsize,
     capacity: usize,
+}
+
+impl<T> Default for RawArena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> RawArena<T> {
@@ -29,7 +35,7 @@ impl<T> RawArena<T> {
         );
         Self {
             ptr: ptr.cast(),
-            len: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
             capacity,
         }
@@ -40,7 +46,7 @@ impl<T> RawArena<T> {
     /// # Safety
     ///
     /// The caller must ensure that the given offset lies within the allocated memory region.
-    unsafe fn ptr(&self, offset: usize) -> *mut T {
+    pub unsafe fn get_raw(&self, offset: usize) -> *mut T {
         self.ptr.as_ptr().add(offset)
     }
 
@@ -51,19 +57,12 @@ impl<T> RawArena<T> {
     /// The caller must ensure that the given index lies within the allocated memory region and
     /// that it is properly initialized.
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
-        &*self.ptr(index)
+        &*self.get_raw(index)
     }
 
-    pub fn get(&self, index: usize) -> Option<&T> {
-        if index >= self.len.load(Ordering::Relaxed)
-            || index >= self.committed.load(Ordering::Relaxed)
-        {
-            return None;
-        }
-
-        // SAFETY: we just checked that the value is within bounds, and we only push
-        // zero-initialized values to the
-        unsafe { Some(&*self.ptr.as_ptr().add(index)) }
+    /// Returns `true` if the `index` has been allocated
+    fn is_allocated(&self, index: usize) -> bool {
+        index < self.committed.load(Ordering::Relaxed)
     }
 }
 
@@ -71,23 +70,35 @@ impl<T> RawArena<T>
 where
     T: bytemuck::Zeroable,
 {
+    /// Get a reference to the value at the given index. Returns `None` if the index has not yet
+    /// been allocated.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if self.is_allocated(index) {
+            // SAFETY: since we only allow values that have been initialized to zero, they are
+            // implicitly initialized as long they have been allocated.
+            unsafe { Some(self.get_unchecked(index)) }
+        } else {
+            None
+        }
+    }
+
     /// Get an index into the arena to a region of zero-initialized memory.
     pub fn reserve_zeroed(&self, count: usize) -> usize {
-        let offset = self.len.fetch_add(count, Ordering::Relaxed);
-        let new_len = offset + count;
+        let offset = self.reserved.fetch_add(count, Ordering::Relaxed);
+        let new_reserved = offset + count;
 
-        if new_len > self.capacity {
+        if new_reserved > self.capacity {
             panic!("out of memory");
         }
 
         let old_committed = self.committed.load(Ordering::Relaxed);
         if offset + count > old_committed {
-            let new = (2 * old_committed).clamp(new_len, self.capacity);
+            let new = (2 * old_committed).clamp(new_reserved, self.capacity);
 
             // SAFETY: we know that `new` is in the range `[0, self.capacity]`. Thus `old_ptr` will
             // also lie within the reserved memory range, and we can safely commit it.
             unsafe {
-                let old_ptr = self.ptr(old_committed).cast();
+                let old_ptr = self.get_raw(old_committed).cast();
                 let committed_bytes = (new - old_committed) * std::mem::size_of::<T>();
                 memory::commit(old_ptr, committed_bytes);
             }

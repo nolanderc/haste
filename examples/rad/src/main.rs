@@ -3,7 +3,7 @@ pub trait Db: haste::Database + haste::HasStorage<Storage> {}
 #[derive(Default)]
 pub struct Database {
     runtime: haste::Runtime,
-    storage: Storage,
+    storage: haste::DatabaseStorage<Self>,
 }
 
 impl haste::Database for Database {
@@ -13,10 +13,15 @@ impl haste::Database for Database {
 }
 
 impl Db for Database {}
+
+impl haste::HasStorages for Database {
+    type StorageList = (Storage,);
+}
+
 impl haste::HasStorage<Storage> for Database {
     #[inline(always)]
     fn storage(&self) -> &Storage {
-        &self.storage
+        &self.storage.list().0
     }
 
     #[inline(always)]
@@ -26,8 +31,7 @@ impl haste::HasStorage<Storage> for Database {
 }
 
 #[haste::storage]
-#[derive(Default)]
-pub struct Storage(Text, fib, Person, fact);
+pub struct Storage(Text, fib, Person);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -69,12 +73,4 @@ fn main() {
     assert_eq!(person.age(&db), 37);
 
     eprintln!("done");
-}
-
-#[haste::query]
-fn fact(db: &dyn crate::Db, n: u64) -> u64 {
-    if n == 0 {
-        return 1;
-    }
-    fact(db, n - 1) * n
 }

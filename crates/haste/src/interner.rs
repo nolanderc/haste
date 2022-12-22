@@ -4,29 +4,18 @@ use crate::{
     arena::Arena,
     non_max::NonMaxU32,
     shard_map::{Entry, ShardMap},
+    Dependency, IngredientId, Runtime,
 };
 
 use std::hash::Hash;
 
 pub struct ArenaInterner<T> {
+    id: IngredientId,
     values: Arena<T>,
     entries: ShardMap<NonMaxU32, ()>,
 }
 
-impl<T> Default for ArenaInterner<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T> ArenaInterner<T> {
-    pub fn new() -> Self {
-        Self {
-            values: Arena::new(),
-            entries: ShardMap::new(),
-        }
-    }
-
     fn eq_fn<'a>(&'a self, value: &'a T) -> impl Fn(&Entry<NonMaxU32, ()>) -> bool + 'a
     where
         T: Eq,
@@ -80,6 +69,20 @@ impl<T> ArenaInterner<T> {
     }
 }
 
+impl<T> crate::Container for ArenaInterner<T> {
+    fn new(id: IngredientId) -> Self {
+        Self {
+            id,
+            values: Arena::new(),
+            entries: ShardMap::new(),
+        }
+    }
+
+    fn id(&self) -> IngredientId {
+        self.id
+    }
+}
+
 impl<T> crate::Interner<T> for ArenaInterner<T>
 where
     T: Eq + Hash,
@@ -92,18 +95,26 @@ where
         crate::Id::new(self.intern(value))
     }
 
-    fn get(&self, id: crate::Id) -> Self::Value<'_> {
-        self.get(id.raw).unwrap()
+    fn get(&self, id: crate::Id, runtime: &Runtime) -> Self::Value<'_> {
+        let value = self.get(id.raw).unwrap();
+        runtime.register_dependency(Dependency {
+            ingredient: self.id,
+            resource: id,
+        });
+        value
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Container;
+
     use super::*;
 
     #[test]
     fn interning() {
-        let interner = ArenaInterner::new();
+        let mut router = crate::StorageRouter::new(1);
+        let interner = ArenaInterner::new(router.next_ingredient());
 
         let a = interner.intern("hello");
         let b = interner.intern("bye");

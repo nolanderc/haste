@@ -31,16 +31,6 @@ impl<'a> FieldInfo<'a> {
     pub fn extract(fields: &mut syn::Fields) -> syn::Result<Vec<FieldInfo>> {
         let mut info = Vec::with_capacity(fields.len());
 
-        match fields {
-            syn::Fields::Unnamed(_) if fields.len() != 1 => {
-                return Err(syn::Error::new(
-                    fields.span(),
-                    "may only have a single unnamed field",
-                ))
-            }
-            _ => {}
-        }
-
         for (index, field) in fields.iter_mut().enumerate() {
             let span = match &field.ident {
                 Some(ident) => ident.span(),

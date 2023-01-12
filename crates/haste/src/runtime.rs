@@ -1,14 +1,14 @@
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
-use crate::{non_max::NonMaxU32, IngredientId, Query};
+use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientId, Query};
 
 #[derive(Default)]
 pub struct Runtime {
     id_allocator: TaskIdAllocator,
 }
 
-pub struct ExecutionResult<Q: Query> {
-    pub output: Q::Output,
+pub struct ExecutionResult<O> {
+    pub output: O,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -34,14 +34,28 @@ impl TaskIdAllocator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Dependency {
     pub ingredient: IngredientId,
     pub resource: crate::Id,
+    /// Extra information carried by the dependency
+    pub extra: u16,
 }
 
+const _: () = assert!(
+    std::mem::size_of::<Dependency>() == 8,
+    "the size of Dependencies should be kept small to be nice to the cache"
+);
+
+/// All data required to execute a task
 struct TaskData {
-    dependencies: Vec<Dependency>,
+    /// A unique identifier for this task (note: task IDs might be recycled once they have finished
+    /// running)
+    #[allow(unused)]
     id: TaskId,
+
+    /// List of all task dependencies 
+    dependencies: Vec<Dependency>,
 }
 
 impl TaskData {
@@ -61,18 +75,14 @@ thread_local! {
 impl Runtime {
     pub(crate) fn execute_query<Q: Query>(
         &self,
-        db: &Q::Database,
+        db: &IngredientDatabase<Q>,
         input: Q::Input,
-    ) -> ExecutionResult<Q> {
+    ) -> ExecutionResult<Q::Output> {
         ACTIVE_TASK.with(|task| {
             let id = self.id_allocator.next();
             let old_task = task.replace(Some(TaskData::new(id)));
-
             let output = Q::execute(db, input);
-
-            let task_result = task
-                .replace(old_task)
-                .expect("no active task for the current thread");
+            let task_result = task.replace(old_task).unwrap();
 
             ExecutionResult {
                 output,

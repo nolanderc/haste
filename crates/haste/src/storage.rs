@@ -1,9 +1,9 @@
-use crate::Database;
+use crate::{Database, HasStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage {
     /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
-    type DynDatabase: Database + ?Sized;
+    type DynDatabase: Database + ?Sized + HasStorage<Self>;
 
     fn new(router: &mut StorageRouter) -> Self;
 }

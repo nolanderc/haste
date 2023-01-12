@@ -161,7 +161,6 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
         impl haste::Ingredient for #ident {
             type Container = haste::interner::ArenaInterner<#data_ident>;
             type Storage = #storage_path;
-            type Database = dyn #db_path;
         }
 
         impl haste::Intern for #ident {

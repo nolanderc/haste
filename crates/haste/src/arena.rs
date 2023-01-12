@@ -214,6 +214,101 @@ impl<T> OnceCell<T> {
     }
 }
 
+/// An arena where values can be cheaply appended at the end, but reading requires the caller to
+/// guarantee that indices are valid.
+///
+/// Unlike `Vec` this never requires reallocating the backing buffer, which might be faster once
+/// the arena grows larger. This also means that one can hold onto references into the backing
+/// buffer accross write calls and multiple threads.
+pub struct AppendArena<T> {
+    raw: RawArena<UnsafeCell<MaybeUninit<T>>>,
+}
+
+impl<T> Default for AppendArena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> AppendArena<T> {
+    pub fn new() -> Self {
+        Self {
+            raw: RawArena::new(),
+        }
+    }
+
+    /// Push a value to the arena, returning its index
+    pub fn push(&self, value: T) -> usize {
+        let index = self.raw.push_zeroed();
+
+        let cell = UnsafeCell::new(MaybeUninit::new(value));
+
+        // SAFETY: no other thread will read or write to/from this index as we have not made it
+        // available yet, so we have exclusive access to this slot.
+        unsafe { self.raw.get_raw(index).write(cell) };
+
+        index
+    }
+
+    /// Append a sequence of values at the end of the buffer, returning the range they inhabit.
+    #[allow(unused)]
+    pub fn extend(
+        &self,
+        mut values: impl Iterator<Item = T> + ExactSizeIterator,
+    ) -> std::ops::Range<usize> {
+        let len = values.len();
+        let start = self.raw.reserve_zeroed(len);
+
+        unsafe {
+            let ptr = self.raw.get_raw(start);
+            for i in 0..len {
+                let value = values.next().expect("buggy ExactSizeIterator impl");
+
+                // SAFETY: no other thread will read or write to/from this index as we have not made it
+                // available yet, so we have exclusive access to this slot.
+                ptr.add(i).write(UnsafeCell::new(MaybeUninit::new(value)));
+            }
+        }
+
+        start..start + len
+    }
+
+    pub fn extend_from_slice(&self, values: &[T]) -> std::ops::Range<usize>
+    where
+        T: Copy,
+    {
+        let start = self.raw.reserve_zeroed(values.len());
+        unsafe {
+            let ptr = self.raw.get_raw(start);
+            ptr.copy_from_nonoverlapping(values.as_ptr().cast(), values.len())
+        }
+        start..start + values.len()
+    }
+
+    /// Get the value at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the provided index is valid for this structure (ie. it was
+    /// previously returned from a call to `push`).
+    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
+        (*self.raw.get_unchecked(index).get()).assume_init_ref()
+    }
+
+    /// Get a range of values.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the provided indices are valid for this structure (ie. they
+    /// were previously returned from a call to `append`).
+    #[allow(unused)]
+    pub unsafe fn get_slice_unchecked(&self, range: std::ops::Range<usize>) -> &[T] {
+        let len = range.end - range.start;
+        let ptr = UnsafeCell::raw_get(self.raw.get_raw(range.start));
+        std::slice::from_raw_parts(ptr.cast(), len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

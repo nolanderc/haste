@@ -64,7 +64,6 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         impl haste::Ingredient for #ident {
             type Container = haste::query_cache::HashQueryCache<Self>;
             type Storage = #storage_path;
-            type Database = dyn #db_path;
         }
 
         impl haste::Query for #ident {

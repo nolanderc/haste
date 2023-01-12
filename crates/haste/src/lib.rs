@@ -40,7 +40,7 @@ pub trait Database {
 }
 
 /// Implemented by databases which contain a specific type of storage.
-pub trait HasStorage<S: Storage>: Database {
+pub trait HasStorage<S: Storage + ?Sized>: Database {
     fn storage(&self) -> &S;
     fn as_dyn(&self) -> &S::DynDatabase;
 }
@@ -50,10 +50,7 @@ pub trait Ingredient {
     type Container: Container;
 
     /// The storage within which this ingredient exists.
-    type Storage: Storage<DynDatabase = Self::Database> + HasIngredient<Self>;
-
-    /// The database object used by this ingredient (eg. `dyn crate::Db`).
-    type Database: Database + HasStorage<Self::Storage> + ?Sized;
+    type Storage: Storage + HasIngredient<Self>;
 }
 
 /// Implemented by storages which has a contoiner for the given ingredient.
@@ -65,8 +62,10 @@ pub trait Query: Ingredient {
     type Input;
     type Output;
 
-    fn execute(db: &Self::Database, input: Self::Input) -> Self::Output;
+    fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Output;
 }
+
+type IngredientDatabase<T> = <<T as Ingredient>::Storage as Storage>::DynDatabase;
 
 pub trait Intern: Ingredient {
     type Value: Eq + std::hash::Hash;

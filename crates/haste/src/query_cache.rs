@@ -1,27 +1,69 @@
-use std::{cell::UnsafeCell, hash::Hash, mem::MaybeUninit};
+use std::hash::Hash;
 
 use parking_lot::RwLockUpgradableReadGuard;
 
-use crate::{arena::RawArena, shard_map::ShardMap, Database, Dependency, Id, IngredientId, Query};
+use crate::{
+    arena::AppendArena, shard_map::ShardMap, Database, Dependency, Id, IngredientDatabase,
+    IngredientId, Query,
+};
 
 pub trait QueryCache<Q: Query> {
-    fn get_or_execute<'a>(&'a self, db: &Q::Database, input: Q::Input) -> &'a Q::Output;
+    fn get_or_execute<'a>(&'a self, db: &IngredientDatabase<Q>, input: Q::Input) -> &'a Q::Output;
 }
 
 pub struct HashQueryCache<Q: Query> {
     id: IngredientId,
     entries: ShardMap<Q::Input, InputSlot>,
-    outputs: RawArena<UnsafeCell<MaybeUninit<OutputSlot<Q::Output>>>>,
+    outputs: OutputStorage<Q::Output>,
+}
+
+struct OutputStorage<T> {
+    /// Stores data about each completed query.
+    slots: AppendArena<OutputSlot<T>>,
+
+    /// Stores the dependencies for all the queries. These are referenced by ranges in the
+    /// `OutputSlot`.
+    dependencies: AppendArena<Dependency>,
+}
+
+impl<T> Default for OutputStorage<T> {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+            dependencies: Default::default(),
+        }
+    }
+}
+
+impl<T> OutputStorage<T> {
+    /// Record the result of a new query
+    fn push(&self, output: T, dependencies: &[Dependency]) -> usize {
+        let dependencies = {
+            let range = self.dependencies.extend_from_slice(dependencies);
+            let end = u32::try_from(range.end).unwrap();
+            let start = range.start as u32;
+            start..end
+        };
+
+        self.slots.push(OutputSlot {
+            output,
+            dependencies,
+        })
+    }
+
+    /// Get the dependencies of the given query
+    #[allow(unused)]
+    unsafe fn dependencies(&self, range: std::ops::Range<u32>) -> &[Dependency] {
+        self.dependencies
+            .get_slice_unchecked(range.start as usize..range.end as usize)
+    }
 }
 
 enum InputSlot {
+    /// The query associated with this specific input is currently is still progressing
     Progress(QueryProgress),
+    /// The query has completed, and its result is associated with the given ID
     Done(Id),
-}
-
-struct OutputSlot<T> {
-    value: T,
-    dependencies: Vec<Dependency>,
 }
 
 struct QueryProgress {}
@@ -30,6 +72,15 @@ impl QueryProgress {
     fn new() -> Self {
         Self {}
     }
+}
+
+struct OutputSlot<T> {
+    /// The output from a query.
+    output: T,
+
+    /// Refers to a sequence of dependencies in `OutputStorage::dependencies`.
+    #[allow(unused)]
+    dependencies: std::ops::Range<u32>,
 }
 
 impl<Q: Query> crate::Container for HashQueryCache<Q> {
@@ -52,7 +103,7 @@ where
 {
     fn get_or_execute<'a>(
         &'a self,
-        db: &<Q>::Database,
+        db: &IngredientDatabase<Q>,
         input: <Q as Query>::Input,
     ) -> &'a <Q as Query>::Output {
         let runtime = db.runtime();
@@ -70,9 +121,10 @@ where
         runtime.register_dependency(Dependency {
             ingredient: self.id,
             resource: id,
+            extra: 0,
         });
 
-        unsafe { &self.output(id).value }
+        unsafe { &self.output(id).output }
     }
 }
 
@@ -114,26 +166,17 @@ where
         Err(input)
     }
 
-    fn execute_query(&self, db: &Q::Database, input: Q::Input, hash: u64) -> Id {
+    fn execute_query(&self, db: &IngredientDatabase<Q>, input: Q::Input, hash: u64) -> Id {
         let result = db.runtime().execute_query::<Q>(db, input.clone());
 
-        let index = self.outputs.push_zeroed();
-        let id = Id::try_from_usize(index).expect("exhausted query IDs");
-
-        // SAFETY: no other thread will read or write to/from this index as we have not made it
-        // available yet, so we have exclusive access to this slot.
-        unsafe {
-            (*self.outputs.get_unchecked(index).get()).write(OutputSlot {
-                value: result.output,
-                dependencies: result.dependencies,
-            })
-        };
+        let index = self.outputs.push(result.output, &result.dependencies);
 
         // make the value available for other threads
         let mut shard = self.entries.shard(hash).raw().write();
         let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
-        entry.value = InputSlot::Done(id);
 
+        let id = Id::try_from_usize(index).expect("exhausted query IDs");
+        entry.value = InputSlot::Done(id);
         id
     }
 }
@@ -144,7 +187,6 @@ impl<Q: Query> HashQueryCache<Q> {
     /// The caller must ensure that the output slot associated with the given `id` has been
     /// initialized.
     unsafe fn output(&self, id: Id) -> &OutputSlot<Q::Output> {
-        let slot = self.outputs.get_unchecked(id.raw.get() as usize);
-        (*slot.get()).assume_init_ref()
+        self.outputs.slots.get_unchecked(id.raw.get() as usize)
     }
 }

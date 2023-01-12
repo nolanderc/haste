@@ -100,6 +100,7 @@ where
         runtime.register_dependency(Dependency {
             ingredient: self.id,
             resource: id,
+            extra: 0,
         });
         value
     }

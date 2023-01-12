@@ -95,7 +95,7 @@ impl<'a> AttrParser<'a> {
                 None => self.emit_error(syn::Error::new(attr.path.span(), "duplicate attribute")),
             }
 
-            return false;
+            false
         });
 
         match self.error {

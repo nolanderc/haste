@@ -1,31 +1,31 @@
-use crate::{Database, HasStorage};
+use crate::{Database, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage {
     /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
-    type DynDatabase: Database + ?Sized + HasStorage<Self>;
+    type DynDatabase: Database + ?Sized + WithStorage<Self>;
 
     fn new(router: &mut StorageRouter) -> Self;
 }
 
 /// Stores the data requried by a single ingredient
 pub trait Container {
-    fn new(id: IngredientId) -> Self;
-    fn id(&self) -> IngredientId;
+    fn new(path: IngredientPath) -> Self;
+    fn path(&self) -> IngredientPath;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IngredientId {
+pub struct IngredientPath {
     storage: u8,
     container: u8,
 }
 
 /// Contains all storage that is needed for the database
-pub struct DatabaseStorage<DB: HasStorages> {
+pub struct DatabaseStorage<DB: WithStorages> {
     storages: DB::StorageList,
 }
 
-pub trait HasStorages {
+pub trait WithStorages {
     /// A type containing all the storages used by a database.
     type StorageList: StorageList;
 }
@@ -37,41 +37,41 @@ pub trait StorageList {
 
 pub struct StorageRouter {
     max_storages: usize,
-    next_id: IngredientId,
+    next_path: IngredientPath,
 }
 
 impl StorageRouter {
     pub(crate) fn new(max_storages: usize) -> Self {
         Self {
             max_storages,
-            next_id: IngredientId {
+            next_path: IngredientPath {
                 storage: 0,
-                container: 8,
+                container: 0,
             },
         }
     }
-    
+
     pub(crate) fn end_storage(&mut self) {
-        if usize::from(self.next_id.storage) >= self.max_storages {
+        if usize::from(self.next_path.storage) >= self.max_storages {
             panic!("routed more storages than there were available");
         }
-        self.next_id.storage += 1;
+        self.next_path.storage += 1;
     }
 
-    pub fn next_ingredient(&mut self) -> IngredientId {
-        let id = self.next_id;
-        self.next_id.container += 1;
+    pub fn next_ingredient(&mut self) -> IngredientPath {
+        let id = self.next_path;
+        self.next_path.container += 1;
         id
     }
 }
 
-impl<DB: HasStorages> Default for DatabaseStorage<DB> {
+impl<DB: WithStorages> Default for DatabaseStorage<DB> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<DB: HasStorages> DatabaseStorage<DB> {
+impl<DB: WithStorages> DatabaseStorage<DB> {
     pub fn new() -> Self {
         let mut router = StorageRouter::new(DB::StorageList::LENGTH);
 
@@ -82,6 +82,10 @@ impl<DB: HasStorages> DatabaseStorage<DB> {
 
     pub fn list(&self) -> &DB::StorageList {
         &self.storages
+    }
+
+    pub fn list_mut(&mut self) -> &mut DB::StorageList {
+        &mut self.storages
     }
 }
 

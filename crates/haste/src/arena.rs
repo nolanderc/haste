@@ -60,6 +60,17 @@ impl<T> RawArena<T> {
         &*self.get_raw(index)
     }
 
+    /// Get a mutable reference to the value at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the given index lies within the allocated memory region and
+    /// that it is properly initialized.
+    #[allow(unused)]
+    pub unsafe fn get_mut_unchecked(&mut self, index: usize) -> &mut T {
+        &mut *self.get_raw(index)
+    }
+
     /// Returns `true` if the `index` has been allocated
     fn is_allocated(&self, index: usize) -> bool {
         index < self.committed.load(Ordering::Relaxed)
@@ -77,6 +88,19 @@ where
             // SAFETY: since we only allow values that have been initialized to zero, they are
             // implicitly initialized as long they have been allocated.
             unsafe { Some(self.get_unchecked(index)) }
+        } else {
+            None
+        }
+    }
+
+    /// Get a mutable reference to the value at the given index. Returns `None` if the index has
+    /// not yet been allocated.
+    #[allow(unused)]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if self.is_allocated(index) {
+            // SAFETY: since we only allow values that have been initialized to zero, they are
+            // implicitly initialized as long they have been allocated.
+            unsafe { Some(self.get_mut_unchecked(index)) }
         } else {
             None
         }
@@ -156,29 +180,31 @@ impl<T> Arena<T> {
 
     pub fn push(&self, value: T) -> usize {
         let index = self.raw.push_zeroed();
-        unsafe {
-            let result = self.raw.get_unchecked(index).write(value);
-            debug_assert!(result.is_ok());
-            index
-        }
+        // SAFETY: we just pushed this index, so no other thread will write to the same slot.
+        unsafe { self.raw.get_unchecked(index).write_unique(value) };
+        index
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
         self.raw.get(index)?.get()
     }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.raw.get_mut(index)?.get_mut()
+    }
 }
 
-/// A region of memory that can only be initialized once.
-///
-/// This implements `Zeroable`, which is the primary way to construct it.
-struct OnceCell<T> {
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct OnceCellState {
     state: AtomicU8,
-    value: UnsafeCell<MaybeUninit<T>>,
 }
 
-unsafe impl<T> bytemuck::Zeroable for OnceCell<T> {}
-
-impl<T> OnceCell<T> {
+impl OnceCellState {
     /// The slot is currently being initialized by some thread.
     const BEING_WRITTEN: u8 = 0x1;
 
@@ -189,28 +215,71 @@ impl<T> OnceCell<T> {
         (state & mask) != 0
     }
 
-    fn write(&self, value: T) -> Result<&T, T> {
+    pub fn start_write(&self) -> bool {
         let old_state = self.state.fetch_or(Self::BEING_WRITTEN, Ordering::Relaxed);
-        if Self::is(Self::BEING_WRITTEN, old_state) {
+        !Self::is(Self::BEING_WRITTEN, old_state)
+    }
+
+    pub unsafe fn finish_write(&self) {
+        let finished = Self::BEING_WRITTEN | Self::INITIALIZED;
+        self.state.store(finished, Ordering::Release);
+    }
+
+    pub fn is_written(&self) -> bool {
+        Self::is(Self::INITIALIZED, self.state.load(Ordering::Acquire))
+    }
+}
+
+unsafe impl bytemuck::Zeroable for OnceCellState {}
+
+/// A region of memory that can only be initialized once.
+///
+/// This implements `Zeroable`, which is the primary way to construct it.
+struct OnceCell<T> {
+    state: OnceCellState,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+unsafe impl<T> bytemuck::Zeroable for OnceCell<T> {}
+
+impl<T> OnceCell<T> {
+    #[allow(unused)]
+    fn write(&self, value: T) -> Result<&T, T> {
+        if !self.state.start_write() {
             return Err(value);
         }
+        unsafe { Ok(self.write_unique(value)) }
+    }
 
-        unsafe {
-            self.value.get().write(MaybeUninit::new(value));
-            self.state.fetch_or(Self::INITIALIZED, Ordering::Release);
-            Ok(self.get_unchecked())
-        }
+    /// # Safety
+    ///
+    /// The caller ensures that the cell has never been written to before.
+    unsafe fn write_unique(&self, value: T) -> &T {
+        self.value.get().write(MaybeUninit::new(value));
+        self.state.finish_write();
+        self.get_unchecked()
     }
 
     fn get(&self) -> Option<&T> {
-        if !Self::is(Self::INITIALIZED, self.state.load(Ordering::Acquire)) {
+        if !self.state.is_written() {
             return None;
         }
         unsafe { Some(self.get_unchecked()) }
     }
 
+    fn get_mut(&mut self) -> Option<&mut T> {
+        if !self.state.is_written() {
+            return None;
+        }
+        unsafe { Some(self.get_mut_unchecked()) }
+    }
+
     unsafe fn get_unchecked(&self) -> &T {
         (*self.value.get()).assume_init_ref()
+    }
+
+    unsafe fn get_mut_unchecked(&mut self) -> &mut T {
+        (*self.value.get()).assume_init_mut()
     }
 }
 

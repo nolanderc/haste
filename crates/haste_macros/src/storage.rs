@@ -54,6 +54,10 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
                 fn container(&self) -> &#container_type {
                     &self.#field_member
                 }
+
+                fn container_mut(&mut self) -> &mut #container_type {
+                    &mut self.#field_member
+                }
             }
         });
 

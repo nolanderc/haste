@@ -1,34 +1,15 @@
-pub trait Db: haste::Database + haste::HasStorage<Storage> {}
+mod token;
 
+pub trait Db: haste::Database + haste::WithStorage<Storage> {}
+
+#[haste::database(Storage)]
 #[derive(Default)]
 pub struct Database {
     runtime: haste::Runtime,
     storage: haste::DatabaseStorage<Self>,
 }
 
-impl haste::Database for Database {
-    fn runtime(&self) -> &haste::Runtime {
-        &self.runtime
-    }
-}
-
 impl Db for Database {}
-
-impl haste::HasStorages for Database {
-    type StorageList = (Storage,);
-}
-
-impl haste::HasStorage<Storage> for Database {
-    #[inline(always)]
-    fn storage(&self) -> &Storage {
-        &self.storage.list().0
-    }
-
-    #[inline(always)]
-    fn as_dyn(&self) -> &<Storage as haste::Storage>::DynDatabase {
-        self
-    }
-}
 
 #[haste::storage]
 pub struct Storage(Text, fib, Person);
@@ -51,13 +32,21 @@ fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-    fib(db, n - 1) + fib(db, n - 2)
+
+    // while computing `fib(n-1)` we can compute `fib(n-2)` in the background:
+    fib::prefetch(db, n - 2);
+    let a = fib(db, n - 1);
+
+    // then we can grab the result of `fib(n-2)`
+    let b = fib(db, n - 2);
+
+    a + b
 }
 
 fn main() {
     let db = Database::default();
 
-    for i in 0..10 {
+    for i in 0..20 {
         eprintln!("fib {} = {}", i, fib(&db, i));
     }
 

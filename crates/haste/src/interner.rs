@@ -4,13 +4,13 @@ use crate::{
     arena::Arena,
     non_max::NonMaxU32,
     shard_map::{Entry, ShardMap},
-    Dependency, IngredientId, Runtime,
+    IngredientPath,
 };
 
 use std::hash::Hash;
 
 pub struct ArenaInterner<T> {
-    id: IngredientId,
+    path: IngredientPath,
     values: Arena<T>,
     entries: ShardMap<NonMaxU32, ()>,
 }
@@ -70,39 +70,35 @@ impl<T> ArenaInterner<T> {
 }
 
 impl<T> crate::Container for ArenaInterner<T> {
-    fn new(id: IngredientId) -> Self {
+    fn new(path: IngredientPath) -> Self {
         Self {
-            id,
+            path,
             values: Arena::new(),
             entries: ShardMap::new(),
         }
     }
 
-    fn id(&self) -> IngredientId {
-        self.id
+    fn path(&self) -> IngredientPath {
+        self.path
     }
 }
 
-impl<T> crate::Interner<T> for ArenaInterner<T>
+impl<T> crate::ElementContainer for ArenaInterner<T>
 where
     T: Eq + Hash,
 {
-    type Value<'a> = &'a T
+    type Value = T;
+
+    type Ref<'a> = &'a T
     where
         Self: 'a;
 
-    fn intern(&self, value: T) -> crate::Id {
+    fn insert(&self, value: T) -> crate::Id {
         crate::Id::new(self.intern(value))
     }
 
-    fn get(&self, id: crate::Id, runtime: &Runtime) -> Self::Value<'_> {
-        let value = self.get(id.raw).unwrap();
-        runtime.register_dependency(Dependency {
-            ingredient: self.id,
-            resource: id,
-            extra: 0,
-        });
-        value
+    fn get_untracked(&self, id: crate::Id) -> Self::Ref<'_> {
+        self.get(id.raw).unwrap()
     }
 }
 

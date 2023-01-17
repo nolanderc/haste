@@ -7,6 +7,12 @@ mod intern;
 mod meta;
 mod query;
 mod storage;
+mod database;
+
+#[proc_macro_attribute]
+pub fn database(meta: TokenStream, input: TokenStream) -> TokenStream {
+    attribute_macro_handler(database::database_impl, meta.into(), input.into()).into()
+}
 
 #[proc_macro_attribute]
 pub fn storage(meta: TokenStream, input: TokenStream) -> TokenStream {

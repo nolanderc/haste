@@ -1,6 +1,6 @@
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
-use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientId, Query};
+use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
 
 #[derive(Default)]
 pub struct Runtime {
@@ -36,7 +36,7 @@ impl TaskIdAllocator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Dependency {
-    pub ingredient: IngredientId,
+    pub ingredient: IngredientPath,
     pub resource: crate::Id,
     /// Extra information carried by the dependency
     pub extra: u16,
@@ -80,6 +80,7 @@ impl Runtime {
     ) -> ExecutionResult<Q::Output> {
         ACTIVE_TASK.with(|task| {
             let id = self.id_allocator.next();
+
             let old_task = task.replace(Some(TaskData::new(id)));
             let output = Q::execute(db, input);
             let task_result = task.replace(old_task).unwrap();

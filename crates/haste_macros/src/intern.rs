@@ -57,7 +57,7 @@ fn derive_struct(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Re
         let span = field.member.span();
 
         let mut extractor = quote! {
-            &haste::DatabaseExt::intern_lookup(db, self).#member
+            &haste::DatabaseExt::lookup(db, self).#member
         };
 
         let mut output_type = field_type.clone();
@@ -112,7 +112,7 @@ fn derive_enum(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Resu
     {
         let mut output_type = data_ident.to_token_stream();
         let mut extractor = quote! {
-            haste::DatabaseExt::intern_lookup(db, self)
+            haste::DatabaseExt::lookup(db, self)
         };
 
         if args.clone {
@@ -163,9 +163,7 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
             type Storage = #storage_path;
         }
 
-        impl haste::Intern for #ident {
-            type Value = #data_ident;
-
+        impl haste::TrackedReference for #ident {
             fn from_id(id: haste::Id) -> Self {
                 Self(id)
             }
@@ -175,9 +173,11 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
             }
         }
 
+        impl haste::Intern for #ident {}
+
         impl #ident {
             pub fn new(db: &dyn #db_path, data: #data_ident) -> Self {
-                haste::DatabaseExt::intern(db, data)
+                haste::DatabaseExt::insert(db, data)
             }
         }
     }

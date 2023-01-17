@@ -4,15 +4,55 @@ use parking_lot::RwLockUpgradableReadGuard;
 
 use crate::{
     arena::AppendArena, shard_map::ShardMap, Database, Dependency, Id, IngredientDatabase,
-    IngredientId, Query,
+    IngredientPath, Query,
 };
 
-pub trait QueryCache<Q: Query> {
-    fn get_or_execute<'a>(&'a self, db: &IngredientDatabase<Q>, input: Q::Input) -> &'a Q::Output;
+pub trait QueryCache: crate::Container {
+    type Query: Query;
+
+    /// Executes the query with the given input, returning an ID for accessing the result of the
+    /// query.
+    fn execute(
+        &self,
+        db: &IngredientDatabase<Self::Query>,
+        input: <Self::Query as Query>::Input,
+    ) -> Id;
+
+    /// Get the output from the query.
+    ///
+    /// # Safety
+    ///
+    /// The `id` must be one previously returned from `execute` in the same revision.
+    unsafe fn get_output_untracked(&self, id: Id) -> &<Self::Query as Query>::Output;
+
+    /// Get the dependencies of a query.
+    ///
+    /// # Safety
+    ///
+    /// The `id` must be one previously returned from `execute` in the same revision.
+    unsafe fn get_dependencies_untracked(&self, id: Id) -> &[Dependency];
+
+    /// Get the output from the query.
+    ///
+    /// # Safety
+    ///
+    /// The `id` must be one previously returned from `execute` in the same revision.
+    unsafe fn get_output(
+        &self,
+        id: Id,
+        runtime: &crate::Runtime,
+    ) -> &<Self::Query as Query>::Output {
+        runtime.register_dependency(Dependency {
+            ingredient: self.path(),
+            resource: id,
+            extra: 0,
+        });
+        self.get_output_untracked(id)
+    }
 }
 
 pub struct HashQueryCache<Q: Query> {
-    id: IngredientId,
+    path: IngredientPath,
     entries: ShardMap<Q::Input, InputSlot>,
     outputs: OutputStorage<Q::Output>,
 }
@@ -84,47 +124,44 @@ struct OutputSlot<T> {
 }
 
 impl<Q: Query> crate::Container for HashQueryCache<Q> {
-    fn new(id: IngredientId) -> Self {
+    fn new(path: IngredientPath) -> Self {
         Self {
-            id,
+            path,
             entries: Default::default(),
             outputs: Default::default(),
         }
     }
 
-    fn id(&self) -> IngredientId {
-        self.id
+    fn path(&self) -> IngredientPath {
+        self.path
     }
 }
 
-impl<Q: Query> QueryCache<Q> for HashQueryCache<Q>
+impl<Q: Query> QueryCache for HashQueryCache<Q>
 where
     Q::Input: Hash + Eq + Clone,
 {
-    fn get_or_execute<'a>(
-        &'a self,
-        db: &IngredientDatabase<Q>,
-        input: <Q as Query>::Input,
-    ) -> &'a <Q as Query>::Output {
-        let runtime = db.runtime();
+    type Query = Q;
 
+    fn execute<'a>(&'a self, db: &IngredientDatabase<Q>, input: <Q as Query>::Input) -> Id {
         // only hash the input once:
         let hash = self.entries.hash(&input);
 
-        let id = match self.get_or_reserve_slot(input, hash) {
+        match self.get_or_reserve_slot(input, hash) {
             // the query has run before, so we reuse the cached output
             Ok(id) => id,
             // this is the first time we encounter this query, so execute it from scratch
             Err(input) => self.execute_query(db, input, hash),
-        };
+        }
+    }
 
-        runtime.register_dependency(Dependency {
-            ingredient: self.id,
-            resource: id,
-            extra: 0,
-        });
+    unsafe fn get_output_untracked(&self, id: Id) -> &<Self::Query as Query>::Output {
+        &self.output(id).output
+    }
 
-        unsafe { &self.output(id).output }
+    unsafe fn get_dependencies_untracked(&self, id: Id) -> &[Dependency] {
+        let slot = self.output(id);
+        self.outputs.dependencies(slot.dependencies.clone())
     }
 }
 

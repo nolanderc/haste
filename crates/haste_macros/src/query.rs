@@ -7,8 +7,10 @@ use syn::spanned::Spanned;
 use crate::meta::ArgumentOptions;
 
 pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
+    let mut errors = Vec::new();
+
     if !meta.is_empty() {
-        return Err(syn::Error::new(
+        errors.push(syn::Error::new(
             meta.span(),
             "unexpected attribute arguments",
         ));
@@ -17,9 +19,16 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     let mut query_fn = syn::parse2::<syn::ItemFn>(input)?;
 
     if !query_fn.sig.generics.params.is_empty() {
-        return Err(syn::Error::new(
+        errors.push(syn::Error::new(
             query_fn.sig.generics.span(),
             "generics not supported",
+        ));
+    }
+
+    if let Some(asyncness) = query_fn.sig.asyncness {
+        errors.push(syn::Error::new(
+            asyncness.span,
+            "`async fn` not supported in queries",
         ));
     }
 
@@ -43,7 +52,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         types: input_types,
         spread: input_spread,
         idents: input_idents,
-    } = input_type(&query_fn.sig)?;
+    } = extract_input_data(&query_fn.sig)?;
     let input_type = quote! { (#(#input_types),*) };
 
     let output_type = match &query_fn.sig.output {
@@ -53,12 +62,17 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     let mut tokens = TokenStream::new();
 
-    tokens.extend(quote_spanned! {ident.span()=>
+    tokens.extend(quote! {
         #[allow(non_camel_case_types)]
         #vis enum #ident {}
 
         impl #ident {
             #query_fn
+
+            #[allow(unused_parens)]
+            pub fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
+                haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*))
+            }
         }
 
         impl haste::Ingredient for #ident {
@@ -96,6 +110,10 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         }
     });
 
+    for error in errors {
+        tokens.extend(error.to_compile_error());
+    }
+
     Ok(tokens)
 }
 
@@ -106,7 +124,7 @@ struct InputData<'a> {
     types: Vec<&'a syn::Type>,
 }
 
-fn input_type(signature: &syn::Signature) -> syn::Result<InputData> {
+fn extract_input_data(signature: &syn::Signature) -> syn::Result<InputData> {
     if signature.inputs.is_empty() {
         return Err(syn::Error::new(
             signature.paren_token.span,

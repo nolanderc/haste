@@ -1,3 +1,5 @@
+#![feature(type_alias_impl_trait)]
+
 mod token;
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
@@ -28,33 +30,28 @@ struct PersonData {
 }
 
 #[haste::query]
-fn fib(db: &dyn crate::Db, n: u64) -> u64 {
+async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
 
-    // while computing `fib(n-1)` we can compute `fib(n-2)` in the background:
-    fib::prefetch(db, n - 2);
-    let a = fib(db, n - 1);
-
-    // then we can grab the result of `fib(n-2)`
-    let b = fib(db, n - 2);
-
-    a + b
+    let a = Box::pin(fib(db, n - 1));
+    let b = Box::pin(fib(db, n - 2));
+    a.await + b.await
 }
 
 fn main() {
     let db = Database::default();
 
     for i in 0..20 {
-        eprintln!("fib {} = {}", i, fib(&db, i));
+        eprintln!("fib {} = {}", i, pollster::block_on(fib(&db, i)));
     }
 
     let a = Text::new(&db, TextData("hello".into()));
     let b = Text::new(&db, TextData("hello".into()));
     assert_eq!(a, b);
-    assert_eq!(a.get(&db), "hello");
-    assert_eq!(b.get(&db), "hello");
+    assert_eq!(a.get(&db).0, "hello");
+    assert_eq!(b.get(&db).0, "hello");
 
     let name = Text::new(&db, TextData("John".into()));
     let person = Person::new(&db, PersonData { name, age: 37 });

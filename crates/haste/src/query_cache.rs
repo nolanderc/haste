@@ -1,4 +1,4 @@
-use std::hash::Hash;
+use std::{future::Future, hash::Hash};
 
 use parking_lot::RwLockUpgradableReadGuard;
 
@@ -10,13 +10,17 @@ use crate::{
 pub trait QueryCache: crate::Container {
     type Query: Query;
 
+    type Future<'a>: Future<Output = Id>
+    where
+        Self: 'a;
+
     /// Executes the query with the given input, returning an ID for accessing the result of the
     /// query.
-    fn execute(
-        &self,
-        db: &IngredientDatabase<Self::Query>,
+    fn evaluate<'a>(
+        &'a self,
+        db: &'a IngredientDatabase<Self::Query>,
         input: <Self::Query as Query>::Input,
-    ) -> Id;
+    ) -> Self::Future<'a>;
 
     /// Get the output from the query.
     ///
@@ -143,15 +147,23 @@ where
 {
     type Query = Q;
 
-    fn execute<'a>(&'a self, db: &IngredientDatabase<Q>, input: <Q as Query>::Input) -> Id {
-        // only hash the input once:
-        let hash = self.entries.hash(&input);
+    type Future<'a> = impl Future<Output = Id> + 'a where Q: 'a;
 
-        match self.get_or_reserve_slot(input, hash) {
-            // the query has run before, so we reuse the cached output
-            Ok(id) => id,
-            // this is the first time we encounter this query, so execute it from scratch
-            Err(input) => self.execute_query(db, input, hash),
+    fn evaluate<'a>(
+        &'a self,
+        db: &'a IngredientDatabase<Q>,
+        input: <Q as Query>::Input,
+    ) -> Self::Future<'a> {
+        async move {
+            // only hash the input once:
+            let hash = self.entries.hash(&input);
+
+            match self.get_or_reserve_slot(input, hash) {
+                // the query has run before, so we reuse the cached output
+                Ok(id) => id,
+                // this is the first time we encounter this query, so execute it from scratch
+                Err(input) => self.execute_query(db, input, hash).await,
+            }
         }
     }
 
@@ -203,8 +215,8 @@ where
         Err(input)
     }
 
-    fn execute_query(&self, db: &IngredientDatabase<Q>, input: Q::Input, hash: u64) -> Id {
-        let result = db.runtime().execute_query::<Q>(db, input.clone());
+    async fn execute_query(&self, db: &IngredientDatabase<Q>, input: Q::Input, hash: u64) -> Id {
+        let result = db.runtime().execute_query::<Q>(db, input.clone()).await;
 
         let index = self.outputs.push(result.output, &result.dependencies);
 

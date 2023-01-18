@@ -25,13 +25,6 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         ));
     }
 
-    if let Some(asyncness) = query_fn.sig.asyncness {
-        errors.push(syn::Error::new(
-            asyncness.span,
-            "`async fn` not supported in queries",
-        ));
-    }
-
     let args = crate::meta::extract_attrs(
         &mut query_fn.attrs,
         ArgumentOptions {
@@ -83,8 +76,9 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         impl haste::Query for #ident {
             type Input = #input_type;
             type Output = #output_type;
+            type Future<'db> = impl std::future::Future<Output = Self::Output> + 'db;
 
-            fn execute(db: &dyn #db_path, input: #input_type) -> #output_type {
+            fn execute(db: &dyn #db_path, input: #input_type) -> Self::Future<'_> {
                 Self::#ident(db, #input_spread)
             }
         }
@@ -97,7 +91,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     };
 
     let mut execution = quote! {
-        haste::DatabaseExt::execute_cached::<#ident>(#db_ident, (#(#input_idents),*))
+        haste::DatabaseExt::execute_cached::<#ident>(#db_ident, (#(#input_idents),*)).await
     };
 
     if args.clone {
@@ -105,7 +99,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     }
 
     tokens.extend(quote_spanned! {ident.span()=>
-        #vis fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
+        #vis async fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
             #execution
         }
     });

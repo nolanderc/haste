@@ -1,3 +1,6 @@
+#![feature(type_alias_impl_trait)]
+#![feature(async_fn_in_trait)]
+
 mod arena;
 mod input;
 pub mod interner;
@@ -72,8 +75,9 @@ pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
 pub trait Query: Ingredient {
     type Input;
     type Output;
+    type Future<'db>: std::future::Future<Output = Self::Output>;
 
-    fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Output;
+    fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
 }
 
 pub trait Intern: Ingredient + TrackedReference
@@ -145,9 +149,10 @@ impl<'db, Q: Query> Spawned<'db, Q> {
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
 pub trait DatabaseExt: Database {
     /// Execute a query with some input, reusing previous results if possible.
-    fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> &'db Q::Output
+    async fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> &'db Q::Output
     where
         Q: Query,
+        Q::Output: 'db,
         Q::Storage: 'db,
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
@@ -155,7 +160,7 @@ pub trait DatabaseExt: Database {
         let db = self.as_dyn();
         let storage = self.storage();
         let cache = storage.container();
-        let id = cache.execute(db, input);
+        let id = cache.evaluate(db, input).await;
 
         // SAFETY: we just executed this query, so the `id` will be valid.
         unsafe { cache.get_output(id, db.runtime()) }
@@ -172,11 +177,14 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        // TODO: perform this work on another thread/node
-        let db = self.as_dyn();
-        let storage = self.storage();
-        let cache = storage.container();
-        cache.execute(db, input);
+        // let runtime = self.runtime();
+        // let storage = self.storage();
+        // let cache = storage.container();
+        // cache.path();
+        //
+        // // TODO: perform this work on another thread/node
+        // let db = self.as_dyn();
+        // cache.evaluate(db, input);
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T

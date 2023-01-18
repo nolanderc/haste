@@ -1,4 +1,4 @@
-use std::{cell::Cell, sync::atomic::AtomicU32};
+use std::{cell::Cell, future::Future, pin::Pin, sync::atomic::AtomicU32};
 
 use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
 
@@ -54,7 +54,7 @@ struct TaskData {
     #[allow(unused)]
     id: TaskId,
 
-    /// List of all task dependencies 
+    /// List of all task dependencies
     dependencies: Vec<Dependency>,
 }
 
@@ -72,24 +72,47 @@ thread_local! {
     static ACTIVE_TASK: Cell<Option<TaskData>> = Cell::new(None);
 }
 
-impl Runtime {
-    pub(crate) fn execute_query<Q: Query>(
-        &self,
-        db: &IngredientDatabase<Q>,
-        input: Q::Input,
-    ) -> ExecutionResult<Q::Output> {
-        ACTIVE_TASK.with(|task| {
-            let id = self.id_allocator.next();
+pub(crate) struct QueryTask<'db, Q: Query> {
+    inner: Q::Future<'db>,
+    task: Option<TaskData>,
+}
 
-            let old_task = task.replace(Some(TaskData::new(id)));
-            let output = Q::execute(db, input);
-            let task_result = task.replace(old_task).unwrap();
+impl<'db, Q: Query> Future for QueryTask<'db, Q> {
+    type Output = ExecutionResult<Q::Output>;
 
-            ExecutionResult {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        ctx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        ACTIVE_TASK.with(|task| unsafe {
+            let this = self.get_unchecked_mut();
+            let inner = Pin::new_unchecked(&mut this.inner);
+
+            let old_task = task.replace(this.task.take());
+            let poll_inner = inner.poll(ctx);
+            this.task = task.replace(old_task);
+
+            let output = std::task::ready!(poll_inner);
+            let dependencies = this.task.take().unwrap().dependencies;
+
+            std::task::Poll::Ready(ExecutionResult {
                 output,
-                dependencies: task_result.dependencies,
-            }
+                dependencies,
+            })
         })
+    }
+}
+
+impl Runtime {
+    pub(crate) fn execute_query<'db, Q: Query>(
+        &self,
+        db: &'db IngredientDatabase<Q>,
+        input: Q::Input,
+    ) -> QueryTask<'db, Q> {
+        QueryTask {
+            inner: Q::execute(db, input),
+            task: Some(TaskData::new(self.id_allocator.next())),
+        }
     }
 
     /// Register a dependency under the currently running query

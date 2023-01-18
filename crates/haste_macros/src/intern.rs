@@ -78,6 +78,13 @@ fn derive_struct(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Re
         });
     }
 
+    let getter = getter_fn(&input, &args);
+    impls.extend(quote! {
+        impl #ingredient {
+            #getter
+        }
+    });
+
     let mut tokens = input.to_token_stream();
     tokens.extend(impls);
     Ok(tokens)
@@ -108,33 +115,40 @@ fn derive_enum(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Resu
         storage_path: &args.storage,
     }));
 
-    // create a getter:
-    {
-        let mut output_type = data_ident.to_token_stream();
-        let mut extractor = quote! {
-            haste::DatabaseExt::lookup(db, self)
-        };
-
-        if args.clone {
-            extractor = quote! {
-                <#data_ident as std::clone::Clone>::clone(#extractor)
-            }
-        } else {
-            output_type = syn::parse_quote! { &#output_type };
+    let getter = getter_fn(&input, &args);
+    impls.extend(quote! {
+        impl #ingredient {
+            #getter
         }
-
-        impls.extend(quote_spanned! {input.ident.span()=>
-            impl #ingredient {
-                pub fn get(self, db: &dyn #db_path) -> #output_type {
-                    #extractor
-                }
-            }
-        });
-    }
+    });
 
     let mut tokens = input.to_token_stream();
     tokens.extend(impls);
     Ok(tokens)
+}
+
+fn getter_fn(input: &syn::DeriveInput, args: &crate::meta::Arguments) -> TokenStream {
+    let data_ident = &input.ident;
+    let mut output_type = data_ident.to_token_stream();
+
+    let mut extractor = quote! {
+        haste::DatabaseExt::lookup(db, self)
+    };
+
+    if args.clone {
+        extractor = quote! {
+            <#data_ident as std::clone::Clone>::clone(#extractor)
+        }
+    } else {
+        output_type = syn::parse_quote! { &#output_type };
+    }
+
+    let db_path = &args.db;
+    quote_spanned! {input.ident.span()=>
+        pub fn get(self, db: &dyn #db_path) -> #output_type {
+            #extractor
+        }
+    }
 }
 
 struct IngredientInfo<'a> {

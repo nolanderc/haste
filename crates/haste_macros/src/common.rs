@@ -20,9 +20,9 @@ impl<'a> FieldInfo<'a> {
             syn::Member::Named(ident) => ident.clone(),
             syn::Member::Unnamed(index) => {
                 if index.index == 0 {
-                    format_ident!("get", span = index.span)
+                    format_ident!("get_inner", span = index.span)
                 } else {
-                    format_ident!("get_{}", index.index, span = index.span)
+                    format_ident!("get_inner_{}", index.index, span = index.span)
                 }
             }
         }

@@ -1,5 +1,4 @@
 #![feature(type_alias_impl_trait)]
-#![feature(async_fn_in_trait)]
 
 mod arena;
 mod input;
@@ -8,6 +7,8 @@ pub mod query_cache;
 mod runtime;
 mod shard_map;
 mod storage;
+
+use std::future::Future;
 
 pub use haste_macros::*;
 pub use query_cache::*;
@@ -144,14 +145,25 @@ impl<'db, Q: Query> Spawned<'db, Q> {
     }
 }
 
+type ExecuteFuture<'db, DB: ?Sized, Q: Query>
+where
+    Q: Query,
+    Q::Input: 'db,
+    Q::Output: 'db,
+    Q::Storage: 'db,
+    Q::Container: QueryCache<Query = Q> + 'db,
+    DB: WithStorage<Q::Storage>,
+= impl Future<Output = &'db <Q as Query>::Output> + 'db;
+
 /// Extends databases with generic methods for working with [`Ingredient`]s.
 ///
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
 pub trait DatabaseExt: Database {
     /// Execute a query with some input, reusing previous results if possible.
-    async fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> &'db Q::Output
+    fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
     where
         Q: Query,
+        Q::Input: 'db,
         Q::Output: 'db,
         Q::Storage: 'db,
         Q::Container: QueryCache<Query = Q> + 'db,
@@ -160,10 +172,13 @@ pub trait DatabaseExt: Database {
         let db = self.as_dyn();
         let storage = self.storage();
         let cache = storage.container();
-        let id = cache.evaluate(db, input).await;
 
-        // SAFETY: we just executed this query, so the `id` will be valid.
-        unsafe { cache.get_output(id, db.runtime()) }
+        async move {
+            let id = cache.evaluate(db, input).await;
+
+            // SAFETY: we just executed this query, so the `id` will be valid.
+            unsafe { cache.get_output(id, db.runtime()) }
+        }
     }
 
     /// Signals to the runtime that we might eventually need the output of the given query.

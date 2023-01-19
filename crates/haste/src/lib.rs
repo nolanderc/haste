@@ -172,12 +172,22 @@ pub trait DatabaseExt: Database {
         let db = self.as_dyn();
         let storage = self.storage();
         let cache = storage.container();
+        let result = cache.get_or_evaluate(db, input);
 
         async move {
-            let id = cache.evaluate(db, input).await;
+            let id = match result {
+                Ok(id) => id,
+                Err(evaluation) => evaluation.await,
+            };
+
+            db.runtime().register_dependency(Dependency {
+                ingredient: cache.path(),
+                resource: id,
+                extra: 0,
+            });
 
             // SAFETY: we just executed this query, so the `id` will be valid.
-            unsafe { cache.get_output(id, db.runtime()) }
+            unsafe { cache.output(id) }
         }
     }
 
@@ -192,14 +202,19 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        // let runtime = self.runtime();
-        // let storage = self.storage();
-        // let cache = storage.container();
-        // cache.path();
-        //
-        // // TODO: perform this work on another thread/node
-        // let db = self.as_dyn();
-        // cache.evaluate(db, input);
+        let db = self.as_dyn();
+        let storage = self.storage();
+        let cache = storage.container();
+        let result = cache.get_or_evaluate(db, input);
+
+        match result {
+            // the query is already computed, so we are done here
+            Ok(_id) => {}
+            // the query must be evaluated, so spawn it in the runtime for concurrent processing
+            Err(evaluation) => {
+                db.runtime().spawn(evaluation);
+            }
+        };
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T

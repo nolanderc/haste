@@ -1,6 +1,6 @@
 use std::{cell::Cell, future::Future, pin::Pin, sync::atomic::AtomicU32};
 
-use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
+use crate::{non_max::NonMaxU32, Id, IngredientDatabase, IngredientPath, Query};
 
 #[derive(Default)]
 pub struct Runtime {
@@ -10,6 +10,28 @@ pub struct Runtime {
 pub struct ExecutionResult<O> {
     pub output: O,
     pub dependencies: Vec<Dependency>,
+}
+
+pub trait QueryTask: Future<Output = crate::Id> {
+    /// Emit a human-readable description of the query.
+    fn description(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<unimplemented>")
+    }
+}
+
+pub struct TaskHandle<'a> {
+    runtime: &'a Runtime,
+}
+
+impl Future for TaskHandle<'_> {
+    type Output = Id;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        todo!("poll task handle")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,12 +94,14 @@ thread_local! {
     static ACTIVE_TASK: Cell<Option<TaskData>> = Cell::new(None);
 }
 
-pub(crate) struct QueryTask<'db, Q: Query> {
+pub(crate) struct QueryFuture<'db, Q: Query> {
+    /// The future which drives the query progress.
     inner: Q::Future<'db>,
+    /// Data associated with the executing task.
     task: Option<TaskData>,
 }
 
-impl<'db, Q: Query> Future for QueryTask<'db, Q> {
+impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
     type Output = ExecutionResult<Q::Output>;
 
     fn poll(
@@ -85,13 +109,19 @@ impl<'db, Q: Query> Future for QueryTask<'db, Q> {
         ctx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         ACTIVE_TASK.with(|task| unsafe {
+            // project the inner fields
             let this = self.get_unchecked_mut();
             let inner = Pin::new_unchecked(&mut this.inner);
 
+            // set the current task as active when polling the query
             let old_task = task.replace(this.task.take());
+
             let poll_inner = inner.poll(ctx);
+
+            // we then restore the previous task (if any)
             this.task = task.replace(old_task);
 
+            // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
             let dependencies = this.task.take().unwrap().dependencies;
 
@@ -108,8 +138,8 @@ impl Runtime {
         &self,
         db: &'db IngredientDatabase<Q>,
         input: Q::Input,
-    ) -> QueryTask<'db, Q> {
-        QueryTask {
+    ) -> QueryFuture<'db, Q> {
+        QueryFuture {
             inner: Q::execute(db, input),
             task: Some(TaskData::new(self.id_allocator.next())),
         }
@@ -122,5 +152,12 @@ impl Runtime {
             data.dependencies.push(dependency);
             task.set(Some(data));
         })
+    }
+
+    pub(crate) fn spawn<'a, T>(&'a self, task: T) -> TaskHandle
+    where
+        T: QueryTask + 'a,
+    {
+        todo!("spawn task")
     }
 }

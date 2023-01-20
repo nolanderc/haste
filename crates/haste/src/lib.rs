@@ -133,19 +133,6 @@ pub trait InputContainer: ElementContainer {
     fn get_mut(&mut self, id: crate::Id) -> Self::RefMut<'_>;
 }
 
-/// Represents a query that has been spawned in a runtime.
-pub struct Spawned<'db, Q: Query> {
-    /// This is just a dummy implementation that evaluates the result straight away.
-    output: &'db Q::Output,
-}
-
-impl<'db, Q: Query> Spawned<'db, Q> {
-    /// Wait for the result of the query to become available.
-    pub fn join(self) -> &'db Q::Output {
-        self.output
-    }
-}
-
 type ExecuteFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
@@ -215,9 +202,12 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => unsafe {
-                db.runtime().spawn(eval);
-            },
+            EvalResult::Eval(eval) => {
+                // TODO: remove this `unsafe`:
+                // FIXME: this is unsound, but how do we constrain the type system so that the
+                // lifetime of the task is known to be valid for the entire runtime?
+                unsafe { db.runtime().spawn(eval) };
+            }
         }
     }
 

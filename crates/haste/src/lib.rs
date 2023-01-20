@@ -7,6 +7,7 @@ pub mod query_cache;
 mod runtime;
 mod shard_map;
 mod storage;
+pub mod util;
 
 use std::future::Future;
 
@@ -176,8 +177,9 @@ pub trait DatabaseExt: Database {
 
         async move {
             let id = match result {
-                Ok(id) => id,
-                Err(evaluation) => evaluation.await,
+                EvalResult::Cached(id) => id,
+                EvalResult::Eval(eval) => eval.await,
+                EvalResult::Pending(pending) => pending.await,
             };
 
             db.runtime().register_dependency(Dependency {
@@ -200,6 +202,7 @@ pub trait DatabaseExt: Database {
         Q: Query,
         Q::Storage: 'db,
         Q::Container: QueryCache<Query = Q> + 'db,
+        <Q::Container as QueryCache>::EvalTask<'db>: Send,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.as_dyn();
@@ -208,13 +211,14 @@ pub trait DatabaseExt: Database {
         let result = cache.get_or_evaluate(db, input);
 
         match result {
-            // the query is already computed, so we are done here
-            Ok(_id) => {}
+            // the query is already computed/pending, so we are done here
+            EvalResult::Cached(_) | EvalResult::Pending(_) => {}
+
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            Err(evaluation) => {
-                db.runtime().spawn(evaluation);
-            }
-        };
+            EvalResult::Eval(eval) => unsafe {
+                db.runtime().spawn(eval);
+            },
+        }
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T

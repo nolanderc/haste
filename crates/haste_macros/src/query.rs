@@ -61,11 +61,6 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
         impl #ident {
             #query_fn
-
-            #[allow(unused_parens)]
-            pub fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
-                haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*))
-            }
         }
 
         impl haste::Ingredient for #ident {
@@ -90,17 +85,24 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         quote_spanned! {output_type.span()=> &#output_type }
     };
 
-    let mut execution = quote! {
-        haste::DatabaseExt::execute_cached::<#ident>(#db_ident, (#(#input_idents),*)).await
+    let clone = if args.clone {
+        quote! { <#output_type as std::clone::Clone>::clone }
+    } else {
+        quote! {}
     };
 
-    if args.clone {
-        execution = quote! { <#output_type as std::clone::Clone>::clone(#execution) };
-    }
-
     tokens.extend(quote_spanned! {ident.span()=>
+        #[allow(unused_parens)]
         #vis async fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
-            #execution
+            #clone (haste::DatabaseExt::execute_cached::<#ident>(#db_ident, (#(#input_idents),*)).await)
+        }
+
+        #[allow(unused_parens)]
+        impl #ident {
+            #[allow(unused_parens)]
+            #vis fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
+                haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*));
+            }
         }
     });
 

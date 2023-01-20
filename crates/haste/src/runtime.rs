@@ -1,59 +1,47 @@
-use std::{cell::Cell, future::Future, pin::Pin, sync::atomic::AtomicU32};
+mod task;
 
-use crate::{non_max::NonMaxU32, Id, IngredientDatabase, IngredientPath, Query};
+use std::{
+    cell::Cell,
+    future::Future,
+    pin::Pin,
+    sync::{atomic::AtomicU32, Arc},
+};
+
+use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
+
+pub use self::task::QueryTask;
+use self::task::RawTask;
 
 #[derive(Default)]
 pub struct Runtime {
-    id_allocator: TaskIdAllocator,
+    scheduler: Arc<Scheduler>,
+}
+
+struct Scheduler {
+    sender: flume::Sender<RawTask>,
+    receiver: flume::Receiver<RawTask>,
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        let (sender, receiver) = flume::unbounded();
+        Self { sender, receiver }
+    }
+}
+
+impl Scheduler {
+    pub fn schedule(&self, task: RawTask) {
+        let _ = self.sender.send(task);
+    }
+
+    pub async fn take(&self) -> Option<RawTask> {
+        self.receiver.recv_async().await.ok()
+    }
 }
 
 pub struct ExecutionResult<O> {
     pub output: O,
     pub dependencies: Vec<Dependency>,
-}
-
-pub trait QueryTask: Future<Output = crate::Id> {
-    /// Emit a human-readable description of the query.
-    fn description(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<unimplemented>")
-    }
-}
-
-pub struct TaskHandle<'a> {
-    runtime: &'a Runtime,
-}
-
-impl Future for TaskHandle<'_> {
-    type Output = Id;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        todo!("poll task handle")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TaskId(NonMaxU32);
-
-struct TaskIdAllocator {
-    next: AtomicU32,
-}
-
-impl Default for TaskIdAllocator {
-    fn default() -> Self {
-        Self {
-            next: AtomicU32::new(0),
-        }
-    }
-}
-
-impl TaskIdAllocator {
-    pub fn next(&self) -> TaskId {
-        let raw = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TaskId(NonMaxU32::new(raw).expect("exhausted task IDs"))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,19 +59,13 @@ const _: () = assert!(
 
 /// All data required to execute a task
 struct TaskData {
-    /// A unique identifier for this task (note: task IDs might be recycled once they have finished
-    /// running)
-    #[allow(unused)]
-    id: TaskId,
-
     /// List of all task dependencies
     dependencies: Vec<Dependency>,
 }
 
 impl TaskData {
-    fn new(id: TaskId) -> Self {
+    fn new() -> Self {
         Self {
-            id,
             dependencies: Vec::new(),
         }
     }
@@ -141,23 +123,63 @@ impl Runtime {
     ) -> QueryFuture<'db, Q> {
         QueryFuture {
             inner: Q::execute(db, input),
-            task: Some(TaskData::new(self.id_allocator.next())),
+            task: Some(TaskData::new()),
         }
     }
 
     /// Register a dependency under the currently running query
     pub(crate) fn register_dependency(&self, dependency: Dependency) {
-        ACTIVE_TASK.with(|task| {
-            let Some(mut data) = task.take() else { return };
-            data.dependencies.push(dependency);
-            task.set(Some(data));
+        ACTIVE_TASK.with(|active| {
+            let Some(mut task) = active.take() else { return };
+            task.dependencies.push(dependency);
+            active.set(Some(task));
         })
     }
 
-    pub(crate) fn spawn<'a, T>(&'a self, task: T) -> TaskHandle
+    pub(crate) unsafe fn spawn<'a, T>(&'a self, task: T)
     where
-        T: QueryTask + 'a,
+        T: QueryTask + Send + 'a,
     {
-        todo!("spawn task")
+        // extend the lifetime of the task to allow it to be stored in the runtime
+        let task = std::mem::transmute::<
+            Box<dyn QueryTask + Send + 'a>,
+            Box<dyn QueryTask + Send + 'static>,
+        >(Box::new(task));
+
+        let task = RawTask::new(task, Arc::downgrade(&self.scheduler));
+        self.scheduler.schedule(task);
+    }
+
+    pub fn block_on<F>(&self, f: F) -> F::Output
+    where
+        F: Future,
+    {
+        pollster::block_on(self.run(f))
+    }
+
+    /// Drive the runtime until the future completes
+    pub async fn run<F>(&self, f: F) -> F::Output
+    where
+        F: Future,
+    {
+        let forever = async move {
+            let mut i = 0u8;
+            loop {
+                if let Some(task) = self.scheduler.take().await {
+                    task.poll();
+                } else {
+                    break;
+                }
+
+                i = i.wrapping_add(1);
+                if i == 0 {
+                    futures_lite::future::yield_now().await;
+                }
+            }
+
+            std::future::pending().await
+        };
+
+        futures_lite::future::race(f, forever).await
     }
 }

@@ -153,6 +153,9 @@ pub struct Arena<T> {
     raw: RawArena<OnceCell<T>>,
 }
 
+unsafe impl<T: Send> Send for Arena<T> {}
+unsafe impl<T: Send> Sync for Arena<T> {}
+
 impl<T> std::ops::Index<usize> for Arena<T> {
     type Output = T;
 
@@ -253,7 +256,8 @@ impl<T> OnceCell<T> {
 
     /// # Safety
     ///
-    /// The caller ensures that the cell has never been written to before.
+    /// The caller ensures that the cell has never been written to before and that there are no
+    /// concurrent writes.
     unsafe fn write_unique(&self, value: T) -> &T {
         self.value.get().write(MaybeUninit::new(value));
         self.state.finish_write();
@@ -292,6 +296,9 @@ impl<T> OnceCell<T> {
 pub struct AppendArena<T> {
     raw: RawArena<UnsafeCell<MaybeUninit<T>>>,
 }
+
+unsafe impl<T: Send> Send for AppendArena<T> {}
+unsafe impl<T: Send> Sync for AppendArena<T> {}
 
 impl<T> Default for AppendArena<T> {
     fn default() -> Self {

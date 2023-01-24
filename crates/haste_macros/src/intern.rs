@@ -71,6 +71,7 @@ fn derive_struct(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Re
 
         impls.extend(quote_spanned! {span=>
             impl #ingredient {
+                #[allow(unused)]
                 pub fn #getter(self, db: &dyn #db_path) -> #output_type {
                     #extractor
                 }
@@ -145,6 +146,7 @@ fn getter_fn(input: &syn::DeriveInput, args: &crate::meta::Arguments) -> TokenSt
 
     let db_path = &args.db;
     quote_spanned! {input.ident.span()=>
+        #[allow(unused)]
         pub fn get(self, db: &dyn #db_path) -> #output_type {
             #extractor
         }

@@ -43,6 +43,7 @@ impl Id {
 /// to the runtime.
 pub trait Database {
     fn runtime(&self) -> &Runtime;
+    fn runtime_mut(&mut self) -> &mut Runtime;
 }
 
 /// Implemented by databases which contain a specific type of storage.
@@ -75,8 +76,8 @@ pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
 }
 
 pub trait Query: Ingredient {
-    type Input;
-    type Output;
+    type Input: 'static;
+    type Output: 'static;
     type Future<'db>: std::future::Future<Output = Self::Output>;
 
     fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
@@ -108,18 +109,6 @@ pub trait ElementContainer: Container {
 
     /// Get the element associated with the given ID without tracking any dependencies.
     fn get_untracked(&self, id: Id) -> Self::Ref<'_>;
-
-    /// Get the element associated with the given ID and also add it as a dependency for the
-    /// current query.
-    fn get(&self, id: crate::Id, runtime: &Runtime) -> Self::Ref<'_> {
-        let value = self.get_untracked(id);
-        runtime.register_dependency(Dependency {
-            ingredient: self.path(),
-            resource: id,
-            extra: 0,
-        });
-        value
-    }
 }
 
 /// A container which can store the inputs to the database. This requires the ability to modify
@@ -136,8 +125,6 @@ pub trait InputContainer: ElementContainer {
 type ExecuteFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
-    Q::Input: 'db,
-    Q::Output: 'db,
     Q::Storage: 'db,
     Q::Container: QueryCache<Query = Q> + 'db,
     DB: WithStorage<Q::Storage>,
@@ -151,8 +138,6 @@ pub trait DatabaseExt: Database {
     fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
     where
         Q: Query,
-        Q::Input: 'db,
-        Q::Output: 'db,
         Q::Storage: 'db,
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
@@ -203,10 +188,7 @@ pub trait DatabaseExt: Database {
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
             EvalResult::Eval(eval) => {
-                // TODO: remove this `unsafe`:
-                // FIXME: this is unsound, but how do we constrain the type system so that the
-                // lifetime of the task is known to be valid for the entire runtime?
-                unsafe { db.runtime().spawn(eval) };
+                db.runtime().spawn(eval);
             }
         }
     }
@@ -231,10 +213,18 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainer + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let id = handle.id();
+        let runtime = self.runtime();
         let storage = self.storage();
         let container = storage.container();
-        container.get(id, self.runtime())
+
+        let id = handle.id();
+        let value = container.get_untracked(id);
+        runtime.register_dependency(Dependency {
+            ingredient: container.path(),
+            resource: id,
+            extra: 0,
+        });
+        value
     }
 
     fn input_mut_untracked<'db, T>(
@@ -255,3 +245,21 @@ pub trait DatabaseExt: Database {
 }
 
 impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
+
+/// Enters a scope within which it is possible to execute queries on other threads.
+pub fn scope<DB, F, T>(db: &mut DB, f: F) -> T
+where
+    F: FnOnce(&DB) -> T,
+    DB: Database + ?Sized,
+{
+    let entered = unsafe { db.runtime_mut().enter() };
+
+    let output = f(db);
+
+    if entered {
+        // we were the ones responsible for calling `enter`, so we must also `exit`
+        db.runtime_mut().exit();
+    }
+
+    output
+}

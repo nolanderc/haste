@@ -26,6 +26,10 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                 fn runtime(&self) -> &haste::Runtime {
                     &self.runtime
                 }
+
+                fn runtime_mut(&mut self) -> &mut haste::Runtime {
+                    &mut self.runtime
+                }
             }
 
             impl haste::WithStorages for #ident {

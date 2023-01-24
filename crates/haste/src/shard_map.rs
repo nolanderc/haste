@@ -63,7 +63,10 @@ impl<K, V, const SHARDS: usize> ShardMap<K, V, SHARDS> {
     }
 
     pub fn shard_index(&self, hash: u64) -> usize {
-        (hash % (SHARDS as u64)) as usize
+        // get the highest bits of the hash to reduce the likelyhood of hash collisions
+        let shard_bits = 8 * std::mem::size_of_val(&SHARDS) as u32 - SHARDS.leading_zeros();
+        let shift_amount = 64 - shard_bits;
+        ((hash >> shift_amount) % (SHARDS as u64)) as usize
     }
 
     pub fn shard(&self, hash: u64) -> &Shard<K, V> {

@@ -48,7 +48,7 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
 }
 
 #[haste::query]
-async fn smallest_factor(db: &dyn crate::Db, n: u32) -> Option<NonZeroU32> {
+async fn smallest_factor(_db: &dyn crate::Db, n: u32) -> Option<NonZeroU32> {
     let mut i = 2;
     // we intentionally made this an `O(n)` algorithm
     while i * i <= n {
@@ -75,37 +75,26 @@ async fn factors(db: &dyn crate::Db, n: u32) -> Vec<u32> {
 }
 
 fn main() {
-    let db = Database::default();
+    let mut db = Database::default();
 
-    std::thread::scope(|scope| {
-        // create a threadpool
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            .saturating_sub(1);
+    let start = std::time::Instant::now();
 
-        let shutdown = haste::util::Signal::new();
-        for _ in 0..num_threads {
-            let shutdown = shutdown.wait();
-            scope.spawn(|| db.runtime.block_on(shutdown));
-        }
-
-        let max = 1_00_000;
-
-        let start = std::time::Instant::now();
-
+    // a scope is a region of code within which we can safely spawn tasks
+    haste::scope(&mut db, |db| {
+        let max = 1_000_000;
         for i in 0..max {
-            factors::prefetch(&db, i);
+            factors::prefetch(db, i);
         }
 
         let mut factorings = Vec::with_capacity(max as usize);
         for i in 0..max {
-            let out = db.runtime.block_on(factors(&db, i));
+            let out = db.runtime.block_on(factors(db, i));
             factorings.push((i, out));
         }
-        let duration = start.elapsed();
-        dbg!(duration);
     });
+
+    let duration = start.elapsed();
+    dbg!(duration);
 
     let a = Text::new(&db, TextData("hello".into()));
     let b = Text::new(&db, TextData("hello".into()));

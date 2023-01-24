@@ -1,20 +1,24 @@
 mod task;
 
-use std::{
-    cell::Cell,
-    future::Future,
-    pin::Pin,
-    sync::{atomic::AtomicU32, Arc},
-};
+use std::{cell::Cell, future::Future, pin::Pin};
 
-use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
+use crate::{Id, IngredientDatabase, IngredientPath, Query};
 
 pub use self::task::QueryTask;
 use self::task::RawTask;
 
-#[derive(Default)]
 pub struct Runtime {
-    scheduler: Arc<Scheduler>,
+    in_scope: bool,
+    tokio: tokio::runtime::Runtime,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            in_scope: false,
+            tokio: tokio::runtime::Runtime::new().unwrap(),
+        }
+    }
 }
 
 struct Scheduler {
@@ -136,50 +140,51 @@ impl Runtime {
         })
     }
 
-    pub(crate) unsafe fn spawn<'a, T>(&'a self, task: T)
+    pub(crate) fn spawn<'a, T>(&'a self, task: T)
     where
         T: QueryTask + Send + 'a,
     {
-        // extend the lifetime of the task to allow it to be stored in the runtime
-        let task = std::mem::transmute::<
-            Box<dyn QueryTask + Send + 'a>,
-            Box<dyn QueryTask + Send + 'static>,
-        >(Box::new(task));
+        assert!(
+            self.in_scope,
+            "call `haste::scope` to enter a scope before spawning new tasks"
+        );
 
-        let task = RawTask::new(task, Arc::downgrade(&self.scheduler));
-        self.scheduler.schedule(task);
+        unsafe {
+            // extend the lifetime of the task to allow it to be stored in the runtime
+            // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
+            // Thus the lifetime of this task is ensured to outlive that.
+            let task = std::mem::transmute::<
+                Pin<Box<dyn QueryTask + Send + 'a>>,
+                Pin<Box<dyn QueryTask + Send + 'static>>,
+            >(Box::pin(task));
+            self.tokio.spawn(task);
+        }
     }
 
     pub fn block_on<F>(&self, f: F) -> F::Output
     where
         F: Future,
     {
-        pollster::block_on(self.run(f))
+        self.tokio.block_on(f)
     }
 
-    /// Drive the runtime until the future completes
-    pub async fn run<F>(&self, f: F) -> F::Output
-    where
-        F: Future,
-    {
-        let forever = async move {
-            let mut i = 0u8;
-            loop {
-                if let Some(task) = self.scheduler.take().await {
-                    task.poll();
-                } else {
-                    break;
-                }
+    /// Enter a new scope, allowing tasks to be spawned into it. If the return value is `true`, the
+    /// caller is responsible for exiting the scope.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that a successful call to `enter` is followed by a matching call to
+    /// `exit` before any further use of the associated database.
+    pub(crate) unsafe fn enter(&mut self) -> bool {
+        let previous = std::mem::replace(&mut self.in_scope, true);
+        previous == false
+    }
 
-                i = i.wrapping_add(1);
-                if i == 0 {
-                    futures_lite::future::yield_now().await;
-                }
-            }
-
-            std::future::pending().await
-        };
-
-        futures_lite::future::race(f, forever).await
+    pub(crate) fn exit(&mut self) {
+        self.in_scope = false;
+        drop(std::mem::replace(
+            &mut self.tokio,
+            tokio::runtime::Runtime::new().unwrap(),
+        ));
     }
 }

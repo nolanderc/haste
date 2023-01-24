@@ -16,7 +16,7 @@ pub enum EvalResult<Eval, Pending> {
 pub trait QueryCache: crate::Container {
     type Query: Query;
 
-    type EvalTask<'a>: QueryTask
+    type EvalTask<'a>: QueryTask + 'a
     where
         Self: 'a;
 
@@ -252,7 +252,7 @@ where
         db: &'a IngredientDatabase<Q>,
         input: Q::Input,
         hash: u64,
-    ) -> HashQueryCacheTask<Q>
+    ) -> HashQueryCacheTask<'a, Q>
     where
         Q::Input: Clone + Unpin,
     {

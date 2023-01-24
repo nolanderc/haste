@@ -99,7 +99,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
         #[allow(unused_parens)]
         impl #ident {
-            #[allow(unused_parens)]
+            #[allow(unused)]
             #vis fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
                 haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*));
             }

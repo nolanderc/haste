@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    arena::AppendArena, shard_map::ShardMap, Database, Dependency, ExecutionResult, Id,
-    IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
+    arena::AppendArena, Database, Dependency, ExecutionResult, Id, IngredientDatabase,
+    IngredientPath, Query, QueryFuture, QueryTask,
 };
 
 pub enum EvalResult<Eval, Pending> {
@@ -53,7 +53,7 @@ pub trait QueryCache: crate::Container {
 
 pub struct HashQueryCache<Q: Query> {
     path: IngredientPath,
-    entries: ShardMap<Q::Input, InputSlot>,
+    entries: flurry::HashMap<Q::Input, Mutex<InputSlot>>,
     outputs: OutputStorage<Q::Output>,
 }
 
@@ -171,7 +171,7 @@ impl<Q: Query> crate::Container for HashQueryCache<Q> {
 
 impl<Q: Query> QueryCache for HashQueryCache<Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Ord + Clone + Unpin + Sync,
 {
     type Query = Q;
 
@@ -184,33 +184,16 @@ where
         db: &'a IngredientDatabase<Q>,
         input: <Q as Query>::Input,
     ) -> EvalResult<Self::EvalTask<'a>, Self::PendingFuture<'a>> {
-        // only hash the input once:
-        let hash = self.entries.hash(&input);
-        let shard = self.entries.shard(hash);
+        let guard = self.entries.guard();
 
-        {
-            // check if the query has already executed previously, and return that result
-            let mut table = shard.raw().lock().unwrap();
-            if let Some(entry) = table.get_mut(hash, self.entries.eq_fn(&input)) {
-                match &mut entry.value {
-                    InputSlot::Done(id) => return EvalResult::Cached(*id),
-                    InputSlot::Progress(progress) => {
-                        let signal = progress.wait();
-                        return EvalResult::Pending(async move { signal.await });
-                    }
-                }
-            }
-
-            // take ownership of the slot, by marking it as being in progress by us
-            let slot = InputSlot::Progress(QueryProgress::new());
-            table.insert_entry(
-                hash,
-                crate::shard_map::Entry::new(input.clone(), slot),
-                self.entries.hash_fn(),
-            );
+        let slot = Mutex::new(InputSlot::Progress(QueryProgress::new()));
+        match self.entries.try_insert(input.clone(), slot, &guard) {
+            Ok(_) => return EvalResult::Eval(self.execute_query(db, input)),
+            Err(error) => match &mut *error.current.lock().unwrap() {
+                InputSlot::Done(id) => return EvalResult::Cached(*id),
+                InputSlot::Progress(progress) => return EvalResult::Pending(progress.wait()),
+            },
         }
-
-        EvalResult::Eval(self.execute_query(db, input, hash))
     }
 
     unsafe fn output(&self, id: Id) -> &<Self::Query as Query>::Output {
@@ -235,13 +218,12 @@ impl<Q: Query> HashQueryCache<Q> {
 
 impl<Q: Query> HashQueryCache<Q>
 where
-    Q::Input: Hash + Eq,
+    Q::Input: Hash + Ord + Sync,
 {
     fn execute_query<'a>(
         &'a self,
         db: &'a IngredientDatabase<Q>,
         input: Q::Input,
-        hash: u64,
     ) -> HashQueryCacheTask<'a, Q>
     where
         Q::Input: Clone + Unpin,
@@ -249,21 +231,21 @@ where
         let result = db.runtime().execute_query::<Q>(db, input.clone());
         HashQueryCacheTask {
             cache: self,
-            input: Some(input),
-            input_hash: hash,
+            input,
             result,
         }
     }
 
-    fn insert(&self, input: Q::Input, hash: u64, result: ExecutionResult<Q::Output>) -> Id {
+    fn insert(&self, input: &Q::Input, result: ExecutionResult<Q::Output>) -> Id {
         let index = self.outputs.push(result.output, &result.dependencies);
 
         // make the value available for other threads
-        let mut shard = self.entries.shard(hash).raw().lock().unwrap();
-        let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
+        let guard = self.entries.guard();
+        let slot = self.entries.get(input, &guard).unwrap();
 
         let id = Id::try_from_usize(index).expect("exhausted query IDs");
-        match std::mem::replace(&mut entry.value, InputSlot::Done(id)) {
+        let previous = std::mem::replace(&mut *slot.lock().unwrap(), InputSlot::Done(id));
+        match previous {
             InputSlot::Done(_) => unreachable!("query evaluated twice"),
             InputSlot::Progress(progress) => progress.finish(id),
         }
@@ -274,14 +256,13 @@ where
 
 pub struct HashQueryCacheTask<'a, Q: Query> {
     cache: &'a HashQueryCache<Q>,
-    input: Option<Q::Input>,
-    input_hash: u64,
+    input: Q::Input,
     result: QueryFuture<'a, Q>,
 }
 
 impl<Q: Query> QueryTask for HashQueryCacheTask<'_, Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Ord + Sync + Clone,
 {
     fn description(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", std::any::type_name::<Q>())
@@ -290,7 +271,7 @@ where
 
 impl<'a, Q: Query> Future for HashQueryCacheTask<'a, Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Ord + Sync + Clone,
 {
     type Output = Id;
 
@@ -305,10 +286,7 @@ where
         let result = unsafe { Pin::new_unchecked(&mut this.result) };
         let output = std::task::ready!(result.poll(cx));
 
-        // SAFETY: we can move out of `input` because it is `Unpin`
-        let input = this.input.take().unwrap();
-
-        let id = this.cache.insert(input, this.input_hash, output);
+        let id = this.cache.insert(&this.input, output);
 
         std::task::Poll::Ready(id)
     }

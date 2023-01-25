@@ -7,7 +7,7 @@ use hashbrown::raw::RawTable;
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
 
-pub struct ShardMap<K, V, const SHARDS: usize = 16> {
+pub struct ShardMap<K, V, const SHARDS: usize = 8> {
     shards: [Shard<K, V>; SHARDS],
     hasher: BuildHasherDefault,
 }

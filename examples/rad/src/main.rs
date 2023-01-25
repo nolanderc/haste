@@ -79,7 +79,7 @@ fn main() {
                 factors::prefetch(db, i);
             }
             for i in 0..max {
-                factors::spawn(db, i).await;
+                factors(db, i).await;
             }
         });
     });

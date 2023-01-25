@@ -4,7 +4,7 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use crate::{IngredientDatabase, IngredientPath, Query};
@@ -19,28 +19,6 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self { tokio: None }
-    }
-}
-
-struct Scheduler {
-    sender: flume::Sender<RawTask>,
-    receiver: flume::Receiver<RawTask>,
-}
-
-impl Default for Scheduler {
-    fn default() -> Self {
-        let (sender, receiver) = flume::unbounded();
-        Self { sender, receiver }
-    }
-}
-
-impl Scheduler {
-    pub fn schedule(&self, task: RawTask) {
-        let _ = self.sender.send(task);
-    }
-
-    pub async fn take(&self) -> Option<RawTask> {
-        self.receiver.recv_async().await.ok()
     }
 }
 

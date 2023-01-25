@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use super::Scheduler;
+type Scheduler = ();
 
 pub trait QueryTask: Future<Output = crate::Id> {
     /// Emit a human-readable description of the query.
@@ -100,7 +100,7 @@ impl Shared {
 
     fn schedule(self: &Arc<Shared>) {
         if let Some(scheduler) = self.scheduler.upgrade() {
-            scheduler.schedule(RawTask(self.clone()));
+            todo!("schedule task")
         }
     }
 }

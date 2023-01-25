@@ -1,6 +1,8 @@
-use std::{future::Future, sync::Arc, task::Waker};
-
-use parking_lot::Mutex;
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    task::Waker,
+};
 
 pub struct Signal {
     state: Arc<SignalState>,
@@ -34,7 +36,7 @@ impl Signal {
 
 impl Drop for Signal {
     fn drop(&mut self) {
-        let wakers = self.state.wakers.lock().take();
+        let wakers = self.state.wakers.lock().unwrap().take();
         for waker in wakers.unwrap() {
             waker.wake();
         }
@@ -50,7 +52,7 @@ impl Future for WaitSignal {
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
 
-        let wakers = &mut *this.state.wakers.lock();
+        let wakers = &mut *this.state.wakers.lock().unwrap();
         match wakers {
             None => std::task::Poll::Ready(()),
             Some(list) => {

@@ -3,11 +3,11 @@ use proc_macro::TokenStream;
 extern crate proc_macro;
 
 mod common;
+mod database;
 mod intern;
 mod meta;
 mod query;
 mod storage;
-mod database;
 
 #[proc_macro_attribute]
 pub fn database(meta: TokenStream, input: TokenStream) -> TokenStream {

@@ -1,6 +1,10 @@
-use std::{future::Future, hash::Hash, pin::Pin, sync::Arc, task::Waker};
-
-use parking_lot::{Mutex, RwLockUpgradableReadGuard};
+use std::{
+    future::Future,
+    hash::Hash,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::Waker,
+};
 
 use crate::{
     arena::AppendArena, shard_map::ShardMap, Database, Dependency, ExecutionResult, Id,
@@ -16,7 +20,7 @@ pub enum EvalResult<Eval, Pending> {
 pub trait QueryCache: crate::Container {
     type Query: Query;
 
-    type EvalTask<'a>: QueryTask + 'a
+    type EvalTask<'a>: QueryTask + Send + 'a
     where
         Self: 'a;
 
@@ -74,7 +78,7 @@ impl QueryProgress {
         let mut registered = false;
 
         std::future::poll_fn(move |ctx| {
-            let mut state = state.lock();
+            let mut state = state.lock().unwrap();
             let (id, wakers) = &mut *state;
             if let Some(id) = id {
                 return std::task::Poll::Ready(*id);
@@ -91,18 +95,13 @@ impl QueryProgress {
 
     fn finish(self, id: Id) {
         if let Some(state) = self.state {
-            let mut state = state.lock();
+            let mut state = state.lock().unwrap();
             state.0 = Some(id);
             for waker in state.1.drain(..) {
                 waker.wake();
             }
         }
     }
-}
-
-struct ProgressState {
-    id: Option<Id>,
-    wakers: Vec<Waker>,
 }
 
 struct OutputStorage<T> {
@@ -176,7 +175,7 @@ where
 {
     type Query = Q;
 
-    type EvalTask<'a> = impl QueryTask + 'a where Q: 'a;
+    type EvalTask<'a> = impl QueryTask + Send + 'a where Q: 'a;
 
     type PendingFuture<'a> = impl Future<Output = Id> + 'a where Q: 'a;
 
@@ -189,36 +188,27 @@ where
         let hash = self.entries.hash(&input);
         let shard = self.entries.shard(hash);
 
-        // check if the query has already executed previously, and return that result
-        let table = shard.raw().upgradable_read();
-        if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
-            match &entry.value {
-                InputSlot::Done(id) => return EvalResult::Cached(*id),
-                InputSlot::Progress(_) => {}
-            }
-        }
-
-        // otherwise, we need to reserve a slot ourselves: take a write lock on the table
-        let mut table = RwLockUpgradableReadGuard::upgrade(table);
-
-        // avoid a race condition where the slot was reserved while we upgraded the lock
-        if let Some(entry) = table.get_mut(hash, self.entries.eq_fn(&input)) {
-            match &mut entry.value {
-                InputSlot::Done(id) => return EvalResult::Cached(*id),
-                InputSlot::Progress(progress) => {
-                    let signal = progress.wait();
-                    return EvalResult::Pending(async move { signal.await });
+        {
+            // check if the query has already executed previously, and return that result
+            let mut table = shard.raw().lock().unwrap();
+            if let Some(entry) = table.get_mut(hash, self.entries.eq_fn(&input)) {
+                match &mut entry.value {
+                    InputSlot::Done(id) => return EvalResult::Cached(*id),
+                    InputSlot::Progress(progress) => {
+                        let signal = progress.wait();
+                        return EvalResult::Pending(async move { signal.await });
+                    }
                 }
             }
-        }
 
-        // take ownership of the slot, by marking it as being in progress by us
-        let slot = InputSlot::Progress(QueryProgress::new());
-        table.insert_entry(
-            hash,
-            crate::shard_map::Entry::new(input.clone(), slot),
-            self.entries.hash_fn(),
-        );
+            // take ownership of the slot, by marking it as being in progress by us
+            let slot = InputSlot::Progress(QueryProgress::new());
+            table.insert_entry(
+                hash,
+                crate::shard_map::Entry::new(input.clone(), slot),
+                self.entries.hash_fn(),
+            );
+        }
 
         EvalResult::Eval(self.execute_query(db, input, hash))
     }
@@ -269,7 +259,7 @@ where
         let index = self.outputs.push(result.output, &result.dependencies);
 
         // make the value available for other threads
-        let mut shard = self.entries.shard(hash).raw().write();
+        let mut shard = self.entries.shard(hash).raw().lock().unwrap();
         let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
 
         let id = Id::try_from_usize(index).expect("exhausted query IDs");

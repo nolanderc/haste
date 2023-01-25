@@ -1,23 +1,24 @@
 mod task;
 
-use std::{cell::Cell, future::Future, pin::Pin};
+use std::{
+    cell::Cell,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+};
 
-use crate::{Id, IngredientDatabase, IngredientPath, Query};
+use crate::{IngredientDatabase, IngredientPath, Query};
 
 pub use self::task::QueryTask;
 use self::task::RawTask;
 
 pub struct Runtime {
-    in_scope: bool,
-    tokio: tokio::runtime::Runtime,
+    tokio: Option<tokio::runtime::Runtime>,
 }
 
 impl Default for Runtime {
     fn default() -> Self {
-        Self {
-            in_scope: false,
-            tokio: tokio::runtime::Runtime::new().unwrap(),
-        }
+        Self { tokio: None }
     }
 }
 
@@ -75,9 +76,22 @@ impl TaskData {
     }
 }
 
+struct ActiveData {
+    /// The currently active task
+    task: Cell<Option<TaskData>>,
+}
+
+impl ActiveData {
+    fn new() -> Self {
+        Self {
+            task: Cell::new(None),
+        }
+    }
+}
+
 thread_local! {
-    /// The currently active task for the current thread
-    static ACTIVE_TASK: Cell<Option<TaskData>> = Cell::new(None);
+    /// The currently active task for the current thread.
+    static ACTIVE: ActiveData = ActiveData::new();
 }
 
 pub(crate) struct QueryFuture<'db, Q: Query> {
@@ -94,18 +108,18 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
         self: std::pin::Pin<&mut Self>,
         ctx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        ACTIVE_TASK.with(|task| unsafe {
+        ACTIVE.with(|active| unsafe {
             // project the inner fields
             let this = self.get_unchecked_mut();
             let inner = Pin::new_unchecked(&mut this.inner);
 
             // set the current task as active when polling the query
-            let old_task = task.replace(this.task.take());
+            let old_task = active.task.replace(this.task.take());
 
             let poll_inner = inner.poll(ctx);
 
             // we then restore the previous task (if any)
-            this.task = task.replace(old_task);
+            this.task = active.task.replace(old_task);
 
             // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
@@ -133,23 +147,27 @@ impl Runtime {
 
     /// Register a dependency under the currently running query
     pub(crate) fn register_dependency(&self, dependency: Dependency) {
-        ACTIVE_TASK.with(|active| {
-            let Some(mut task) = active.take() else { return };
+        ACTIVE.with(|active| {
+            let Some(mut task) = active.task.take() else { return };
             task.dependencies.push(dependency);
-            active.set(Some(task));
+            active.task.set(Some(task));
         })
     }
 
-    pub(crate) fn spawn<'a, T>(&'a self, task: T)
+    fn executor(&self) -> &tokio::runtime::Runtime {
+        match &self.tokio {
+            None => panic!("call `haste::scope` to enter a scope before spawning new tasks"),
+            Some(executor) => executor,
+        }
+    }
+
+    pub(crate) fn spawn_query<'a, T>(&'a self, task: T) -> impl Future<Output = crate::Id>
     where
         T: QueryTask + Send + 'a,
     {
-        assert!(
-            self.in_scope,
-            "call `haste::scope` to enter a scope before spawning new tasks"
-        );
-
         unsafe {
+            let tokio = self.executor();
+
             // extend the lifetime of the task to allow it to be stored in the runtime
             // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
             // Thus the lifetime of this task is ensured to outlive that.
@@ -157,7 +175,9 @@ impl Runtime {
                 Pin<Box<dyn QueryTask + Send + 'a>>,
                 Pin<Box<dyn QueryTask + Send + 'static>>,
             >(Box::pin(task));
-            self.tokio.spawn(task);
+
+            let handle = tokio.spawn(task);
+            async move { handle.await.unwrap() }
         }
     }
 
@@ -165,9 +185,18 @@ impl Runtime {
     where
         F: Future,
     {
-        self.tokio.block_on(f)
+        self.executor().block_on(f)
     }
+}
 
+/// There may only be one active runtime. This keeps track of what runtime that is.
+///
+/// # Safety
+///
+/// This pointer should only be used for identity comparisons. Dereferincing is forbidden.
+static ACTIVE_RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
+
+impl Runtime {
     /// Enter a new scope, allowing tasks to be spawned into it. If the return value is `true`, the
     /// caller is responsible for exiting the scope.
     ///
@@ -176,15 +205,24 @@ impl Runtime {
     /// The caller must ensure that a successful call to `enter` is followed by a matching call to
     /// `exit` before any further use of the associated database.
     pub(crate) unsafe fn enter(&mut self) -> bool {
-        let previous = std::mem::replace(&mut self.in_scope, true);
-        previous == false
+        use Ordering::Relaxed;
+
+        match ACTIVE_RUNTIME.compare_exchange(std::ptr::null_mut(), self, Relaxed, Relaxed) {
+            Ok(_) => {
+                self.tokio = Some(tokio::runtime::Runtime::new().unwrap());
+                true
+            }
+
+            // this runtime was already active, so we are done:
+            Err(old) if old == self => return false,
+
+            Err(_) => panic!("only one runtime can be in scope at once"),
+        }
     }
 
     pub(crate) fn exit(&mut self) {
-        self.in_scope = false;
-        drop(std::mem::replace(
-            &mut self.tokio,
-            tokio::runtime::Runtime::new().unwrap(),
-        ));
+        // cancel all running tasks and wait for shutdown
+        drop(self.tokio.take());
+        ACTIVE_RUNTIME.store(std::ptr::null_mut(), Ordering::Relaxed);
     }
 }

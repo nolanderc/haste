@@ -22,7 +22,7 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
     {
         let storage_paths = storages.iter();
         impls.extend(quote! {
-            impl haste::Database for #ident {
+            unsafe impl haste::Database for #ident {
                 fn runtime(&self) -> &haste::Runtime {
                     &self.runtime
                 }

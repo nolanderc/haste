@@ -41,7 +41,13 @@ impl Id {
 
 /// A database contains storage for all the ingredients in the query system, and provides a handle
 /// to the runtime.
-pub trait Database {
+///
+/// # Safety
+///
+/// This trait is `unsafe` to implement because it requires the guarantee that the same runtime
+/// will always be returned, and that the lifetime of the runtime is the lifetime of the database
+/// storage. That is: the inner runtime and storage will only ever be accessed together.
+pub unsafe trait Database {
     fn runtime(&self) -> &Runtime;
     fn runtime_mut(&mut self) -> &mut Runtime;
 }
@@ -76,9 +82,9 @@ pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
 }
 
 pub trait Query: Ingredient {
-    type Input: 'static;
-    type Output: 'static;
-    type Future<'db>: std::future::Future<Output = Self::Output>;
+    type Input: 'static + Send;
+    type Output: 'static + Send;
+    type Future<'db>: std::future::Future<Output = Self::Output> + Send;
 
     fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
 }
@@ -130,6 +136,14 @@ where
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
+type SpawnFuture<'db, DB: ?Sized, Q: Query>
+where
+    Q: Query,
+    Q::Storage: 'db,
+    Q::Container: QueryCache<Query = Q> + 'db,
+    DB: WithStorage<Q::Storage>,
+= impl Future<Output = &'db <Q as Query>::Output> + 'db;
+
 /// Extends databases with generic methods for working with [`Ingredient`]s.
 ///
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
@@ -143,6 +157,7 @@ pub trait DatabaseExt: Database {
         Self: WithStorage<Q::Storage>,
     {
         let db = self.as_dyn();
+        let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
         let result = cache.get_or_evaluate(db, input);
@@ -154,7 +169,47 @@ pub trait DatabaseExt: Database {
                 EvalResult::Pending(pending) => pending.await,
             };
 
-            db.runtime().register_dependency(Dependency {
+            runtime.register_dependency(Dependency {
+                ingredient: cache.path(),
+                resource: id,
+                extra: 0,
+            });
+
+            // SAFETY: we just executed this query, so the `id` will be valid.
+            unsafe { cache.output(id) }
+        }
+    }
+
+    /// Signals to the runtime that we might eventually need the output of the given query.
+    ///
+    /// This is intended to be used as an optimization, and is the core primitive for scheduling
+    /// parallel work.
+    fn spawn<'db, Q>(&'db self, input: Q::Input) -> SpawnFuture<'db, Self, Q>
+    where
+        Q: Query,
+        Q::Storage: 'db,
+        Q::Container: QueryCache<Query = Q> + 'db,
+        Self: WithStorage<Q::Storage>,
+    {
+        let db = self.as_dyn();
+        let runtime = self.runtime();
+        let storage = self.storage();
+        let cache = storage.container();
+
+        let result = match cache.get_or_evaluate(db, input) {
+            EvalResult::Cached(id) => EvalResult::Cached(id),
+            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval)),
+            EvalResult::Pending(pending) => EvalResult::Pending(pending),
+        };
+
+        async move {
+            let id = match result {
+                EvalResult::Cached(id) => id,
+                EvalResult::Eval(eval) => eval.await,
+                EvalResult::Pending(pending) => pending.await,
+            };
+
+            runtime.register_dependency(Dependency {
                 ingredient: cache.path(),
                 resource: id,
                 extra: 0,
@@ -174,7 +229,6 @@ pub trait DatabaseExt: Database {
         Q: Query,
         Q::Storage: 'db,
         Q::Container: QueryCache<Query = Q> + 'db,
-        <Q::Container as QueryCache>::EvalTask<'db>: Send,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.as_dyn();
@@ -188,7 +242,7 @@ pub trait DatabaseExt: Database {
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
             EvalResult::Eval(eval) => {
-                db.runtime().spawn(eval);
+                drop(db.runtime().spawn_query(eval));
             }
         }
     }

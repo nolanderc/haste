@@ -1,11 +1,11 @@
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::{
+    hash::{BuildHasher, Hash, Hasher},
+    sync::Mutex,
+};
 
 use hashbrown::raw::RawTable;
-use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard as ReadGuard};
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
-
-pub type EntryRef<'a, K, V> = MappedRwLockReadGuard<'a, Entry<K, V>>;
 
 pub struct ShardMap<K, V, const SHARDS: usize = 16> {
     shards: [Shard<K, V>; SHARDS],
@@ -13,11 +13,11 @@ pub struct ShardMap<K, V, const SHARDS: usize = 16> {
 }
 
 pub struct Shard<K, V> {
-    table: RwLock<RawTable<Entry<K, V>>>,
+    table: Mutex<RawTable<Entry<K, V>>>,
 }
 
 impl<K, V> Shard<K, V> {
-    pub fn raw(&self) -> &RwLock<RawTable<Entry<K, V>>> {
+    pub fn raw(&self) -> &Mutex<RawTable<Entry<K, V>>> {
         &self.table
     }
 }
@@ -63,9 +63,9 @@ impl<K, V, const SHARDS: usize> ShardMap<K, V, SHARDS> {
     }
 
     pub fn shard_index(&self, hash: u64) -> usize {
-        // get the highest bits of the hash to reduce the likelyhood of hash collisions
+        // get the highest bits of the hash to reduce the likelihood of hash collisions
         let shard_bits = 8 * std::mem::size_of_val(&SHARDS) as u32 - SHARDS.leading_zeros();
-        let shift_amount = 64 - shard_bits;
+        let shift_amount = (64 - 7) - shard_bits;
         ((hash >> shift_amount) % (SHARDS as u64)) as usize
     }
 
@@ -87,37 +87,6 @@ impl<K, V, const SHARDS: usize> ShardMap<K, V, SHARDS> {
         K: Eq,
     {
         move |entry| key == &entry.key
-    }
-
-    #[allow(unused)]
-    pub fn insert(&self, key: K, value: V) -> Option<V>
-    where
-        K: Hash + Eq,
-    {
-        let hash = self.hash(&key);
-        let shard = self.shard(hash);
-        let entry = Entry { key, value };
-
-        let mut table = shard.table.write();
-        match table.get_mut(hash, self.eq_fn(&entry.key)) {
-            Some(old) => Some(std::mem::replace(old, entry).value),
-            None => {
-                table.insert_entry(hash, entry, self.hash_fn());
-                None
-            }
-        }
-    }
-
-    #[allow(unused)]
-    pub fn get(&self, key: &K) -> Option<EntryRef<K, V>>
-    where
-        K: Hash + Eq,
-    {
-        let hash = self.hash(key);
-        let shard = self.shard(hash);
-
-        let table = shard.table.read();
-        ReadGuard::try_map(table, |table| table.get(hash, self.eq_fn(key))).ok()
     }
 }
 

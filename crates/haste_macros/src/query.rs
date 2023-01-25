@@ -103,6 +103,11 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             #vis fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
                 haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*));
             }
+
+            #[allow(unused)]
+            #vis async fn spawn(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
+                #clone (haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*)).await)
+            }
         }
     });
 

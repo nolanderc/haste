@@ -1,5 +1,3 @@
-use parking_lot::RwLockUpgradableReadGuard;
-
 use crate::{
     arena::Arena,
     non_max::NonMaxU32,
@@ -46,16 +44,7 @@ impl<T> ArenaInterner<T> {
         let shard = self.entries.shard(hash);
 
         // check if the value already exists in the interner
-        let table = shard.raw().upgradable_read();
-        if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-            return old.key;
-        }
-
-        // get a write lock on the table, allowing us to insert the new value
-        let mut table = RwLockUpgradableReadGuard::upgrade(table);
-
-        // check for race condition, in case another thread managed to insert this value while we
-        // upgraded our read lock to a write lock.
+        let mut table = shard.raw().lock().unwrap();
         if let Some(old) = table.get(hash, self.eq_fn(&value)) {
             return old.key;
         }

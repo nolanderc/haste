@@ -36,15 +36,7 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-
-    fib::prefetch(db, n - 1);
-    fib::prefetch(db, n - 2);
-
-    let a = Box::pin(fib(db, n - 1));
-    let b = Box::pin(fib(db, n - 2));
-
-    let out = a.await + b.await;
-    out
+    fib::spawn(db, n - 1).await + fib::spawn(db, n - 2).await
 }
 
 #[haste::query]
@@ -81,16 +73,15 @@ fn main() {
 
     // a scope is a region of code within which we can safely spawn tasks
     haste::scope(&mut db, |db| {
-        let max = 1_000_000;
-        for i in 0..max {
-            factors::prefetch(db, i);
-        }
-
-        let mut factorings = Vec::with_capacity(max as usize);
-        for i in 0..max {
-            let out = db.runtime.block_on(factors(db, i));
-            factorings.push((i, out));
-        }
+        db.runtime.block_on(async {
+            let max = 1_000_000;
+            for i in 0..max {
+                factors::prefetch(db, i);
+            }
+            for i in 0..max {
+                factors::spawn(db, i).await;
+            }
+        });
     });
 
     let duration = start.elapsed();

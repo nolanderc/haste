@@ -11,27 +11,43 @@ use std::{
     task::Waker,
 };
 
+use smallvec::SmallVec;
+
 pub struct Signal {
+    /// Either `null` or an `Arc<SignalState>`.
+    ///
+    /// The `Arc` is only initialized by waiting tasks. This allows us to avoid an allocation if no
+    /// one ever waits on the signal.
     state: AtomicPtr<SignalState>,
 }
 
 pub struct WaitSignal {
     /// Reference to the shared state.
     state: Arc<SignalState>,
+
     /// The index of this task's waker in the list of wakers.
+    ///
+    /// This is used to determine if we should insert a new waker into the list of wakers, or if we
+    /// can simply re-use the old waker if polled twice.
     registered: Option<u32>,
 }
 
 struct SignalState {
+    /// Either `0` or a `NonZeroU32`. If this is `0` the signal has not been triggered yet.
     value: AtomicU32,
-    wakers: Mutex<Vec<Waker>>,
+
+    /// List of wakers to wake when the value has been set.
+    ///
+    /// We use a mutex here with the reasoning that it will be faster to temporarily take an
+    /// uncontended lock than to allocate a linked list of nodes.
+    wakers: Mutex<SmallVec<[Waker; 4]>>,
 }
 
 impl SignalState {
     const fn new() -> Self {
         Self {
             value: AtomicU32::new(0),
-            wakers: Mutex::new(Vec::new()),
+            wakers: Mutex::new(SmallVec::new_const()),
         }
     }
 
@@ -47,6 +63,7 @@ impl Signal {
         }
     }
 
+    /// Wait until the signal is triggered with a value.
     pub fn wait(&self) -> WaitSignal {
         let mut ptr = self.state.load(Acquire);
 
@@ -80,6 +97,7 @@ impl Signal {
         }
     }
 
+    /// Send the final value to anyone waiting on this signal.
     pub fn finish(mut self, value: NonZeroU32) {
         let ptr = *self.state.get_mut();
         if ptr.is_null() {
@@ -92,7 +110,7 @@ impl Signal {
 
         state.value.store(value.get(), Release);
         if let Ok(mut wakers) = state.wakers.lock() {
-            for waker in std::mem::take(&mut *wakers) {
+            for waker in std::mem::replace(&mut *wakers, SmallVec::new_const()) {
                 waker.wake();
             }
         }

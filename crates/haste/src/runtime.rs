@@ -10,7 +10,6 @@ use std::{
 use crate::{IngredientDatabase, IngredientPath, Query};
 
 pub use self::task::QueryTask;
-use self::task::RawTask;
 
 pub struct Runtime {
     tokio: Option<tokio::runtime::Runtime>,

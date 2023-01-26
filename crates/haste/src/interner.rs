@@ -41,10 +41,17 @@ impl<T> ArenaInterner<T> {
         T: Hash + Eq,
     {
         let hash = self.entries.hash(&value);
-        let shard = self.entries.shard(hash);
+        let shard = self.entries.shard(hash).raw();
 
-        // check if the value already exists in the interner
-        let mut table = shard.raw().lock().unwrap();
+        {
+            // check if the value already exists in the interner
+            let table = shard.read().unwrap();
+            if let Some(old) = table.get(hash, self.eq_fn(&value)) {
+                return old.key;
+            }
+        }
+
+        let mut table = shard.write().unwrap();
         if let Some(old) = table.get(hash, self.eq_fn(&value)) {
             return old.key;
         }

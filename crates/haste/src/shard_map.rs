@@ -1,23 +1,23 @@
 use std::{
     hash::{BuildHasher, Hash, Hasher},
-    sync::Mutex,
+    sync::RwLock,
 };
 
 use hashbrown::raw::RawTable;
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
 
-pub struct ShardMap<K, V, const SHARDS: usize = 8> {
+pub struct ShardMap<K, V, const SHARDS: usize = 32> {
     shards: [Shard<K, V>; SHARDS],
     hasher: BuildHasherDefault,
 }
 
 pub struct Shard<K, V> {
-    table: Mutex<RawTable<Entry<K, V>>>,
+    table: RwLock<RawTable<Entry<K, V>>>,
 }
 
 impl<K, V> Shard<K, V> {
-    pub fn raw(&self) -> &Mutex<RawTable<Entry<K, V>>> {
+    pub fn raw(&self) -> &RwLock<RawTable<Entry<K, V>>> {
         &self.table
     }
 }

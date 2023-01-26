@@ -1,14 +1,18 @@
 use std::{
     future::Future,
     hash::Hash,
+    num::NonZeroU32,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     task::Waker,
 };
 
 use crate::{
-    arena::AppendArena, shard_map::ShardMap, Database, Dependency, ExecutionResult, Id,
-    IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
+    arena::AppendArena, non_max::NonMaxU32, shard_map::ShardMap, Database, Dependency,
+    ExecutionResult, Id, IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
 
 pub enum EvalResult<Eval, Pending> {
@@ -65,42 +69,27 @@ enum InputSlot {
 }
 
 struct QueryProgress {
-    state: Option<Arc<Mutex<(Option<Id>, Vec<Waker>)>>>,
+    signal: crate::util::Signal,
 }
 
 impl QueryProgress {
-    fn new() -> Self {
-        Self { state: None }
+    const fn new() -> Self {
+        Self {
+            signal: crate::util::Signal::new(),
+        }
     }
 
-    fn wait(&mut self) -> impl Future<Output = Id> {
-        let state = self.state.get_or_insert_with(Default::default).clone();
-        let mut registered = false;
-
-        std::future::poll_fn(move |ctx| {
-            let mut state = state.lock().unwrap();
-            let (id, wakers) = &mut *state;
-            if let Some(id) = id {
-                return std::task::Poll::Ready(*id);
-            }
-
-            if !registered {
-                wakers.push(ctx.waker().clone());
-                registered = true;
-            }
-
-            std::task::Poll::Pending
-        })
+    fn wait(&self) -> impl Future<Output = Id> {
+        let wait_signal = self.signal.wait();
+        async move {
+            let raw = wait_signal.await.get();
+            crate::Id::new(NonMaxU32::new(raw - 1).unwrap())
+        }
     }
 
     fn finish(self, id: Id) {
-        if let Some(state) = self.state {
-            let mut state = state.lock().unwrap();
-            state.0 = Some(id);
-            for waker in state.1.drain(..) {
-                waker.wake();
-            }
-        }
+        self.signal
+            .finish(NonZeroU32::new(id.raw.get() + 1).unwrap());
     }
 }
 
@@ -171,7 +160,7 @@ impl<Q: Query> crate::Container for HashQueryCache<Q> {
 
 impl<Q: Query> QueryCache for HashQueryCache<Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Eq + Clone + Sync,
 {
     type Query = Q;
 
@@ -190,24 +179,31 @@ where
 
         {
             // check if the query has already executed previously, and return that result
-            let mut table = shard.raw().lock().unwrap();
-            if let Some(entry) = table.get_mut(hash, self.entries.eq_fn(&input)) {
-                match &mut entry.value {
+            let table = shard.raw().read().unwrap();
+            if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
+                match &entry.value {
                     InputSlot::Done(id) => return EvalResult::Cached(*id),
-                    InputSlot::Progress(progress) => {
-                        let signal = progress.wait();
-                        return EvalResult::Pending(async move { signal.await });
-                    }
+                    InputSlot::Progress(progress) => return EvalResult::Pending(progress.wait()),
+                }
+            }
+        }
+
+        {
+            // Else we have to insert the slot ourselves.
+            // We also have to check for a race condition where another thread inserted its slot
+            // while we were still waiting for the write lock.
+            let mut table = shard.raw().write().unwrap();
+            if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
+                match &entry.value {
+                    InputSlot::Done(id) => return EvalResult::Cached(*id),
+                    InputSlot::Progress(progress) => return EvalResult::Pending(progress.wait()),
                 }
             }
 
             // take ownership of the slot, by marking it as being in progress by us
             let slot = InputSlot::Progress(QueryProgress::new());
-            table.insert_entry(
-                hash,
-                crate::shard_map::Entry::new(input.clone(), slot),
-                self.entries.hash_fn(),
-            );
+            let entry = crate::shard_map::Entry::new(input.clone(), slot);
+            table.insert_entry(hash, entry, self.entries.hash_fn());
         }
 
         EvalResult::Eval(self.execute_query(db, input, hash))
@@ -244,44 +240,52 @@ where
         hash: u64,
     ) -> HashQueryCacheTask<'a, Q>
     where
-        Q::Input: Clone + Unpin,
+        Q::Input: Clone,
     {
         let result = db.runtime().execute_query::<Q>(db, input.clone());
         HashQueryCacheTask {
             cache: self,
-            input: Some(input),
+            input,
             input_hash: hash,
             result,
         }
     }
 
-    fn insert(&self, input: Q::Input, hash: u64, result: ExecutionResult<Q::Output>) -> Id {
+    fn insert(&self, input: &Q::Input, hash: u64, result: ExecutionResult<Q::Output>) -> Id {
         let index = self.outputs.push(result.output, &result.dependencies);
-
-        // make the value available for other threads
-        let mut shard = self.entries.shard(hash).raw().lock().unwrap();
-        let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
-
         let id = Id::try_from_usize(index).expect("exhausted query IDs");
-        match std::mem::replace(&mut entry.value, InputSlot::Done(id)) {
-            InputSlot::Done(_) => unreachable!("query evaluated twice"),
-            InputSlot::Progress(progress) => progress.finish(id),
-        }
 
-        id
+        let previous = {
+            // make the value available for other threads
+            let mut shard = self.entries.shard(hash).raw().write().unwrap();
+            let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
+            std::mem::replace(&mut entry.value, InputSlot::Done(id))
+        };
+
+        match previous {
+            // the query was evaluated twice, so we have to reuse the previous result for
+            // consistency.
+            InputSlot::Done(id) => id,
+
+            // there might be other queries blocked on this result, so notify them all
+            InputSlot::Progress(progress) => {
+                progress.finish(id);
+                id
+            }
+        }
     }
 }
 
 pub struct HashQueryCacheTask<'a, Q: Query> {
     cache: &'a HashQueryCache<Q>,
-    input: Option<Q::Input>,
+    input: Q::Input,
     input_hash: u64,
     result: QueryFuture<'a, Q>,
 }
 
 impl<Q: Query> QueryTask for HashQueryCacheTask<'_, Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Eq + Clone,
 {
     fn description(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", std::any::type_name::<Q>())
@@ -290,7 +294,7 @@ where
 
 impl<'a, Q: Query> Future for HashQueryCacheTask<'a, Q>
 where
-    Q::Input: Hash + Eq + Clone + Unpin,
+    Q::Input: Hash + Eq + Clone,
 {
     type Output = Id;
 
@@ -305,10 +309,7 @@ where
         let result = unsafe { Pin::new_unchecked(&mut this.result) };
         let output = std::task::ready!(result.poll(cx));
 
-        // SAFETY: we can move out of `input` because it is `Unpin`
-        let input = this.input.take().unwrap();
-
-        let id = this.cache.insert(input, this.input_hash, output);
+        let id = this.cache.insert(&this.input, this.input_hash, output);
 
         std::task::Poll::Ready(id)
     }

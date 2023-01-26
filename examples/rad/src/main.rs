@@ -1,6 +1,6 @@
 #![feature(type_alias_impl_trait)]
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::atomic::AtomicU32};
 
 mod token;
 
@@ -73,14 +73,29 @@ fn main() {
 
     // a scope is a region of code within which we can safely spawn tasks
     haste::scope(&mut db, |db| {
-        db.runtime.block_on(async {
-            let max = 1_000_000;
-            for i in 0..max {
-                factors::prefetch(db, i);
+        let max = 1_000_000;
+        let num_cpus = std::thread::available_parallelism().unwrap().get();
+        let i = AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..num_cpus {
+                scope.spawn(|| {
+                    db.runtime.block_on(async {
+                        loop {
+                            let i = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i > max {
+                                break;
+                            }
+                            factors(db, i).await;
+                        }
+                    })
+                });
             }
-            for i in 0..max {
-                factors(db, i).await;
-            }
+
+            db.runtime.block_on(async {
+                for i in 0..max {
+                    factors(db, i).await;
+                }
+            });
         });
     });
 

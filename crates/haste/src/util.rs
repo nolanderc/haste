@@ -18,8 +18,8 @@ pub struct Signal {
 pub struct WaitSignal {
     /// Reference to the shared state.
     state: Arc<SignalState>,
-    /// Has this task's waker been registered in the list of wakers already?
-    registered: bool,
+    /// The index of this task's waker in the list of wakers.
+    registered: Option<u32>,
 }
 
 struct SignalState {
@@ -76,7 +76,7 @@ impl Signal {
 
         WaitSignal {
             state,
-            registered: false,
+            registered: None,
         }
     }
 
@@ -130,21 +130,37 @@ impl Future for WaitSignal {
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
 
+        // fast path if the value has been set
         if let Some(value) = this.state.load_value() {
             return std::task::Poll::Ready(value);
         }
 
-        if !this.registered {
-            this.state.wakers.lock().unwrap().push(cx.waker().clone());
-            this.registered = true;
+        // slow path: take the waker lock and register our waker
+        let mut wakers = this.state.wakers.lock().unwrap();
 
-            // it is possible that the value was set while we were waiting for the lock
-            if let Some(value) = this.state.load_value() {
-                return std::task::Poll::Ready(value);
+        // it is possible that the value was set while we were waiting for the lock
+        if let Some(value) = this.state.load_value() {
+            return std::task::Poll::Ready(value);
+        }
+
+        let current_waker = cx.waker();
+        match this.registered {
+            // we need to register our waker to be polled again
+            None => {
+                this.registered = Some(wakers.len() as u32);
+                wakers.push(current_waker.clone());
+            }
+            // we already have a waker installed
+            Some(index) => {
+                let old = &mut wakers[index as usize];
+                if !old.will_wake(current_waker) {
+                    // we were polled with a new waker, so replace the old
+                    *old = current_waker.clone();
+                }
             }
         }
 
-        // the 
+        // the waker has been registered in the list, and
         std::task::Poll::Pending
     }
 }

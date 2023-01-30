@@ -1,3 +1,16 @@
+//! Implements a lexer following the Go spec.
+//!
+//! The lexer works on a best-effort basis, meaning invalid tokens are matched to the best
+//! fitting token class. Validation of tokens is up to the parser. The reasoning is that the
+//! parser can emit better diagnostics due to having more surrounding context, and also that the
+//! lexer becomes more performant.
+//!
+//! Paricularly, the numeric token classes come in many variants (hexadecimal, binary,
+//! floating-point, etc.) and handling all these in a single case in the lexer becomes hairy.
+//! Instead, if we can use the information that a token is hexadecimal integer during parsing,
+//! we can just have a single case for that case, and not have to worry about hexadecimal floats
+//! as well.
+
 use std::num::{NonZeroU32, NonZeroUsize};
 
 #[repr(u8)]

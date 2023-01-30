@@ -31,7 +31,7 @@ pub mod unix {
         let ptr = unsafe { libc::mmap(ptr::null_mut(), size, protection, flags, -1, 0) };
         match NonNull::new(ptr) {
             Some(ptr) => ptr.cast(),
-            None => panic!("could not reserve virtual memory ({} bytes)", size),
+            None => panic!("could not reserve virtual memory ({size} bytes)"),
         }
     }
 
@@ -55,7 +55,7 @@ pub mod unix {
             return;
         }
 
-        panic!("could not commit memory region: {:p}+{}", ptr, size)
+        panic!("could not commit memory region: {ptr:p}+{size}")
     }
 
     /// Unmap a region of memory.

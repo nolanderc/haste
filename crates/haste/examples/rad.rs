@@ -1,10 +1,8 @@
 #![feature(type_alias_impl_trait)]
 
-use std::{num::NonZeroU32, sync::atomic::AtomicU32};
+use std::num::NonZeroU32;
 
-mod token;
-
-pub trait Db: haste::Database + haste::WithStorage<Storage> + Sync {}
+pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
 #[haste::database(Storage)]
 #[derive(Default)]
@@ -16,7 +14,7 @@ pub struct Database {
 impl Db for Database {}
 
 #[haste::storage]
-pub struct Storage(Text, fib, Person, smallest_factor, factors);
+pub struct Storage(Text, fib, Person, smallest_factor, factors, next_prime);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,7 +43,7 @@ async fn smallest_factor(_db: &dyn crate::Db, n: u32) -> Option<NonZeroU32> {
     // we intentionally made this an `O(n)` algorithm
     while i * i <= n {
         if n % i == 0 {
-            return NonZeroU32::new(i as u32);
+            return NonZeroU32::new(i);
         }
         i += 1;
     }
@@ -66,41 +64,45 @@ async fn factors(db: &dyn crate::Db, n: u32) -> Vec<u32> {
     factors
 }
 
+#[haste::query]
+#[clone]
+async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
+    next_prime::prefetch(db, n + 1);
+
+    if smallest_factor(db, n + 1).await.is_none() {
+        return n + 1;
+    }
+
+    next_prime::spawn(db, n + 1).await
+}
+
 fn main() {
     let mut db = Database::default();
 
     let start = std::time::Instant::now();
 
     // a scope is a region of code within which we can safely spawn tasks
-    haste::scope(&mut db, |db| {
+    haste::scope(&mut db, |scope, db| {
         let max = 1_000_000;
-        let num_cpus = std::thread::available_parallelism().unwrap().get();
-        let i = AtomicU32::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..num_cpus {
-                scope.spawn(|| {
-                    db.runtime.block_on(async {
-                        loop {
-                            let i = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i > max {
-                                break;
-                            }
-                            factors(db, i).await;
-                        }
-                    })
-                });
+
+        std::thread::scope(|threads| {
+            let signal = haste::util::DropSignal::new();
+
+            for _ in 0..8 {
+                let signal = signal.wait();
+                threads.spawn(|| scope.block_on(signal));
             }
 
-            db.runtime.block_on(async {
+            scope.block_on(async {
                 for i in 0..max {
-                    factors(db, i).await;
+                    next_prime(db, i).await;
                 }
             });
-        });
+        })
     });
 
     let duration = start.elapsed();
-    dbg!(duration);
+    eprintln!("time: {duration:?}");
 
     let a = Text::new(&db, TextData("hello".into()));
     let b = Text::new(&db, TextData("hello".into()));

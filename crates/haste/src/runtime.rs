@@ -4,20 +4,28 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Arc,
+    },
 };
 
 use crate::{IngredientDatabase, IngredientPath, Query};
 
 pub use self::task::QueryTask;
+use self::task::Scheduler;
 
 pub struct Runtime {
     tokio: Option<tokio::runtime::Runtime>,
+    scheduler: Arc<Scheduler>,
 }
 
 impl Default for Runtime {
     fn default() -> Self {
-        Self { tokio: None }
+        Self {
+            tokio: None,
+            scheduler: Arc::new(Scheduler::new()),
+        }
     }
 }
 
@@ -131,38 +139,35 @@ impl Runtime {
         })
     }
 
-    fn executor(&self) -> &tokio::runtime::Runtime {
-        match &self.tokio {
-            None => panic!("call `haste::scope` to enter a scope before spawning new tasks"),
-            Some(executor) => executor,
-        }
-    }
-
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T) -> impl Future<Output = crate::Id>
     where
         T: QueryTask + Send + 'a,
     {
         unsafe {
-            let tokio = self.executor();
+            let _tokio = self.executor();
 
             // extend the lifetime of the task to allow it to be stored in the runtime
             // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
             // Thus the lifetime of this task is ensured to outlive that.
             let task = std::mem::transmute::<
-                Pin<Box<dyn QueryTask + Send + 'a>>,
-                Pin<Box<dyn QueryTask + Send + 'static>>,
-            >(Box::pin(task));
-
-            let handle = tokio.spawn(task);
-            async move { handle.await.unwrap() }
+                Box<dyn QueryTask + Send + 'a>,
+                Box<dyn QueryTask + Send + 'static>,
+            >(Box::new(task));
+            self.scheduler.spawn(task)
         }
     }
 
-    pub fn block_on<F>(&self, f: F) -> F::Output
+    pub(crate) fn block_on<F>(&self, f: F) -> F::Output
     where
         F: Future,
     {
-        self.executor().block_on(f)
+        let executor = self.executor();
+        let forever = async { self.run().await };
+        executor.block_on(futures_lite::future::or(f, forever))
+    }
+
+    pub(crate) async fn run(&self) -> ! {
+        self.scheduler.run().await
     }
 }
 
@@ -187,11 +192,12 @@ impl Runtime {
         match ACTIVE_RUNTIME.compare_exchange(std::ptr::null_mut(), self, Relaxed, Relaxed) {
             Ok(_) => {
                 self.tokio = Some(tokio::runtime::Runtime::new().unwrap());
+                self.scheduler.start();
                 true
             }
 
             // this runtime was already active, so we are done:
-            Err(old) if old == self => return false,
+            Err(old) if old == self => false,
 
             Err(_) => panic!("only one runtime can be in scope at once"),
         }
@@ -199,7 +205,20 @@ impl Runtime {
 
     pub(crate) fn exit(&mut self) {
         // cancel all running tasks and wait for shutdown
+        let active = ACTIVE_RUNTIME.load(Ordering::Relaxed);
+        assert!(active == self, "can only exit the currently active runtime");
+
+        self.scheduler.shutdown();
         drop(self.tokio.take());
+
         ACTIVE_RUNTIME.store(std::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Get the current executor
+    fn executor(&self) -> &tokio::runtime::Runtime {
+        match &self.tokio {
+            None => panic!("call `haste::scope` to enter a scope before spawning new tasks"),
+            Some(executor) => executor,
+        }
     }
 }

@@ -18,3 +18,7 @@ smallvec = { version = "1.10.0", features = ["const_new", "union"] }
 
 [dependencies.haste_macros]
 path = "../haste_macros"
+
+[[example]]
+name = "rad"
+path = "examples/rad.rs"

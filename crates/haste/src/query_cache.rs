@@ -77,7 +77,7 @@ impl QueryProgress {
         }
     }
 
-    fn finish(self, id: Id) {
+    fn finish(mut self, id: Id) {
         self.signal
             .finish(NonZeroU32::new(id.raw.get() + 1).unwrap());
     }
@@ -248,7 +248,7 @@ where
         let previous = {
             // make the value available for other threads
             let mut shard = self.entries.shard(hash).raw().write().unwrap();
-            let entry = shard.get_mut(hash, self.entries.eq_fn(&input)).unwrap();
+            let entry = shard.get_mut(hash, self.entries.eq_fn(input)).unwrap();
             std::mem::replace(&mut entry.value, InputSlot::Done(id))
         };
 

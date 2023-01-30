@@ -47,7 +47,7 @@ impl Id {
 /// This trait is `unsafe` to implement because it requires the guarantee that the same runtime
 /// will always be returned, and that the lifetime of the runtime is the lifetime of the database
 /// storage. That is: the inner runtime and storage will only ever be accessed together.
-pub unsafe trait Database {
+pub unsafe trait Database: Sync {
     fn runtime(&self) -> &Runtime;
     fn runtime_mut(&mut self) -> &mut Runtime;
 }
@@ -303,12 +303,16 @@ impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
 /// Enters a scope within which it is possible to execute queries on other threads.
 pub fn scope<DB, F, T>(db: &mut DB, f: F) -> T
 where
-    F: FnOnce(&DB) -> T,
+    F: FnOnce(Scope<'_>, &DB) -> T,
     DB: Database + ?Sized,
 {
     let entered = unsafe { db.runtime_mut().enter() };
 
-    let output = f(db);
+    let scope = Scope {
+        runtime: db.runtime(),
+    };
+
+    let output = f(scope, db);
 
     if entered {
         // we were the ones responsible for calling `enter`, so we must also `exit`
@@ -316,4 +320,14 @@ where
     }
 
     output
+}
+
+pub struct Scope<'a> {
+    runtime: &'a Runtime,
+}
+
+impl<'a> Scope<'a> {
+    pub fn block_on<F: Future>(&self, f: F) -> F::Output {
+        self.runtime.block_on(f)
+    }
 }

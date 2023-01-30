@@ -162,7 +162,7 @@ impl<T> std::ops::Index<usize> for Arena<T> {
     fn index(&self, index: usize) -> &Self::Output {
         match self.get(index) {
             Some(value) => value,
-            None => panic!("index out of bounds: {}", index),
+            None => panic!("index out of bounds: {index}"),
         }
     }
 }

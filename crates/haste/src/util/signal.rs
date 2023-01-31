@@ -93,7 +93,7 @@ impl Signal {
 
                         if ptr.is_null() {
                             // spurious failure: the pointer is still null
-                            continue
+                            continue;
                         }
 
                         // Also drop our newly allocated state:
@@ -134,13 +134,15 @@ impl Signal {
 
         loop {
             if let Some(previous) = Self::done(ptr) {
-                // the task has already finished once before
+                // we need to synchronize with the write of the value so that any writes that
+                // depend on the `previous` value can be seen by the current thread.
+                self.state.load(Acquire);
                 return Err(previous);
             }
 
             match self
                 .state
-                .compare_exchange_weak(ptr, done_ptr, Relaxed, Relaxed)
+                .compare_exchange_weak(ptr, done_ptr, Release, Acquire)
             {
                 // we managed to mark the state as done
                 Ok(_) => break,

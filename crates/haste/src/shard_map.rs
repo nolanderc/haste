@@ -55,7 +55,7 @@ impl<K, V, const SHARDS: usize> ShardMap<K, V, SHARDS> {
         }
     }
 
-    pub fn hash<T>(&self, value: &T) -> u64
+    pub fn hash<T: ?Sized>(&self, value: &T) -> u64
     where
         T: Hash,
     {
@@ -91,7 +91,7 @@ impl<K, V, const SHARDS: usize> ShardMap<K, V, SHARDS> {
 }
 
 /// Use a hasher to hash a single value.
-fn hash_one<T: Hash>(key: &T, builder: &BuildHasherDefault) -> u64 {
+fn hash_one<T: Hash + ?Sized>(key: &T, builder: &BuildHasherDefault) -> u64 {
     let mut state = builder.build_hasher();
     key.hash(&mut state);
     state.finish()

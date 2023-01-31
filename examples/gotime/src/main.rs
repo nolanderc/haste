@@ -4,10 +4,18 @@ use std::{path::PathBuf, sync::Arc};
 
 pub use diagnostic::{Diagnostic, Result};
 
-use crate::token::Token;
+use crate::{
+    common::{SourcePath, SourcePathData, Text},
+    util::TextBox,
+};
 
+mod common;
 mod diagnostic;
+mod syntax;
 mod token;
+mod util;
+mod span;
+mod key;
 
 #[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
 struct Arguments {
@@ -22,7 +30,7 @@ pub struct Database {
 }
 
 #[haste::storage]
-pub struct Storage(compile, source_text);
+pub struct Storage(compile, source_text, Text, SourcePath);
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
@@ -44,27 +52,34 @@ fn main() {
 /// Compile the program using the given arguments
 #[haste::query]
 async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
-    let text = source_text(db, arguments.path.clone()).await?;
-    let tokens = token::tokenize(&text);
+    let source_path = SourcePath::new(db, SourcePathData::new(arguments.path));
 
-    eprintln!("text: {text:?}");
+    let text = source_text(db, source_path).await?;
+    let tokens = token::tokenize(&text);
+    eprintln!("{}", TextBox::new(source_path.display(db), &text));
+
     for token in tokens {
-        if token.token() != Token::SemiColon {
-            eprintln!(
-                "{: <11}: {}",
-                format!("{:?}", token.token()),
-                &text[token.range()]
-            );
-        }
+        eprintln!(
+            "{: <11}: {}",
+            format!("{:?}", token.token()),
+            &text[token.range()]
+        );
     }
 
     Ok(())
 }
 
 /// Get the source text for some file.
+/// TODO: this should be made marked as a mutable input
 #[haste::query]
 #[clone]
-async fn source_text(_db: &dyn crate::Db, path: PathBuf) -> Result<Arc<str>> {
+async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<Arc<str>> {
+    let data = path.get(db);
+    let path = match data {
+        SourcePathData::Absolute(path) => path,
+        SourcePathData::Relative(path) => path,
+    };
+
     match tokio::fs::read_to_string(path).await {
         Ok(text) => Ok(text.into()),
         Err(error) => Err(Diagnostic::error(error.to_string())),

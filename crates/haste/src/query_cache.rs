@@ -47,15 +47,8 @@ pub trait QueryCache: crate::Container {
 
 pub struct HashQueryCache<Q: Query> {
     path: IngredientPath,
-    entries: ShardMap<Q::Input, InputSlot>,
+    entries: ShardMap<Q::Input, QueryProgress>,
     outputs: OutputStorage<Q::Output>,
-}
-
-enum InputSlot {
-    /// The query associated with this specific input is currently is still progressing
-    Progress(QueryProgress),
-    /// The query has completed, and its result is associated with the given ID
-    Done(Id),
 }
 
 struct QueryProgress {
@@ -69,17 +62,22 @@ impl QueryProgress {
         }
     }
 
-    fn wait(&self) -> impl Future<Output = Id> {
-        let wait_signal = self.signal.wait();
-        async move {
-            let raw = wait_signal.await.get();
-            crate::Id::new(NonMaxU32::new(raw - 1).unwrap())
-        }
+    fn id_from_non_zero(value: NonZeroU32) -> crate::Id {
+        crate::Id::new(NonMaxU32::new(value.get() - 1).unwrap())
     }
 
-    fn finish(mut self, id: Id) {
+    fn get_or_wait(&self) -> Result<Id, impl Future<Output = Id>> {
         self.signal
-            .finish(NonZeroU32::new(id.raw.get() + 1).unwrap());
+            .get_or_wait()
+            .map(Self::id_from_non_zero)
+            .map_err(|signal| async move { Self::id_from_non_zero(signal.await) })
+    }
+
+    fn finish(&self, id: Id) -> Result<Id, Id> {
+        self.signal
+            .finish(NonZeroU32::new(id.raw.get() + 1).unwrap())
+            .map(Self::id_from_non_zero)
+            .map_err(Self::id_from_non_zero)
     }
 }
 
@@ -171,9 +169,9 @@ where
             // check if the query has already executed previously, and return that result
             let table = shard.raw().read().unwrap();
             if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
-                match &entry.value {
-                    InputSlot::Done(id) => return EvalResult::Cached(*id),
-                    InputSlot::Progress(progress) => return EvalResult::Pending(progress.wait()),
+                match entry.value.get_or_wait() {
+                    Ok(id) => return EvalResult::Cached(id),
+                    Err(pending) => return EvalResult::Pending(pending),
                 }
             }
         }
@@ -184,15 +182,14 @@ where
             // while we were still waiting for the write lock.
             let mut table = shard.raw().write().unwrap();
             if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
-                match &entry.value {
-                    InputSlot::Done(id) => return EvalResult::Cached(*id),
-                    InputSlot::Progress(progress) => return EvalResult::Pending(progress.wait()),
+                match entry.value.get_or_wait() {
+                    Ok(id) => return EvalResult::Cached(id),
+                    Err(pending) => return EvalResult::Pending(pending),
                 }
             }
 
             // take ownership of the slot, by marking it as being in progress by us
-            let slot = InputSlot::Progress(QueryProgress::new());
-            let entry = crate::shard_map::Entry::new(input.clone(), slot);
+            let entry = crate::shard_map::Entry::new(input.clone(), QueryProgress::new());
             table.insert_entry(hash, entry, self.entries.hash_fn());
         }
 
@@ -245,23 +242,14 @@ where
         let index = self.outputs.push(result.output, &result.dependencies);
         let id = Id::try_from_usize(index).expect("exhausted query IDs");
 
-        let previous = {
-            // make the value available for other threads
-            let mut shard = self.entries.shard(hash).raw().write().unwrap();
-            let entry = shard.get_mut(hash, self.entries.eq_fn(input)).unwrap();
-            std::mem::replace(&mut entry.value, InputSlot::Done(id))
-        };
-
-        match previous {
+        // make the value available for other threads
+        let shard = self.entries.shard(hash).raw().read().unwrap();
+        let entry = shard.get(hash, self.entries.eq_fn(input)).unwrap();
+        match entry.value.finish(id) {
+            Ok(id) => id,
             // the query was evaluated twice, so we have to reuse the previous result for
             // consistency.
-            InputSlot::Done(id) => id,
-
-            // there might be other queries blocked on this result, so notify them all
-            InputSlot::Progress(progress) => {
-                progress.finish(id);
-                id
-            }
+            Err(id) => id,
         }
     }
 }

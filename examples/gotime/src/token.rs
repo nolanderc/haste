@@ -113,6 +113,7 @@ pub enum Token {
     FloatHex,
 
     Imaginary,
+
     Rune,
     String,
     RawString,

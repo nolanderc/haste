@@ -1,4 +1,5 @@
 #![feature(type_alias_impl_trait)]
+#![feature(trivial_bounds)]
 
 mod arena;
 mod input;
@@ -104,17 +105,25 @@ where
 
 /// A container that stores values (elements) which are accessed by an ID.
 pub trait ElementContainer: Container {
-    type Value;
+    type Value: ?Sized;
 
     type Ref<'a>: std::ops::Deref<Target = Self::Value>
     where
         Self: 'a;
 
     /// Add a new element to the container, returning its ID for future access
-    fn insert(&self, value: Self::Value) -> Id;
+    fn insert(&self, value: Self::Value) -> Id
+    where
+        Self::Value: Sized;
 
     /// Get the element associated with the given ID without tracking any dependencies.
     fn get_untracked(&self, id: Id) -> Self::Ref<'_>;
+}
+
+/// Extends `ElementContainer` with methods for inserting references
+pub trait ElementContainerRef: ElementContainer {
+    /// Add a new element to the container, returning its ID for future access
+    fn insert_ref(&self, value: &Self::Value) -> Id;
 }
 
 /// A container which can store the inputs to the database. This requires the ability to modify
@@ -252,11 +261,25 @@ pub trait DatabaseExt: Database {
         T: Ingredient + TrackedReference,
         T::Storage: 'db,
         T::Container: ElementContainer + 'db,
+        <T::Container as ElementContainer>::Value: Sized,
         Self: WithStorage<T::Storage>,
     {
         let storage = self.storage();
         let container = storage.container();
         let id = container.insert(value);
+        T::from_id(id)
+    }
+
+    fn insert_ref<'db, T>(&'db self, value: &<T::Container as ElementContainer>::Value) -> T
+    where
+        T: Ingredient + TrackedReference,
+        T::Storage: 'db,
+        T::Container: ElementContainerRef + 'db,
+        Self: WithStorage<T::Storage>,
+    {
+        let storage = self.storage();
+        let container = storage.container();
+        let id = container.insert_ref(value);
         T::from_id(id)
     }
 
@@ -279,22 +302,6 @@ pub trait DatabaseExt: Database {
             extra: 0,
         });
         value
-    }
-
-    fn input_mut_untracked<'db, T>(
-        &'db mut self,
-        input: T,
-    ) -> <T::Container as InputContainer>::RefMut<'db>
-    where
-        T: Input,
-        T::Storage: 'db,
-        T::Container: InputContainer + 'db,
-        Self: WithStorage<T::Storage>,
-    {
-        let id = input.id();
-        let storage = self.storage_mut();
-        let contanier = storage.container_mut();
-        contanier.get_mut(id)
     }
 }
 

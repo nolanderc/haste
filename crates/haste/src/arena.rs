@@ -72,7 +72,7 @@ impl<T> RawArena<T> {
     }
 
     /// Returns `true` if the `index` has been allocated
-    fn is_allocated(&self, index: usize) -> bool {
+    pub fn is_allocated(&self, index: usize) -> bool {
         index < self.committed.load(Ordering::Relaxed)
     }
 }

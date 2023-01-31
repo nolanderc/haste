@@ -1,6 +1,6 @@
 mod signal;
 
-pub use signal::{DropSignal, DropWaitSignal, Signal, WaitSignal};
+pub use signal::{DropSignal, Signal, WaitSignal};
 
 pub struct CallOnDrop<T, F: FnMut() -> T>(pub F);
 

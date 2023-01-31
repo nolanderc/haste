@@ -5,7 +5,7 @@ use std::{
     sync::{
         atomic::{
             AtomicPtr, AtomicU32,
-            Ordering::{Acquire, Release},
+            Ordering::{Acquire, Relaxed, Release},
         },
         Arc, Mutex,
     },
@@ -15,7 +15,7 @@ use std::{
 use smallvec::SmallVec;
 
 pub struct Signal {
-    /// Either `null` or an `Arc<SignalState>`.
+    /// Either `null`, `Arc<SignalState>` or `(NonZeroU32 << 1) | 1`.
     ///
     /// The `Arc` is only initialized by waiting tasks. This allows us to avoid an allocation if no
     /// one ever waits on the signal.
@@ -64,25 +64,52 @@ impl Signal {
         }
     }
 
+    fn done(ptr: *mut SignalState) -> Option<NonZeroU32> {
+        let addr = ptr as usize;
+        if (addr & 1) != 0 {
+            NonZeroU32::new((addr >> 1) as u32)
+        } else {
+            None
+        }
+    }
+
     /// Wait until the signal is triggered with a value.
-    pub fn wait(&self) -> WaitSignal {
+    pub fn get_or_wait(&self) -> Result<NonZeroU32, WaitSignal> {
         let mut ptr = self.state.load(Acquire);
 
         if ptr.is_null() {
             // initialize the state
             let new = Arc::into_raw(Arc::new(SignalState::new())).cast_mut();
-            while ptr.is_null() {
+            loop {
                 match self.state.compare_exchange_weak(ptr, new, Release, Acquire) {
-                    Ok(_) => ptr = new,
+                    // we managed to initialize the state to our `new` state
+                    Ok(_) => {
+                        ptr = new;
+                        break;
+                    }
+                    // some one else changed the value under our feet, so use that one.
                     Err(actual) => {
-                        // drop the newly allocated state and use the actual one
+                        ptr = actual;
+
+                        if ptr.is_null() {
+                            // spurious failure: the pointer is still null
+                            continue
+                        }
+
+                        // Also drop our newly allocated state:
                         // SAFETY: we are the only ones holding a reference to `new` so this will
                         // always deallocate
                         unsafe { Arc::from_raw(new.cast_const()) };
-                        ptr = actual;
+
+                        break;
                     }
                 }
             }
+        }
+
+        // check if the value has already been set
+        if let Some(value) = Self::done(ptr) {
+            return Ok(value);
         }
 
         // SAFETY: we hold a reference to `self`, so there is at least one owner of the value
@@ -92,21 +119,44 @@ impl Signal {
         // `increment_strong_count`
         let state = unsafe { Arc::from_raw(ptr) };
 
-        WaitSignal {
+        Err(WaitSignal {
             state,
             registered: None,
-        }
+        })
     }
 
     /// Send the final value to anyone waiting on this signal.
-    pub fn finish(&mut self, value: NonZeroU32) {
-        let ptr = std::mem::replace(self.state.get_mut(), std::ptr::null_mut());
-        if ptr.is_null() {
-            // no tasks are waiting on this result
-            return;
+    pub fn finish(&self, value: NonZeroU32) -> Result<NonZeroU32, NonZeroU32> {
+        let done_addr = (value.get() << 1) | 1;
+        let done_ptr = done_addr as *mut _;
+
+        let mut ptr = self.state.load(Relaxed);
+
+        loop {
+            if let Some(previous) = Self::done(ptr) {
+                // the task has already finished once before
+                return Err(previous);
+            }
+
+            match self
+                .state
+                .compare_exchange_weak(ptr, done_ptr, Relaxed, Relaxed)
+            {
+                // we managed to mark the state as done
+                Ok(_) => break,
+
+                // the state may have been initialized or marked as done by another thread, so try
+                // again to determine which case it is
+                Err(new) => ptr = new,
+            }
         }
 
-        // SAFETY: `self` always holds one of the references to the state, so the pointer is valid
+        if ptr.is_null() {
+            return Ok(value);
+        }
+
+        // SAFETY: The pointer was neither `null` nor marked as done, so this must be a valid
+        // `Arc`
         let state = unsafe { &*ptr };
 
         state.value.store(value.get(), Release);
@@ -115,6 +165,8 @@ impl Signal {
                 waker.wake();
             }
         }
+
+        Ok(value)
     }
 }
 
@@ -122,7 +174,7 @@ impl Drop for Signal {
     fn drop(&mut self) {
         let ptr = *self.state.get_mut();
 
-        if ptr.is_null() {
+        if ptr.is_null() || Self::done(ptr).is_some() {
             // nothing more to do
             return;
         }
@@ -192,35 +244,26 @@ pub struct DropSignal {
     raw: Signal,
 }
 
-pub struct DropWaitSignal {
-    raw: WaitSignal,
-}
-
 impl DropSignal {
     pub const fn new() -> Self {
         Self { raw: Signal::new() }
     }
 
-    pub fn wait(&self) -> DropWaitSignal {
-        DropWaitSignal {
-            raw: self.raw.wait(),
+    pub fn wait(&self) -> impl Future<Output = ()> {
+        let result = self.raw.get_or_wait();
+        async move {
+            match result {
+                Ok(_) => {}
+                Err(signal) => {
+                    signal.await;
+                }
+            }
         }
     }
 }
 
 impl Drop for DropSignal {
     fn drop(&mut self) {
-        self.raw.finish(NonZeroU32::new(1).unwrap());
-    }
-}
-
-impl Future for DropWaitSignal {
-    type Output = ();
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().raw).poll(cx).map(drop)
+        let _ = self.raw.finish(NonZeroU32::new(1).unwrap());
     }
 }

@@ -4,8 +4,14 @@ use crate::common::SourcePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
-    pub range: FileRange,
     pub path: SourcePath,
+    pub range: FileRange,
+}
+
+impl Span {
+    pub fn new(path: SourcePath, range: FileRange) -> Self {
+        Self { path, range }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,6 +23,13 @@ pub struct FileRange {
 impl FileRange {
     pub fn slice_range(self) -> std::ops::Range<usize> {
         self.start.get() as usize..self.end.get() as usize
+    }
+
+    pub fn join(self, other: Self) -> Self {
+        Self {
+            start: self.start.max(other.start),
+            end: self.end.max(other.end),
+        }
     }
 }
 

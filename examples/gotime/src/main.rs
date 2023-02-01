@@ -1,21 +1,19 @@
 #![feature(type_alias_impl_trait)]
+#![feature(log_syntax)]
 
 use std::{path::PathBuf, sync::Arc};
 
 pub use diagnostic::{Diagnostic, Result};
 
-use crate::{
-    common::{SourcePath, SourcePathData, Text},
-    util::TextBox,
-};
+use crate::common::{SourcePath, SourcePathData, Text};
 
 mod common;
 mod diagnostic;
+mod key;
+mod span;
 mod syntax;
 mod token;
 mod util;
-mod span;
-mod key;
 
 #[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
 struct Arguments {
@@ -43,28 +41,28 @@ fn main() {
 
     let mut db = Database::default();
     haste::scope(&mut db, |scope, db| {
-        scope.block_on(compile(db, arguments));
-    });
+        let result = scope.block_on(compile(db, arguments));
 
+        match result {
+            Ok(()) => {}
+            Err(diagnostic) => {
+                dbg!(diagnostic);
+            }
+        }
+    });
     eprintln!("time: {:?}", start.elapsed());
 }
 
 /// Compile the program using the given arguments
 #[haste::query]
+#[clone]
 async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let source_path = SourcePath::new(db, SourcePathData::new(arguments.path));
 
     let text = source_text(db, source_path).await?;
-    let tokens = token::tokenize(&text);
-    eprintln!("{}", TextBox::new(source_path.display(db), &text));
+    let ast = syntax::parse(db, &text, source_path)?;
 
-    for token in tokens {
-        eprintln!(
-            "{: <11}: {}",
-            format!("{:?}", token.token()),
-            &text[token.range()]
-        );
-    }
+    dbg!(ast);
 
     Ok(())
 }

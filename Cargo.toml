@@ -4,6 +4,3 @@ members = ["crates/*", "examples/*"]
 # Build dependencies with optimizations
 [profile.dev.package."*"]
 opt-level = 2
-
-[patch.crates-io]
-bytemuck = { git = "https://github.com/Lokathor/bytemuck", rev = "4eea45e21885af768ac2fb4b24e88488c2f1c0ac" }

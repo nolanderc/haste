@@ -10,24 +10,11 @@ use std::num::NonZeroU32;
 /// # use haste::non_max::NonMaxU32;
 /// assert_eq!(size_of::<NonMaxU32>(), size_of::<Option<NonMaxU32>>());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct NonMaxU32 {
     /// We use `NonZeroU32` for its special property that it has `0` as a niche. In order to use
-    /// `u32::MAX` as the niche instead, we always store the bitwise-inverted value (ie. we flip
-    /// all bits: 1s become 0s and 0s become 1s).
-    inverted: NonZeroU32,
-}
-
-impl PartialOrd for NonMaxU32 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NonMaxU32 {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.inverted.cmp(&self.inverted)
-    }
+    /// `u32::MAX` as the niche instead, we always store the value `x` as `x + 1`.
+    encoded: NonZeroU32,
 }
 
 impl std::fmt::Debug for NonMaxU32 {
@@ -49,13 +36,18 @@ impl NonMaxU32 {
     };
 
     pub const fn new(value: u32) -> Option<Self> {
-        match NonZeroU32::new(!value) {
+        match value.checked_add(1) {
             None => None,
-            Some(inverted) => Some(Self { inverted }),
+            Some(non_zero) => {
+                // SAFETY: we just added 1 to `value` and checked for overflow, thus it cannot be
+                // `0`
+                let encoded = unsafe { NonZeroU32::new_unchecked(non_zero) };
+                Some(Self { encoded })
+            }
         }
     }
 
     pub fn get(self) -> u32 {
-        !self.inverted.get()
+        self.encoded.get() - 1
     }
 }

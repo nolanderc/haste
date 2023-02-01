@@ -11,112 +11,149 @@
 //! we can just have a single case for that case, and not have to worry about hexadecimal floats
 //! as well.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Token {
-    Error = 0,
+use haste::non_max::NonMaxU32;
 
-    Identifier,
+use crate::span::FileRange;
 
-    Break,
-    Case,
-    Chan,
-    Const,
-    Continue,
-    Default,
-    Defer,
-    Else,
-    Fallthrough,
-    For,
-    Func,
-    Go,
-    Goto,
-    If,
-    Import,
-    Interface,
-    Map,
-    Package,
-    Range,
-    Return,
-    Select,
-    Struct,
-    Switch,
-    Type,
-    Var,
+macro_rules! define_tokens {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $token:ident {
+            $($variant:ident = $name:literal),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $token {
+            $($variant),*
+        }
 
-    Plus,
-    Minus,
-    Times,
-    Div,
-    Rem,
+        #[allow(unused)]
+        impl $token {
+            pub const ALL: &[Token] = &[$(Self::$variant),*];
+            pub const COUNT: usize = Self::ALL.len();
 
-    And,
-    Or,
-    Xor,
-    Shl,
-    Shr,
-    Nand,
-    LogicalNot,
+            pub const fn display(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),*
+                }
+            }
 
-    PlusAssign,
-    MinusAssign,
-    TimesAssign,
-    DivAssign,
-    RemAssign,
+            pub const fn is_class(self) -> bool {
+                match self {
+                    $(Self::$variant => $name.as_bytes()[0] == b'<'),*
+                }
+            }
+        }
+    };
+}
 
-    AndAssign,
-    OrAssign,
-    XorAssign,
-    ShlAssign,
-    ShrAssign,
-    NandAssign,
+define_tokens! {
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Token {
+        Error = "<error>",
 
-    LogicalAnd,
-    LogicalOr,
-    LThinArrow,
-    PlusPlus,
-    MinusMinus,
+        Identifier = "<identifier>",
 
-    Equal,
-    NotEqual,
-    Less,
-    Greater,
-    LessEqual,
-    GreaterEqual,
+        Break = "break",
+        Case = "case",
+        Chan = "chan",
+        Const = "const",
+        Continue = "continue",
+        Default = "default",
+        Defer = "defer",
+        Else = "else",
+        Fallthrough = "fallthrough",
+        For = "for",
+        Func = "func",
+        Go = "go",
+        Goto = "goto",
+        If = "if",
+        Import = "import",
+        Interface = "interface",
+        Map = "map",
+        Package = "package",
+        Range = "range",
+        Return = "return",
+        Select = "select",
+        Struct = "struct",
+        Switch = "switch",
+        Type = "type",
+        Var = "var",
 
-    Assign,
-    Tilde,
+        Plus = "+",
+        Minus = "-",
+        Times = "*",
+        Div = "/",
+        Rem = "%",
 
-    Define,
-    Ellipses,
+        And = "&",
+        Or = "|",
+        Xor = "^",
+        Shl = "<<",
+        Shr = ">>",
+        Nand = "&^",
+        LogicalNot = "!",
 
-    LParens,
-    LBracket,
-    LCurly,
-    RParens,
-    RBracket,
-    RCurly,
+        PlusAssign = "+=",
+        MinusAssign = "-=",
+        TimesAssign = "*=",
+        DivAssign = "/=",
+        RemAssign = "%=",
 
-    Dot,
-    Colon,
-    Comma,
-    SemiColon,
+        AndAssign = "&=",
+        OrAssign = "|=",
+        XorAssign = "^=",
+        ShlAssign = "<<=",
+        ShrAssign = ">>=",
+        NandAssign = "&^=",
 
-    Integer,
-    IntegerBinary,
-    IntegerOctal,
-    IntegerHex,
+        LogicalAnd = "&&",
+        LogicalOr = "||",
+        LThinArrow = "<-",
+        PlusPlus = "++",
+        MinusMinus = "--",
 
-    Float,
-    FloatHex,
+        Equal = "==",
+        NotEqual = "!=",
+        Less = "<",
+        Greater = ">",
+        LessEqual = "<=",
+        GreaterEqual = ">=",
 
-    Imaginary,
+        Assign = "=",
+        Tilde = "~",
 
-    Rune,
-    String,
-    RawString,
+        Define = ":=",
+        Ellipses = "...",
+
+        LParens = "(",
+        LBracket = "[",
+        LCurly = "{",
+        RParens = ")",
+        RBracket = "]",
+        RCurly = "}",
+
+        Dot = ".",
+        Colon = ":",
+        Comma = ",",
+        SemiColon = ";",
+
+        Integer = "<integer>",
+        IntegerBinary = "<integer>",
+        IntegerOctal = "<integer>",
+        IntegerHex = "<integer>",
+
+        Float = "<float>",
+        FloatHex = "<float>",
+
+        Imaginary = "<imaginary>",
+
+        Rune = "<rune>",
+        String = "<string>",
+    }
 }
 
 pub fn tokenize(text: &str) -> Vec<SpannedToken> {
@@ -481,19 +518,19 @@ impl Token {
 
     fn strip_rune(text: &str) -> (Token, usize) {
         match Self::strip_character_literal::<b'\''>(text) {
-            Some(len) => (Token::Rune, len.get()),
-            None => (Token::Error, text.len()),
+            Ok(len) => (Token::Rune, len),
+            Err(len) => (Token::Error, len),
         }
     }
 
     fn strip_string(text: &str) -> (Token, usize) {
         match Self::strip_character_literal::<b'\"'>(text) {
-            Some(len) => (Token::String, len.get()),
-            None => (Token::Error, text.len()),
+            Ok(len) => (Token::String, len),
+            Err(len) => (Token::Error, len),
         }
     }
 
-    fn strip_character_literal<const QUOTE: u8>(text: &str) -> Option<NonZeroUsize> {
+    fn strip_character_literal<const QUOTE: u8>(text: &str) -> Result<usize, usize> {
         let bytes = text.as_bytes();
         let mut len = 1;
 
@@ -502,7 +539,7 @@ impl Token {
             len += 1;
 
             if first == QUOTE {
-                return NonZeroUsize::new(len);
+                return Ok(len);
             }
 
             if first != b'\\' {
@@ -518,7 +555,7 @@ impl Token {
             };
         }
 
-        None
+        Err(text.len())
     }
 
     fn strip_raw_string(text: &str) -> (Token, usize) {
@@ -529,7 +566,7 @@ impl Token {
             let first = bytes[len];
             len += 1;
             if first == b'`' {
-                return (Token::RawString, len);
+                return (Token::String, len);
             }
         }
 
@@ -537,16 +574,19 @@ impl Token {
     }
 }
 
-// FIXME: accepts codepoints in the category `Other_Alphabetic`, although it shouldn't
+// FIXME: accepts codepoints in the category `Other_Alphabetic`, although it shouldn't according to
+// the spec
 fn is_unicode_letter(ch: char) -> bool {
     ch.is_alphabetic() || ch == '_'
 }
 
-// FIXME: accepts codepoints in the categories `Nl` and `No`, althought it shouldn't
+// FIXME: accepts codepoints in the categories `Nl` and `No`, althought it shouldn't according to
+// the spec
 fn is_unicode_digit(ch: char) -> bool {
     ch.is_numeric()
 }
 
+/// Encodes a `Token` together with its location in the source file using only 8 bytes.
 #[derive(Clone, Copy)]
 pub struct SpannedToken {
     // the only combination of length and `Token` than would produce a value of `0` would be an
@@ -599,10 +639,60 @@ impl SpannedToken {
         self.kind_and_length.get() >> 8
     }
 
+    pub fn file_range(self) -> FileRange {
+        let start = self.offset();
+        let end = start + self.length();
+        FileRange {
+            start: NonMaxU32::new(start).unwrap(),
+            end: NonMaxU32::new(end).unwrap(),
+        }
+    }
+
     pub fn range(self) -> std::ops::Range<usize> {
         let start = self.offset() as usize;
         let end = start + self.length() as usize;
         start..end
+    }
+}
+
+type TokenSetBits = u128;
+
+const _: () = assert!(std::mem::size_of::<TokenSetBits>() * 8 >= Token::COUNT);
+
+#[derive(Default, Clone, Copy)]
+pub struct TokenSet {
+    bits: TokenSetBits,
+}
+
+impl TokenSet {
+    pub fn clear(&mut self) {
+        self.bits = 0;
+    }
+
+    pub fn insert(&mut self, token: Token) {
+        self.bits |= Self::mask(token);
+    }
+
+    fn mask(token: Token) -> TokenSetBits {
+        1 << token as u8
+    }
+
+    pub fn len(self) -> usize {
+        self.bits.count_ones() as usize
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Token> {
+        let mut bits = self.bits;
+        std::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+
+            let lowest = bits.trailing_zeros();
+            let token: Token = unsafe { std::mem::transmute(lowest as u8) };
+            bits &= !Self::mask(token);
+            Some(token)
+        })
     }
 }
 
@@ -946,8 +1036,8 @@ mod tests {
                 .join("")
             ),
             [
-                (Token::RawString, r#"`abc`"#),
-                (Token::RawString, r#"`\n`"#),
+                (Token::String, r#"`abc`"#),
+                (Token::String, r#"`\n`"#),
                 (Token::String, r#""\n""#),
                 (Token::String, r#""\"""#),
                 (Token::String, r#""Hello, world!\n""#),

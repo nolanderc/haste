@@ -3,6 +3,8 @@ use std::marker::PhantomData;
 use haste::non_max::NonMaxU32;
 
 /// Like `Vec<T>`, but can only be indexed by a specific type.
+#[repr(transparent)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct KeyVec<K, T> {
     _phantom: PhantomData<K>,
     inner: Vec<T>,
@@ -10,31 +12,119 @@ pub struct KeyVec<K, T> {
 
 /// Like `[T]`, but can only be indexed by a specific type.
 #[repr(transparent)]
+#[derive(PartialEq, Eq, Hash)]
 pub struct KeySlice<K, T> {
     _phantom: PhantomData<K>,
     data: [T],
+}
+
+impl<K, T> std::fmt::Debug for KeyVec<K, T>
+where
+    K: std::fmt::Debug + KeyOps,
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl<K, T> std::fmt::Debug for KeySlice<K, T>
+where
+    K: std::fmt::Debug + KeyOps,
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for (i, value) in self.data.iter().enumerate() {
+            let key = K::from_index(i);
+            map.entry(
+                &crate::util::display_fn(move |f| write!(f, "{:?}", key)),
+                value,
+            );
+        }
+        map.finish()
+    }
 }
 
 impl<K, T> std::ops::Deref for KeyVec<K, T> {
     type Target = KeySlice<K, T>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: `KdSlice` is a `repr(transparent)` wrapper around `[T]`
-        unsafe { std::mem::transmute(self.inner.as_slice()) }
+        self.as_slice()
     }
 }
 
 impl<K, T> std::ops::DerefMut for KeyVec<K, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: `KdSlice` is a `repr(transparent)` wrapper around `[T]`
-        unsafe { std::mem::transmute(self.inner.as_mut_slice()) }
+        self.as_mut_slice()
+    }
+}
+
+impl<K, T> From<Vec<T>> for KeyVec<K, T> {
+    fn from(inner: Vec<T>) -> Self {
+        Self {
+            inner,
+            _phantom: PhantomData,
+        }
     }
 }
 
 impl<K, T> From<KeyVec<K, T>> for Box<KeySlice<K, T>> {
     fn from(vec: KeyVec<K, T>) -> Self {
-        // SAFETY: `KdSlice` is a `repr(transparent)` wrapper around `[T]`
+        // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
         unsafe { std::mem::transmute(vec.inner.into_boxed_slice()) }
+    }
+}
+
+impl<K, T> Clone for Box<KeySlice<K, T>>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
+        let slice: &Box<[T]> = unsafe { std::mem::transmute(self) };
+
+        let clone: Box<[T]> = slice.clone();
+
+        // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
+        unsafe { std::mem::transmute(clone) }
+    }
+}
+
+impl<K: KeyOps, T> Default for KeyVec<K, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, T> KeyVec<K, T> {
+    pub const fn new() -> Self {
+        Self {
+            _phantom: PhantomData,
+            inner: Vec::new(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &KeySlice<K, T> {
+        // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
+        unsafe { std::mem::transmute(self.inner.as_slice()) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut KeySlice<K, T> {
+        // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
+        unsafe { std::mem::transmute(self.inner.as_mut_slice()) }
+    }
+}
+
+impl<K: KeyOps, T> KeyVec<K, T> {
+    pub fn push(&mut self, value: T) -> K {
+        let key = K::from_index(self.inner.len());
+        self.inner.push(value);
+        key
+    }
+
+    pub fn split_off(&mut self, key: K) -> KeyVec<K, T> {
+        self.inner.split_off(key.index()).into()
     }
 }
 
@@ -62,15 +152,35 @@ impl<K: KeyOps, T> std::ops::IndexMut<K> for KeySlice<K, T> {
     }
 }
 
+impl<K: KeyOps, T> std::ops::Index<std::ops::Range<K>> for KeySlice<K, T> {
+    type Output = [T];
+
+    fn index(&self, range: std::ops::Range<K>) -> &Self::Output {
+        &self.data[range.start.index()..range.end.index()]
+    }
+}
+
+impl<K: KeyOps, T> std::ops::IndexMut<std::ops::Range<K>> for KeySlice<K, T> {
+    fn index_mut(&mut self, range: std::ops::Range<K>) -> &mut Self::Output {
+        &mut self.data[range.start.index()..range.end.index()]
+    }
+}
+
 pub trait KeyOps {
     fn from_index(index: usize) -> Self;
     fn index(self) -> usize;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key<T> {
     raw: NonMaxU32,
     _phantom: PhantomData<*const T>,
+}
+
+impl<T> std::fmt::Debug for Key<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.raw.get().fmt(f)
+    }
 }
 
 impl<T> KeyOps for Key<T> {
@@ -87,9 +197,11 @@ impl<T> KeyOps for Key<T> {
 }
 
 /// The origin to which some `Relative<K>` refers to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Base<K>(K);
 
 /// An offset from `Base<K>`, which together form a `K`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Relative<K>(K);
 
 impl<K> Base<K>
@@ -102,5 +214,9 @@ where
 
     pub fn offset(self, relative: Relative<K>) -> K {
         K::from_index(self.0.index() + relative.0.index())
+    }
+
+    pub fn relative_to(self, k: K) -> Relative<K> {
+        Relative(K::from_index(k.index() - self.0.index()))
     }
 }

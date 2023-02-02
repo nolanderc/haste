@@ -154,7 +154,7 @@ pub struct Arena<T> {
 }
 
 unsafe impl<T: Send> Send for Arena<T> {}
-unsafe impl<T: Send> Sync for Arena<T> {}
+unsafe impl<T: Send + Sync> Sync for Arena<T> {}
 
 impl<T> std::ops::Index<usize> for Arena<T> {
     type Output = T;
@@ -298,7 +298,7 @@ pub struct AppendArena<T> {
 }
 
 unsafe impl<T: Send> Send for AppendArena<T> {}
-unsafe impl<T: Send> Sync for AppendArena<T> {}
+unsafe impl<T: Send + Sync> Sync for AppendArena<T> {}
 
 impl<T> Default for AppendArena<T> {
     fn default() -> Self {

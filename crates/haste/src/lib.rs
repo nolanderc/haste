@@ -84,7 +84,7 @@ pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
 
 pub trait Query: Ingredient {
     type Input: 'static + Send;
-    type Output: 'static + Send;
+    type Output: 'static + Send + Sync;
     type Future<'db>: std::future::Future<Output = Self::Output> + Send;
 
     fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;

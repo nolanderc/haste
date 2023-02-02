@@ -5,10 +5,9 @@ use std::num::NonZeroU32;
 use bstr::BStr;
 
 use crate::{
-    common::SourcePath,
     key::{Base, Key, KeySlice, KeyVec, Relative},
     span::{FileRange, Span},
-    Text,
+    Text, source::SourcePath,
 };
 
 pub use self::parse::parse;

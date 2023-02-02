@@ -1,15 +1,16 @@
 #![feature(type_alias_impl_trait)]
-#![feature(log_syntax)]
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 pub use diagnostic::{Diagnostic, Result};
 
-use crate::common::{SourcePath, SourcePathData, Text};
+use crate::common::Text;
+use crate::source::{source_text, SourcePath, SourcePathData};
 
 mod common;
 mod diagnostic;
 mod key;
+mod source;
 mod span;
 mod syntax;
 mod token;
@@ -28,7 +29,13 @@ pub struct Database {
 }
 
 #[haste::storage]
-pub struct Storage(compile, source_text, Text, SourcePath);
+pub struct Storage(
+    common::Text,
+    source::SourcePath,
+    source::source_text,
+    source::line_starts,
+    compile,
+);
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
@@ -46,7 +53,8 @@ fn main() {
         match result {
             Ok(()) => {}
             Err(diagnostic) => {
-                dbg!(diagnostic);
+                let display = crate::util::display_fn(|f| scope.block_on(diagnostic.write(db, f)));
+                eprintln!("{}", display);
             }
         }
     });
@@ -59,27 +67,10 @@ fn main() {
 async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let source_path = SourcePath::new(db, SourcePathData::new(arguments.path));
 
-    let text = source_text(db, source_path).await?;
+    let text = source_text(db, source_path).await.as_ref()?;
     let ast = syntax::parse(db, &text, source_path)?;
 
     dbg!(ast);
 
     Ok(())
-}
-
-/// Get the source text for some file.
-/// TODO: this should be made marked as a mutable input
-#[haste::query]
-#[clone]
-async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<Arc<str>> {
-    let data = path.get(db);
-    let path = match data {
-        SourcePathData::Absolute(path) => path,
-        SourcePathData::Relative(path) => path,
-    };
-
-    match tokio::fs::read_to_string(path).await {
-        Ok(text) => Ok(text.into()),
-        Err(error) => Err(Diagnostic::error(error.to_string())),
-    }
 }

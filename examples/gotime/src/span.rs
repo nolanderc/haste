@@ -1,6 +1,6 @@
 use haste::non_max::NonMaxU32;
 
-use crate::common::SourcePath;
+use crate::source::SourcePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {

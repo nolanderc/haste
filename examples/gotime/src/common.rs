@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Debug, Display},
-    path::PathBuf,
-};
+use std::fmt::Debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Text {
@@ -34,32 +31,5 @@ impl Text {
 
     pub fn display(self, db: &dyn crate::Db) -> impl Debug + '_ {
         crate::util::display_fn(move |f| f.write_str(self.get(db)))
-    }
-}
-
-#[haste::intern(SourcePath)]
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum SourcePathData {
-    Absolute(PathBuf),
-    Relative(PathBuf),
-}
-
-impl SourcePathData {
-    pub fn new(path: PathBuf) -> Self {
-        if path.is_relative() {
-            Self::Relative(path)
-        } else {
-            Self::Absolute(path)
-        }
-    }
-}
-
-impl SourcePath {
-    pub fn display(self, db: &dyn crate::Db) -> impl Display + '_ {
-        crate::util::display_fn(move |f| match self.get(db) {
-            SourcePathData::Absolute(path) | SourcePathData::Relative(path) => {
-                write!(f, "{}", path.display())
-            }
-        })
     }
 }

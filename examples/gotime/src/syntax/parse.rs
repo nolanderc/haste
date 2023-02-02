@@ -4,7 +4,6 @@ use bstr::{BString, ByteVec};
 use haste::non_max::NonMaxU32;
 
 use crate::{
-    common::SourcePath,
     token::{SpannedToken, Token, TokenSet},
     Diagnostic,
 };

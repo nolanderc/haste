@@ -3,11 +3,13 @@ mod parse;
 use std::num::NonZeroU32;
 
 use bstr::BStr;
+use haste::non_max::NonMaxU32;
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
+    source::SourcePath,
     span::{FileRange, Span},
-    Text, source::SourcePath,
+    Text,
 };
 
 pub use self::parse::parse;
@@ -63,7 +65,7 @@ pub enum PackageName {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decl {
     /// Name of the declaration (or `_`).
-    pub identifier: Option<Identifier>,
+    pub ident: Identifier,
 
     /// The type of declaration.
     pub kind: DeclKind,
@@ -119,7 +121,7 @@ pub struct VarDecl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncDecl {
     pub signature: Signature,
-    pub body: ExprId,
+    pub body: Option<StmtId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -145,18 +147,23 @@ pub struct Signature {
     pub parameters: Box<[Parameter]>,
 
     /// Number of outputs from the function
-    pub outputs: u16,
+    pub outputs: u32,
 
     /// Determines if the function accepts an arbitrary number of input arguments
-    pub variadic: bool,
+    pub variadic: Option<Variadic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Parameter {
-    /// The name of the parameter (or `_`)
+    /// The name of the parameter
     pub name: Option<Identifier>,
     /// The type of the parameter. The same `TypeId` may be reused for multiple parameters.
     pub typ: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Variadic {
+    pub span: SpanId,
 }
 
 /// Contains information about all expressions and types in a declaration
@@ -184,8 +191,20 @@ pub type NodeId = Key<Node>;
 /// Refers to a range of nodes in the `indirect` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeRange {
-    pub start: u32,
-    pub length: NonZeroU32,
+    pub start: NonMaxU32,
+    pub length: NonMaxU32,
+}
+
+/// References a statement node in the current declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtId {
+    pub node: NodeId,
+}
+
+/// Refers to a range of statements in the `indirect` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtRange {
+    pub nodes: NodeRange,
 }
 
 /// References an expression node in the current declaration.
@@ -208,20 +227,20 @@ pub struct TypeId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringRange {
-    pub start: u32,
-    pub length: NonZeroU32,
+    pub start: NonMaxU32,
+    pub length: NonMaxU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Node {
-    /// A generic name that could reference a type or variable depending on context
-    Name(Text),
+    /// A generic name (or `_`) that could reference a type or variable depending on context.
+    Name(Option<Text>),
     /// References an item within the inner node (could be a field, method or package member)
-    Selector(NodeId, Text),
+    Selector(NodeId, Identifier),
 
     // === Types === //
     /// An array/slice of the given type, possibly with a fixed size
-    Array(Option<ExprId>, TypeId),
+    Pointer(TypeId),
 
     // === Expressions ===
     Integer(IntegerBits),
@@ -234,6 +253,7 @@ pub enum Node {
     Binary(BinaryOperator, ExprId),
 
     // === Statements ===
+    Block(StmtRange),
     Return(Option<ExprId>),
     ReturnMulti(ExprRange),
 }
@@ -329,10 +349,11 @@ impl BinaryOperator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Either an identifier or `_`
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier {
-    /// The text of the identifier
-    pub text: Text,
+    /// The text of the identifier or `_`
+    pub text: Option<Text>,
     /// References a span in the closest enclosing scope.
     pub span: SpanId,
 }

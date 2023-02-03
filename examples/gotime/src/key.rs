@@ -71,8 +71,14 @@ impl<K, T> From<Vec<T>> for KeyVec<K, T> {
 
 impl<K, T> From<KeyVec<K, T>> for Box<KeySlice<K, T>> {
     fn from(vec: KeyVec<K, T>) -> Self {
+        Self::from(vec.inner)
+    }
+}
+
+impl<K, T> From<Vec<T>> for Box<KeySlice<K, T>> {
+    fn from(vec: Vec<T>) -> Self {
         // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
-        unsafe { std::mem::transmute(vec.inner.into_boxed_slice()) }
+        unsafe { std::mem::transmute(vec.into_boxed_slice()) }
     }
 }
 
@@ -125,6 +131,12 @@ impl<K: KeyOps, T> KeyVec<K, T> {
 
     pub fn split_off(&mut self, key: K) -> KeyVec<K, T> {
         self.inner.split_off(key.index()).into()
+    }
+}
+
+impl<K, T> KeySlice<K, T> {
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -204,12 +216,22 @@ pub struct Base<K>(K);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Relative<K>(K);
 
+impl<K: KeyOps> Default for Base<K> {
+    fn default() -> Self {
+        Self::origin()
+    }
+}
+
 impl<K> Base<K>
 where
     K: KeyOps,
 {
     pub fn origin() -> Self {
         Self(K::from_index(0))
+    }
+
+    pub fn at(base: K) -> Self {
+        Self(base)
     }
 
     pub fn offset(self, relative: Relative<K>) -> K {

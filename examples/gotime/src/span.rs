@@ -12,6 +12,17 @@ impl Span {
     pub fn new(path: SourcePath, range: FileRange) -> Self {
         Self { path, range }
     }
+
+    pub(crate) fn join(&self, other: Self) -> Span {
+        assert!(
+            self.path == other.path,
+            "can only join `Span`s from the same file"
+        );
+        Self {
+            path: self.path,
+            range: self.range.join(other.range),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -50,6 +50,14 @@ enum Severity {
     Error,
 }
 
+impl Severity {
+    fn style(self) -> Style {
+        match self {
+            Severity::Error => Style::Red,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum Attachment {
     Label(Label),
@@ -146,7 +154,14 @@ impl Diagnostic {
                 let severity_text = match message.severity {
                     Severity::Error => "error",
                 };
-                writeln!(out, "{}: {}", severity_text, message.text)?;
+                let severity_style = message.severity.style();
+                let bold = Style::Bold;
+                let reset = Style::Default;
+                writeln!(
+                    out,
+                    "{bold}{severity_style}{}:{reset} {bold}{}",
+                    severity_text, message.text
+                )?;
 
                 for attachment in message.attachments.iter() {
                     attachment.format(message.severity, sources, out)?;
@@ -203,17 +218,58 @@ impl Label {
         let underline_width = (range.end.get() - range.start.get()) as usize;
         let underline = "^".repeat(underline_width);
 
-        writeln!(out, "{}--> {}", gutter, source.display_path)?;
-        writeln!(out, "{} |", gutter)?;
-        writeln!(out, "{} | {}", line + 1, line_text)?;
-        write!(out, "{} | {}{}", gutter, underline_offset, underline)?;
+        let reset = Style::Default;
+        let blue = Style::Blue;
+        let italic = Style::Italic;
+        let bold = Style::Bold;
+        let severity = parent_severity.style();
+
+        writeln!(
+            out,
+            "{bold}{blue}{}-->{reset} {italic}{blue}{}{reset}",
+            gutter, source.display_path
+        )?;
+        // writeln!(out, "{bold}{blue}{} |{reset}", gutter)?;
+        writeln!(out, "{bold}{blue}{} |{reset} {}", line + 1, line_text)?;
+        write!(
+            out,
+            "{bold}{blue}{} |{reset} {bold}{severity}{}{}",
+            gutter, underline_offset, underline
+        )?;
         if self.text.is_empty() {
             writeln!(out)?;
         } else {
             writeln!(out, " {}", self.text)?;
         }
+        write!(out, "{reset}")?;
 
         Ok(())
+    }
+}
+
+enum Style {
+    Default,
+    Red,
+    Yellow,
+    Blue,
+    Cyan,
+    Gray,
+    Bold,
+    Italic,
+}
+
+impl std::fmt::Display for Style {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Style::Default => write!(f, "\x1b[m"),
+            Style::Red => write!(f, "\x1b[31m"),
+            Style::Yellow => write!(f, "\x1b[33m"),
+            Style::Blue => write!(f, "\x1b[34m"),
+            Style::Cyan => write!(f, "\x1b[36m"),
+            Style::Gray => write!(f, "\x1b[37m"),
+            Style::Bold => write!(f, "\x1b[1m"),
+            Style::Italic => write!(f, "\x1b[3m"),
+        }
     }
 }
 

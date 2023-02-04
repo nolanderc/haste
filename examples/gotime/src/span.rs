@@ -25,10 +25,16 @@ impl Span {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileRange {
     pub start: NonMaxU32,
     pub end: NonMaxU32,
+}
+
+impl std::fmt::Debug for FileRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
+    }
 }
 
 impl FileRange {

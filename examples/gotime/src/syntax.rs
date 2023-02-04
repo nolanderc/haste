@@ -1,7 +1,5 @@
 mod parse;
 
-use std::num::NonZeroU32;
-
 use bstr::BStr;
 use haste::non_max::NonMaxU32;
 
@@ -207,6 +205,12 @@ pub struct StmtRange {
     pub nodes: NodeRange,
 }
 
+impl StmtRange {
+    fn new(nodes: NodeRange) -> Self {
+        Self { nodes }
+    }
+}
+
 /// References an expression node in the current declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExprId {
@@ -217,6 +221,12 @@ pub struct ExprId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExprRange {
     pub nodes: NodeRange,
+}
+
+impl ExprRange {
+    fn new(nodes: NodeRange) -> Self {
+        Self { nodes }
+    }
 }
 
 /// References a type node in the current declaration.
@@ -245,23 +255,66 @@ pub enum Node {
     // === Expressions ===
     Integer(IntegerBits),
     Float(FloatBits),
-    Imaginary(ImaginaryBits),
+    Imaginary(FloatBits),
     Rune(char),
     String(StringRange),
-    Call(ExprId, ExprRange),
+    Call(ExprId, ExprRange, Option<ArgumentSpread>),
     Unary(UnaryOperator, ExprId),
-    Binary(BinaryOperator, ExprId),
+    Binary(ExprId, BinaryOperator, ExprId),
 
     // === Statements ===
     Block(StmtRange),
     Return(Option<ExprId>),
     ReturnMulti(ExprRange),
+    VarDecl(AssignRange),
+    Assignment(AssignRange),
+    Increment(ExprId),
+    Decrement(ExprId),
+    Send(ExprId, ExprId),
 }
 
 const _: () = assert!(
     std::mem::size_of::<Node>() <= 16,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
+
+/// Marks that the last call argument should be used as the variadic arguments
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArgumentSpread {}
+
+/// Stores two contiguous ranges of the same length. Used by assignment and declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssignRange {
+    /// The index of the first range.
+    start: NonMaxU32,
+    /// The length of each half (ie. the total length is twice this value).
+    half_length: NonMaxU32,
+}
+
+impl AssignRange {
+    fn from_full(nodes: NodeRange) -> Self {
+        assert!(nodes.length.get() % 2 == 0);
+        let half = nodes.length.get() / 2;
+        Self {
+            start: nodes.start,
+            half_length: NonMaxU32::new(half).unwrap(),
+        }
+    }
+
+    pub fn bindings(self) -> ExprRange {
+        ExprRange::new(NodeRange {
+            start: self.start,
+            length: self.half_length,
+        })
+    }
+
+    pub fn values(self) -> ExprRange {
+        ExprRange::new(NodeRange {
+            start: NonMaxU32::new(self.start.get() + self.half_length.get()).unwrap(),
+            length: self.half_length,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntegerBits {
@@ -278,9 +331,6 @@ pub enum FloatBits {
     /// TODO: intern large floats.
     Large(),
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ImaginaryBits {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOperator {
@@ -321,7 +371,7 @@ pub enum BinaryOperator {
 }
 
 impl BinaryOperator {
-    pub fn precedence(self) -> u32 {
+    pub fn precedence(self) -> u8 {
         match self {
             BinaryOperator::LogicalOr => 1,
             BinaryOperator::LogicalAnd => 2,

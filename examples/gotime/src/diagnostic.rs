@@ -229,11 +229,11 @@ impl Label {
             "{bold}{blue}{}-->{reset} {italic}{blue}{}{reset}",
             gutter, source.display_path
         )?;
-        // writeln!(out, "{bold}{blue}{} |{reset}", gutter)?;
+        writeln!(out, "{bold}{blue}{} |{reset}", gutter)?;
         writeln!(out, "{bold}{blue}{} |{reset} {}", line + 1, line_text)?;
         write!(
             out,
-            "{bold}{blue}{} |{reset} {bold}{severity}{}{}",
+            "{bold}{blue}{} |{reset} {severity}{}{}",
             gutter, underline_offset, underline
         )?;
         if self.text.is_empty() {

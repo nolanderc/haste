@@ -209,12 +209,24 @@ impl<T> KeyOps for Key<T> {
 }
 
 /// The origin to which some `Relative<K>` refers to
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Base<K>(K);
 
 /// An offset from `Base<K>`, which together form a `K`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Relative<K>(K);
+
+impl<K: std::fmt::Debug> std::fmt::Debug for Base<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Base({:?})", self.0)
+    }
+}
+
+impl<K: std::fmt::Debug> std::fmt::Debug for Relative<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Relative({:?})", self.0)
+    }
+}
 
 impl<K: KeyOps> Default for Base<K> {
     fn default() -> Self {

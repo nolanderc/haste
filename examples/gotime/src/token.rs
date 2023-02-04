@@ -665,6 +665,10 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
+    pub const fn new() -> Self {
+        Self { bits: 0 }
+    }
+
     pub fn clear(&mut self) {
         self.bits = 0;
     }
@@ -673,7 +677,16 @@ impl TokenSet {
         self.bits |= Self::mask(token);
     }
 
-    fn mask(token: Token) -> TokenSetBits {
+    pub const fn with(mut self, token: Token) -> Self {
+        self.bits |= Self::mask(token);
+        self
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.bits |= other.bits;
+    }
+
+    const fn mask(token: Token) -> TokenSetBits {
         1 << token as u8
     }
 
@@ -693,6 +706,17 @@ impl TokenSet {
             bits &= !Self::mask(token);
             Some(token)
         })
+    }
+
+    pub const fn find(self, token: Token) -> Option<usize> {
+        let mask = Self::mask(token);
+        if self.bits & mask == 0 {
+            // the token is not in the set
+            None
+        } else {
+            // count the number of tokens in the set which are less than this token
+            Some((self.bits & (mask - 1)).count_ones() as usize)
+        }
     }
 }
 

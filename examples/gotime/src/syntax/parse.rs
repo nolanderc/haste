@@ -2,6 +2,7 @@ use std::{borrow::Cow, ops::Range};
 
 use bstr::{BString, ByteVec};
 use haste::non_max::NonMaxU32;
+use smallvec::SmallVec;
 
 use crate::{
     key::KeyOps,
@@ -145,6 +146,7 @@ impl Data {
         let length = nodes.len();
 
         self.node.indirect.extend_from_slice(nodes);
+        self.node.indirect_stack.truncate(base);
 
         NodeRange {
             start: NonMaxU32::new(start as u32).unwrap(),
@@ -161,13 +163,13 @@ impl<'a> Parser<'a> {
         self.expected.clear();
     }
 
-    fn next(&self) -> Option<SpannedToken> {
+    fn peek(&self) -> Option<SpannedToken> {
         self.tokens.get(self.current_token).copied()
     }
 
     fn try_peek(&mut self, token: Token) -> Option<SpannedToken> {
         self.expected.insert(token);
-        let next = self.next()?;
+        let next = self.peek()?;
         if next.token() == token {
             Some(next)
         } else {
@@ -211,7 +213,7 @@ impl<'a> Parser<'a> {
     }
 
     fn unexpected_range(&self) -> FileRange {
-        match self.next() {
+        match self.peek() {
             Some(token) => token.file_range(),
             None => {
                 fn char_width(ch: Option<char>) -> usize {
@@ -235,46 +237,50 @@ impl<'a> Parser<'a> {
     }
 
     fn error_expected(&mut self, expected: &str) -> Diagnostic {
-        let message = match self.next() {
-            Some(token) => format!("unexpected token `{}`", self.snippet(token.range())),
+        let message = match self.peek() {
+            Some(token) => format!(
+                "unexpected token `{}` ({:?})",
+                self.snippet(token.range()),
+                token.token()
+            ),
             None => format!("unexpected end of file"),
         };
 
         let range = self.unexpected_range();
         let span = Span::new(self.path, range);
 
-        Diagnostic::error(message).label(span, expected)
+        Diagnostic::error(message).label(span, format!("expected {expected}"))
+    }
+
+    fn emit_expected(&mut self, expected: &str) {
+        let diagnostic = self.error_expected(expected);
+        self.emit(diagnostic)
     }
 
     fn emit_unexpected_token(&mut self) {
         let expected_count = self.expected.len();
         let mut expected = String::with_capacity(expected_count * 8);
-        if expected_count > 0 {
-            expected += "expected ";
-
-            for (i, token) in self.expected.iter().enumerate() {
-                if i != 0 {
-                    if i == expected_count - 1 {
-                        expected += " or ";
-                    } else {
-                        expected += ", ";
-                    }
-                }
-
-                let text = token.display();
-
-                if token.is_class() {
-                    expected.push_str(text);
+        for (i, token) in self.expected.iter().enumerate() {
+            if i != 0 {
+                if i == expected_count - 1 {
+                    expected += " or ";
                 } else {
-                    expected += "`";
-                    expected.push_str(text);
-                    expected += "`";
+                    expected += ", ";
                 }
+            }
+
+            let text = token.display();
+
+            if token.is_class() {
+                expected.push_str(text);
+            } else {
+                expected += "`";
+                expected.push_str(text);
+                expected += "`";
             }
         }
 
-        let diagnostic = self.error_expected(&expected);
-        self.emit(diagnostic);
+        self.emit_expected(&expected);
     }
 
     fn emit(&mut self, diagnostic: Diagnostic) {
@@ -293,27 +299,6 @@ impl<'a> Parser<'a> {
         Cow::Owned(format!("{}...", &text[..text.len() - rest]))
     }
 
-    fn file(&mut self) -> Result<File> {
-        let package = self.package()?;
-        let imports = self.imports()?;
-        let declarations = self.declarations()?;
-        self.expect_eof()?;
-
-        if !self.diagnostics.is_empty() {
-            return Err(());
-        }
-
-        let file = File {
-            path: self.path,
-            package,
-            imports: KeyVec::from(imports).into(),
-            declarations: KeyVec::from(declarations).into(),
-            span_ranges: std::mem::take(&mut self.data.span_ranges).into(),
-        };
-
-        Ok(file)
-    }
-
     fn expect_eof(&mut self) -> Result<()> {
         if self.current_token == self.tokens.len() {
             return Ok(());
@@ -327,9 +312,31 @@ impl<'a> Parser<'a> {
         self.data.base.spans.relative_to(key)
     }
 
+    fn span_range(&self, id: SpanId) -> FileRange {
+        self.data.span_ranges[self.data.base.spans.offset(id)]
+    }
+
     fn get_span(&self, id: SpanId) -> Span {
-        let range = self.data.span_ranges[self.data.base.spans.offset(id)];
-        Span::new(self.path, range)
+        Span::new(self.path, self.span_range(id))
+    }
+
+    fn node_span_id(&self, id: NodeId) -> SpanId {
+        self.data.node.spans[self.data.base.nodes + id.index()]
+    }
+
+    fn node_span(&self, id: NodeId) -> FileRange {
+        self.span_range(self.node_span_id(id))
+    }
+
+    fn node_range_span(&self, range: NodeRange) -> FileRange {
+        let first = range.start.get();
+        let last = first + range.length.get().saturating_sub(1);
+
+        let base = self.data.base.node_indirect;
+        let first_id = self.data.node.indirect[first as usize - base];
+        let last_id = self.data.node.indirect[last as usize - base];
+
+        self.node_span(first_id).join(self.node_span(last_id))
     }
 
     fn emit_node(&mut self, node: Node, span: SpanId) -> NodeId {
@@ -355,6 +362,35 @@ impl<'a> Parser<'a> {
         TypeId {
             node: self.emit_node(node, span),
         }
+    }
+
+    fn multi(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<NodeRange> {
+        let base = self.data.node.indirect_stack.len();
+        let result = f(self);
+        let range = self.data.pop_indirect(base);
+        let () = result?;
+        Ok(range)
+    }
+
+    fn file(&mut self) -> Result<File> {
+        let package = self.package()?;
+        let imports = self.imports()?;
+        let declarations = self.declarations()?;
+        self.expect_eof()?;
+
+        if !self.diagnostics.is_empty() {
+            return Err(());
+        }
+
+        let file = File {
+            path: self.path,
+            package,
+            imports: KeyVec::from(imports).into(),
+            declarations: KeyVec::from(declarations).into(),
+            span_ranges: std::mem::take(&mut self.data.span_ranges).into(),
+        };
+
+        Ok(file)
     }
 
     fn package(&mut self) -> Result<Identifier> {
@@ -412,7 +448,7 @@ impl<'a> Parser<'a> {
 
     fn declarations(&mut self) -> Result<Vec<Decl>> {
         let mut declarations = Vec::new();
-        while self.next().is_some() {
+        while self.peek().is_some() {
             declarations.push(self.declaration()?);
         }
         Ok(declarations)
@@ -635,8 +671,7 @@ impl<'a> Parser<'a> {
         if let Some(typ) = self.try_type()? {
             Ok(typ)
         } else {
-            let diagnostic = self.error_expected("expected a type");
-            Err(self.emit(diagnostic))
+            Err(self.emit_expected("a type"))
         }
     }
 
@@ -665,39 +700,340 @@ impl<'a> Parser<'a> {
         if self.eat(Token::Dot) {
             let member = self.identifier()?;
             let package = self.emit_node(Node::Name(name.text), name.span);
-            Ok(self.emit_type(Node::Selector(package, member), member.span))
+            let range = self
+                .span_range(name.span)
+                .join(self.span_range(member.span));
+            let span = self.emit_span(range);
+            Ok(self.emit_type(Node::Selector(package, member), span))
         } else {
             Ok(self.emit_type(Node::Name(name.text), name.span))
         }
     }
 
-    fn statement(&mut self) -> Result<StmtId> {
+    fn try_statement(&mut self) -> Result<Option<StmtId>> {
         if self.peek_is(Token::LCurly) {
-            return self.block();
+            return Ok(Some(self.block()?));
         }
 
-        let diagnostic = self.error_expected("expected a statement");
-        Err(self.emit(diagnostic))
+        if self.peek_is(Token::Return) {
+            return Ok(Some(self.return_statement()?));
+        }
+
+        self.try_simple_statement()
     }
 
     fn block(&mut self) -> Result<StmtId> {
         let start = self.expect(Token::LCurly)?.file_range();
 
-        let base = self.data.node.indirect_stack.len();
+        let statements = self.multi(|this| {
+            loop {
+                if let Some(statement) = this.try_statement()? {
+                    this.data.push_indirect(statement.node);
+                }
 
-        while !self.peek_is(Token::RCurly) {
-            let statement = self.statement()?;
-            self.data.push_indirect(statement.node);
-        }
+                if !this.eat(Token::SemiColon) {
+                    break;
+                }
+            }
+
+            Ok(())
+        })?;
 
         let end = self.expect(Token::RCurly)?.file_range();
         let span = self.emit_span(start.join(end));
 
-        let statements = StmtRange {
-            nodes: self.data.pop_indirect(base),
+        Ok(self.emit_stmt(Node::Block(StmtRange::new(statements)), span))
+    }
+
+    fn return_statement(&mut self) -> Result<StmtId> {
+        let return_token = self.expect(Token::Return)?;
+
+        let expr = self.try_expression()?;
+        let is_multi = expr.is_some() && self.peek_is(Token::Comma);
+
+        if !is_multi {
+            let mut range = return_token.file_range();
+            if let Some(expr) = expr {
+                range = range.join(self.node_span(expr.node));
+            }
+            let span = self.emit_span(range);
+            return Ok(self.emit_stmt(Node::Return(expr), span));
+        }
+
+        let exprs = self.multi(|this| {
+            this.data.push_indirect(expr.unwrap().node);
+
+            while this.eat(Token::Comma) {
+                let expr = this.expression()?;
+                this.data.push_indirect(expr.node);
+            }
+
+            Ok(())
+        })?;
+
+        let exprs_span = self.node_range_span(exprs);
+        let span = self.emit_span(return_token.file_range().join(exprs_span));
+        Ok(self.emit_stmt(Node::ReturnMulti(ExprRange::new(exprs)), span))
+    }
+
+    fn try_simple_statement(&mut self) -> Result<Option<StmtId>> {
+        let Some(first) = self.try_expression()? else { return Ok(None) };
+
+        let binding_base = self.data.node.indirect_stack.len();
+
+        if self.peek_is(Token::Comma) {
+            self.data.push_indirect(first.node);
+            while self.eat(Token::Comma) {
+                let binding = self.expression()?;
+                self.data.push_indirect(binding.node);
+            }
+        }
+
+        let mut binding_count = self.data.node.indirect_stack.len() - binding_base;
+
+        let is_definition = self.eat(Token::Define);
+        let is_assignment = self.eat(Token::Assign);
+
+        if is_definition || is_assignment {
+            if binding_count == 0 {
+                self.data.push_indirect(first.node);
+                binding_count += 1;
+            }
+
+            self.push_expression_list(binding_count)?;
+
+            let full_range = self.data.pop_indirect(binding_base);
+            let range = AssignRange::from_full(full_range);
+            let kind = if is_definition {
+                Node::VarDecl(range)
+            } else {
+                Node::Assignment(range)
+            };
+            let span = self.emit_span(self.node_range_span(full_range));
+            return Ok(Some(self.emit_stmt(kind, span)));
+        }
+
+        self.data.node.indirect_stack.truncate(binding_base);
+
+        // we found an expression list, but no `=` or `:=`
+        if binding_count != 0 {
+            return Err(self.emit_unexpected_token());
+        }
+
+        // at this point we have exactly one expression, which might be followed by some suffix
+        let expr = first;
+
+        if let Some(token) = self.try_expect(Token::PlusPlus) {
+            let range = self.node_span(expr.node).join(token.file_range());
+            let span = self.emit_span(range);
+            return Ok(Some(self.emit_stmt(Node::Increment(expr), span)));
+        }
+
+        if let Some(token) = self.try_expect(Token::MinusMinus) {
+            let range = self.node_span(expr.node).join(token.file_range());
+            let span = self.emit_span(range);
+            return Ok(Some(self.emit_stmt(Node::Decrement(expr), span)));
+        }
+
+        if self.eat(Token::LThinArrow) {
+            let message = self.expression()?;
+            let range = self.node_span(expr.node).join(self.node_span(message.node));
+            let span = self.emit_span(range);
+            return Ok(Some(self.emit_stmt(Node::Send(expr, message), span)));
+        }
+
+        Ok(Some(StmtId { node: expr.node }))
+    }
+
+    fn push_expression_list(&mut self, count: usize) -> Result<()> {
+        for i in 0..count {
+            if i != 0 {
+                self.expect(Token::Comma)?;
+            }
+
+            let expr = self.expression()?;
+            self.data.push_indirect(expr.node);
+        }
+        Ok(())
+    }
+
+    fn expression(&mut self) -> Result<ExprId> {
+        match self.try_expression()? {
+            Some(expr) => Ok(expr),
+            None => Err(self.emit_expected("an expression")),
+        }
+    }
+
+    fn try_expression(&mut self) -> Result<Option<ExprId>> {
+        let Some(lhs) = self.try_unary_expr()? else { return Ok(None) };
+        let expr = self.binary_expr(lhs, 0)?;
+        Ok(Some(expr))
+    }
+
+    fn binary_expr(&mut self, mut lhs: ExprId, min_precedence: u8) -> Result<ExprId> {
+        while let Some(op) = self.peek_binary_op() {
+            let current_precedence = op.precedence();
+            if current_precedence <= min_precedence {
+                break;
+            }
+            self.advance();
+
+            let mut rhs = self.unary_expr()?;
+            rhs = self.binary_expr(rhs, current_precedence)?;
+
+            let range = self.node_span(lhs.node).join(self.node_span(rhs.node));
+            let span = self.emit_span(range);
+            lhs = self.emit_expr(Node::Binary(lhs, op, rhs), span);
+        }
+        Ok(lhs)
+    }
+
+    fn peek_binary_op(&mut self) -> Option<BinaryOperator> {
+        static OPERATORS: LookupTable<BinaryOperator, 19> = LookupTable::new([
+            (Token::LogicalOr, BinaryOperator::LogicalOr),
+            (Token::LogicalAnd, BinaryOperator::LogicalAnd),
+            (Token::Equal, BinaryOperator::Equal),
+            (Token::NotEqual, BinaryOperator::NotEqual),
+            (Token::Less, BinaryOperator::Less),
+            (Token::LessEqual, BinaryOperator::LessEqual),
+            (Token::Greater, BinaryOperator::Greater),
+            (Token::GreaterEqual, BinaryOperator::GreaterEqual),
+            (Token::Plus, BinaryOperator::Add),
+            (Token::Minus, BinaryOperator::Sub),
+            (Token::Or, BinaryOperator::BitOr),
+            (Token::Xor, BinaryOperator::BitXor),
+            (Token::Times, BinaryOperator::Mul),
+            (Token::Div, BinaryOperator::Div),
+            (Token::Rem, BinaryOperator::Rem),
+            (Token::Shl, BinaryOperator::ShiftLeft),
+            (Token::Shr, BinaryOperator::ShiftRight),
+            (Token::And, BinaryOperator::BitAnd),
+            (Token::Nand, BinaryOperator::BitNand),
+        ]);
+
+        self.expected.merge(OPERATORS.tokens);
+        let next = self.peek()?;
+        OPERATORS.lookup(next.token())
+    }
+
+    fn unary_expr(&mut self) -> Result<ExprId> {
+        match self.try_unary_expr()? {
+            Some(expr) => Ok(expr),
+            None => Err(self.emit_expected("an expression")),
+        }
+    }
+
+    fn try_unary_expr(&mut self) -> Result<Option<ExprId>> {
+        let mut prefixes = SmallVec::<[_; 4]>::new();
+        while let Some(unary) = self.try_unary_op() {
+            prefixes.push(unary);
+        }
+
+        let Some(mut inner) = self.try_primary_expr()? else {
+            if prefixes.is_empty() {
+                return Ok(None);
+            } else {
+                return Err(self.emit_expected("an expression"));
+            }
         };
 
-        Ok(self.emit_stmt(Node::Block(statements), span))
+        while let Some((op, range)) = prefixes.pop() {
+            let range = self.node_span(inner.node).join(range);
+            let span = self.emit_span(range);
+            inner = self.emit_expr(Node::Unary(op, inner), span);
+        }
+
+        Ok(Some(inner))
+    }
+
+    fn try_unary_op(&mut self) -> Option<(UnaryOperator, FileRange)> {
+        static OPERATORS: LookupTable<UnaryOperator, 7> = LookupTable::new([
+            (Token::Plus, UnaryOperator::Plus),
+            (Token::Minus, UnaryOperator::Minus),
+            (Token::LogicalNot, UnaryOperator::Not),
+            (Token::Xor, UnaryOperator::Xor),
+            (Token::Times, UnaryOperator::Deref),
+            (Token::And, UnaryOperator::Ref),
+            (Token::LThinArrow, UnaryOperator::Recv),
+        ]);
+
+        self.expected.merge(OPERATORS.tokens);
+        let next = self.peek()?;
+        let operator = OPERATORS.lookup(next.token())?;
+        self.advance();
+        Some((operator, next.file_range()))
+    }
+
+    fn try_primary_expr(&mut self) -> Result<Option<ExprId>> {
+        let Some(mut base) = self.try_operand()? else { return Ok(None) };
+
+        loop {
+            if self.eat(Token::Dot) {
+                let member = self.identifier()?;
+                let member_range = self.span_range(member.span);
+                let range = self.node_span(base.node).join(member_range);
+                let span = self.emit_span(range);
+                base = self.emit_expr(Node::Selector(base.node, member), span);
+                continue;
+            }
+
+            if self.peek_is(Token::LParens) {
+                base = self.call(base)?;
+                continue;
+            }
+
+            return Ok(Some(base));
+        }
+    }
+
+    fn call(&mut self, base: ExprId) -> Result<ExprId> {
+        self.expect(Token::LParens)?;
+
+        let mut spread = None;
+        let arguments = self.multi(|this| {
+            while !this.peek_is(Token::RParens) {
+                let argument = this.expression()?;
+                this.data.push_indirect(argument.node);
+
+                if this.eat(Token::Ellipses) {
+                    spread = Some(ArgumentSpread {});
+                }
+
+                if !this.eat(Token::Comma) {
+                    break;
+                }
+            }
+            Ok(())
+        })?;
+
+        let end = self.expect(Token::RParens)?.file_range();
+        let range = self.node_span(base.node).join(end);
+        let span = self.emit_span(range);
+        Ok(self.emit_expr(Node::Call(base, ExprRange::new(arguments), spread), span))
+    }
+
+    fn try_operand(&mut self) -> Result<Option<ExprId>> {
+        if self.peek_is(Token::Identifier) {
+            let ident = self.identifier()?;
+            return Ok(Some(self.emit_expr(Node::Name(ident.text), ident.span)));
+        }
+
+        if let Some(token) = self.try_expect(Token::Integer) {
+            let value = match self.source[token.range()].parse() {
+                Ok(value) => value,
+                Err(error) => {
+                    let span = Span::new(self.path, token.file_range());
+                    let diagnostic =
+                        Diagnostic::error("invalid integer literal").label(span, error);
+                    return Err(self.emit(diagnostic));
+                }
+            };
+            let integer = IntegerBits::Small(value);
+            let span = self.emit_span(token.file_range());
+            return Ok(Some(self.emit_expr(Node::Integer(integer), span)));
+        }
+
+        Ok(None)
     }
 
     fn string(&mut self) -> Result<(StringRange, SpanId)> {
@@ -885,4 +1221,50 @@ fn decode_escape_sequence(
     }
 
     Ok(i)
+}
+
+struct LookupTable<T, const N: usize> {
+    tokens: TokenSet,
+    values: [T; N],
+}
+
+impl<T: Copy, const N: usize> LookupTable<T, N> {
+    pub const fn new(mut branches: [(Token, T); N]) -> Self {
+        // sort the branches according to the value of the `Token`
+        let mut i = 1;
+        while i < N {
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if (branches[j].0 as u8) < (branches[i].0 as u8) {
+                    break;
+                }
+                let old_j = branches[j];
+                branches[j] = branches[i];
+                branches[i] = old_j;
+            }
+            i += 1;
+        }
+
+        let mut tokens = TokenSet::new();
+        let mut values = [branches[0].1; N];
+
+        let mut i = 0;
+        while i < N {
+            let (token, value) = branches[i];
+            tokens = tokens.with(token);
+            values[i] = value;
+            i += 1;
+        }
+
+        Self { tokens, values }
+    }
+
+    pub const fn lookup(&self, token: Token) -> Option<T> {
+        if let Some(index) = self.tokens.find(token) {
+            Some(self.values[index])
+        } else {
+            None
+        }
+    }
 }

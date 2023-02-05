@@ -79,6 +79,8 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
                 }
             }
         }
+
+        impl haste::DynStorage for #ident {}
     });
 
     let mut tokens = strukt.to_token_stream();

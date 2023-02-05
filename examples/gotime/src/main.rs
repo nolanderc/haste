@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub use diagnostic::{Diagnostic, Result};
+use haste::DatabaseExt;
 
 use crate::common::Text;
 use crate::source::{source_text, SourcePath, SourcePathData};
@@ -70,7 +71,7 @@ async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let text = source_text(db, source_path).await.as_ref()?;
     let ast = syntax::parse(db, &text, source_path)?;
 
-    dbg!(ast);
+    dbg!(db.fmt(ast));
 
     Ok(())
 }

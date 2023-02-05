@@ -1,16 +1,32 @@
 use crate::{Database, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
-pub trait Storage {
+pub trait Storage: DynStorage {
     /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
     type DynDatabase: Database + ?Sized + WithStorage<Self>;
 
     fn new(router: &mut StorageRouter) -> Self;
 }
 
+pub trait DynStorage: std::any::Any {}
+
+impl dyn DynStorage {
+    pub(crate) fn downcast<S: 'static>(&self) -> Option<&S> {
+        if self.type_id() == std::any::TypeId::of::<S>() {
+            // SAFETY: `self` and `S` are of the same type:
+            Some(unsafe { &*(self as *const _ as *const S) })
+        } else {
+            None
+        }
+    }
+}
+
 /// Stores the data requried by a single ingredient
-pub trait Container {
+pub trait Container: DynContainer {
     fn new(path: IngredientPath) -> Self;
+}
+
+pub trait DynContainer: 'static {
     fn path(&self) -> IngredientPath;
 }
 
@@ -31,8 +47,12 @@ pub trait WithStorages {
 }
 
 pub trait StorageList {
-    const LENGTH: usize;
-    fn new(router: &mut StorageRouter) -> Self;
+    fn new(router: &mut StorageRouter) -> Self
+    where
+        Self: Sized;
+
+    fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage>;
+    fn get_path(&self, path: IngredientPath) -> Option<&dyn DynStorage>;
 }
 
 pub struct StorageRouter {
@@ -41,9 +61,9 @@ pub struct StorageRouter {
 }
 
 impl StorageRouter {
-    pub(crate) fn new(max_storages: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            max_storages,
+            max_storages: u8::MAX as usize,
             next_path: IngredientPath {
                 storage: 0,
                 container: 0,
@@ -73,7 +93,7 @@ impl<DB: WithStorages> Default for DatabaseStorage<DB> {
 
 impl<DB: WithStorages> DatabaseStorage<DB> {
     pub fn new() -> Self {
-        let mut router = StorageRouter::new(DB::StorageList::LENGTH);
+        let mut router = StorageRouter::new();
 
         Self {
             storages: DB::StorageList::new(&mut router),
@@ -89,18 +109,10 @@ impl<DB: WithStorages> DatabaseStorage<DB> {
     }
 }
 
-macro_rules! ignore {
-    ($($tt:tt)*) => {
-        ()
-    };
-}
-
 macro_rules! impl_tuple {
     ($($T:ident)*) => {
+        #[allow(unused, clippy::unused_unit, non_snake_case)]
         impl<$($T: Storage),*> StorageList for ($($T,)*) {
-            const LENGTH: usize = <[()]>::len(&[$(ignore!($T)),*]);
-
-            #[allow(unused, clippy::unused_unit, non_snake_case)]
             fn new(router: &mut StorageRouter) -> Self {
                 $(
                     let $T: $T = $T::new(router);
@@ -108,6 +120,33 @@ macro_rules! impl_tuple {
                 )*
 
                 ($($T,)*)
+            }
+
+            fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage> {
+                let ($($T,)*) = self;
+
+                $(
+                    if std::any::TypeId::of::<$T>() == id {
+                        return Some($T)
+                    }
+                )*
+
+                None
+            }
+
+            fn get_path(&self, path: IngredientPath) -> Option<&dyn DynStorage> {
+                let ($($T,)*) = self;
+
+                let mut i = 0;
+
+                $(
+                    if i == path.storage {
+                        return Some($T);
+                    }
+                    i += 1;
+                )*
+
+                None
             }
         }
     };

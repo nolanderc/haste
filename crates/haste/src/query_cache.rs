@@ -140,7 +140,9 @@ impl<Q: Query> crate::Container for HashQueryCache<Q> {
             outputs: Default::default(),
         }
     }
+}
 
+impl<Q: Query> crate::DynContainer for HashQueryCache<Q> {
     fn path(&self) -> IngredientPath {
         self.path
     }

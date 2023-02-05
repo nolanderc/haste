@@ -13,7 +13,7 @@ pub struct ArenaInterner<T> {
     entries: ShardMap<NonMaxU32, ()>,
 }
 
-impl<T> crate::Container for ArenaInterner<T> {
+impl<T: 'static> crate::Container for ArenaInterner<T> {
     fn new(path: IngredientPath) -> Self {
         Self {
             path,
@@ -21,7 +21,9 @@ impl<T> crate::Container for ArenaInterner<T> {
             entries: ShardMap::new(),
         }
     }
+}
 
+impl<T: 'static> crate::DynContainer for ArenaInterner<T> {
     fn path(&self) -> IngredientPath {
         self.path
     }
@@ -29,7 +31,7 @@ impl<T> crate::Container for ArenaInterner<T> {
 
 impl<T> crate::ElementContainer for ArenaInterner<T>
 where
-    T: Eq + Hash,
+    T: Eq + Hash + 'static,
 {
     type Value = T;
 
@@ -203,7 +205,9 @@ impl crate::Container for StringInterner {
             entries: ShardMap::new(),
         }
     }
+}
 
+impl crate::DynContainer for StringInterner {
     fn path(&self) -> IngredientPath {
         self.path
     }
@@ -319,7 +323,7 @@ mod tests {
 
     #[test]
     fn interning() {
-        let mut router = crate::StorageRouter::new(1);
+        let mut router = crate::StorageRouter::new();
         let interner = ArenaInterner::new(router.next_ingredient());
 
         let a = interner.intern("hello");

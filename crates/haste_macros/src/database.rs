@@ -23,12 +23,24 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
         let storage_paths = storages.iter();
         impls.extend(quote! {
             unsafe impl haste::Database for #ident {
+                fn as_dyn(&self) -> &dyn haste::Database {
+                    self
+                }
+
                 fn runtime(&self) -> &haste::Runtime {
                     &self.runtime
                 }
 
                 fn runtime_mut(&mut self) -> &mut haste::Runtime {
                     &mut self.runtime
+                }
+
+                fn dyn_storage(&self, id: std::any::TypeId) -> Option<&dyn haste::DynStorage> {
+                    haste::StorageList::get(self.storage.list(), id)
+                }
+
+                fn dyn_storage_path(&self, path: haste::IngredientPath) -> Option<&dyn haste::DynStorage> {
+                    haste::StorageList::get_path(self.storage.list(), path)
                 }
             }
 
@@ -46,7 +58,7 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
         impls.extend(quote! {
             impl haste::WithStorage<#storage> for Database {
                 #[inline(always)]
-                fn as_dyn(&self) -> &<#storage as haste::Storage>::DynDatabase {
+                fn cast_dyn(&self) -> &<#storage as haste::Storage>::DynDatabase {
                     self
                 }
 

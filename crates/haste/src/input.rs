@@ -5,20 +5,22 @@ pub struct InputStorage<T> {
     arena: Arena<T>,
 }
 
-impl<T> crate::Container for InputStorage<T> {
+impl<T: 'static> crate::Container for InputStorage<T> {
     fn new(path: IngredientPath) -> Self {
         Self {
             path,
             arena: Default::default(),
         }
     }
+}
 
+impl<T: 'static> crate::DynContainer for InputStorage<T> {
     fn path(&self) -> IngredientPath {
         self.path
     }
 }
 
-impl<T> crate::ElementContainer for InputStorage<T> {
+impl<T: 'static> crate::ElementContainer for InputStorage<T> {
     type Value = T;
 
     type Ref<'a> = &'a T where T: 'a;
@@ -33,7 +35,7 @@ impl<T> crate::ElementContainer for InputStorage<T> {
     }
 }
 
-impl<T> crate::InputContainer for InputStorage<T> {
+impl<T: 'static> crate::InputContainer for InputStorage<T> {
     type RefMut<'a> = &'a mut T where T: 'a;
 
     fn get_mut(&mut self, id: crate::Id) -> Self::RefMut<'_> {

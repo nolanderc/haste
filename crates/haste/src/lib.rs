@@ -2,6 +2,7 @@
 #![feature(trivial_bounds)]
 
 mod arena;
+pub mod fmt;
 mod input;
 pub mod interner;
 pub mod query_cache;
@@ -10,7 +11,7 @@ mod shard_map;
 mod storage;
 pub mod util;
 
-use std::future::Future;
+use std::{any::TypeId, future::Future};
 
 pub use haste_macros::*;
 pub use query_cache::*;
@@ -49,18 +50,26 @@ impl Id {
 /// will always be returned, and that the lifetime of the runtime is the lifetime of the database
 /// storage. That is: the inner runtime and storage will only ever be accessed together.
 pub unsafe trait Database: Sync {
+    fn as_dyn(&self) -> &dyn Database;
+
     fn runtime(&self) -> &Runtime;
     fn runtime_mut(&mut self) -> &mut Runtime;
+
+    /// Gets the storage of the given type.
+    fn dyn_storage(&self, typ: TypeId) -> Option<&dyn DynStorage>;
+
+    /// Gets the storage for the given ingredient.
+    fn dyn_storage_path(&self, path: IngredientPath) -> Option<&dyn DynStorage>;
 }
 
 /// Implemented by databases which contain a specific type of storage.
 pub trait WithStorage<S: Storage + ?Sized>: Database {
-    fn as_dyn(&self) -> &S::DynDatabase;
+    fn cast_dyn(&self) -> &S::DynDatabase;
     fn storage(&self) -> &S;
     fn storage_mut(&mut self) -> &mut S;
 }
 
-pub trait Ingredient {
+pub trait Ingredient: 'static {
     /// The storage within which this ingredient exists.
     type Storage: Storage + HasIngredient<Self>;
 
@@ -165,7 +174,7 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.as_dyn();
+        let db = self.cast_dyn();
         let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
@@ -200,7 +209,7 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.as_dyn();
+        let db = self.cast_dyn();
         let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
@@ -240,7 +249,7 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.as_dyn();
+        let db = self.cast_dyn();
         let storage = self.storage();
         let cache = storage.container();
         let result = cache.get_or_evaluate(db, input);
@@ -303,6 +312,11 @@ pub trait DatabaseExt: Database {
         });
         value
     }
+
+    fn fmt<T>(&self, value: T) -> fmt::Adapter<'_, T>
+    {
+        fmt::Adapter::new(self.as_dyn(), value)
+    }
 }
 
 impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
@@ -334,6 +348,7 @@ pub struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
+    /// Drives the runtime using the current thread until the given future completes.
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         self.runtime.block_on(f)
     }

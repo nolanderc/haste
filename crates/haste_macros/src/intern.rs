@@ -170,8 +170,10 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
         storage_path,
     } = info;
 
+    let ident_text = ident.to_string();
+
     quote! {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         #vis struct #ident(haste::Id);
 
         impl haste::Ingredient for #ident {
@@ -194,6 +196,19 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
         impl #ident {
             pub fn new(db: &dyn #db_path, data: #data_ident) -> Self {
                 haste::DatabaseExt::insert(db, data)
+            }
+        }
+
+        impl std::fmt::Debug for #ident {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                haste::fmt::with_storage::<#storage_path>(|db| {
+                    if let Some(db) = db {
+                        let value = haste::DatabaseExt::lookup(db, *self);
+                        std::fmt::Debug::fmt(value, f)
+                    } else {
+                        write!(f, concat!(#ident_text, "({:?})"), self.0)
+                    }
+                })
             }
         }
     }

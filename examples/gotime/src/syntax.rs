@@ -167,9 +167,6 @@ pub struct Variadic {
 /// Contains information about all expressions and types in a declaration
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeStorage {
-    /// For each node, its location in the source file
-    pub spans: KeyList<NodeId, SpanId>,
-
     /// For each node, its kind
     pub kinds: KeyList<NodeId, Node>,
 
@@ -181,59 +178,63 @@ pub struct NodeStorage {
 
     /// All string literals refer to a range of bytes in this allocation.
     pub string_buffer: Box<BStr>,
+
+    /// For each node, its location in the source file
+    pub spans: KeyList<NodeId, SpanId>,
 }
 
 /// References a node in the current declaration.
 pub type NodeId = Key<Node>;
 
 /// Refers to a range of nodes in the `indirect` list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeRange {
     pub start: NonMaxU32,
     pub length: NonMaxU32,
 }
 
-/// References a statement node in the current declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StmtId {
-    pub node: NodeId,
-}
-
-/// Refers to a range of statements in the `indirect` list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StmtRange {
-    pub nodes: NodeRange,
-}
-
-impl StmtRange {
-    fn new(nodes: NodeRange) -> Self {
-        Self { nodes }
+impl std::fmt::Debug for NodeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{}", self.start, self.start.get() + self.length.get())
     }
 }
 
-/// References an expression node in the current declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExprId {
-    pub node: NodeId,
+macro_rules! node_id_wrapper {
+    ($id:ident, $range:ident) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $id {
+            pub node: NodeId,
+        }
+
+        impl std::fmt::Debug for $id {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($id), "({:?})"), self.node)
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $range {
+            pub nodes: NodeRange,
+        }
+
+        impl std::fmt::Debug for $range {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($range), "({:?})"), self.nodes)
+            }
+        }
+
+        #[allow(unused)]
+        impl $range {
+            fn new(nodes: NodeRange) -> Self {
+                Self { nodes }
+            }
+        }
+    };
 }
 
-/// Refers to a range of expressions in the `indirect` list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExprRange {
-    pub nodes: NodeRange,
-}
-
-impl ExprRange {
-    fn new(nodes: NodeRange) -> Self {
-        Self { nodes }
-    }
-}
-
-/// References a type node in the current declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeId {
-    pub node: NodeId,
-}
+node_id_wrapper!(StmtId, StmtRange);
+node_id_wrapper!(ExprId, ExprRange);
+node_id_wrapper!(TypeId, TypeRange);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringRange {

@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Text {
     id: haste::Id,
 }
@@ -31,5 +31,17 @@ impl Text {
 
     pub fn display(self, db: &dyn crate::Db) -> impl Debug + '_ {
         crate::util::display_fn(move |f| f.write_str(self.get(db)))
+    }
+}
+
+impl std::fmt::Debug for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        haste::fmt::with_storage::<crate::Storage>(|db| {
+            if let Some(db) = db {
+                haste::DatabaseExt::lookup(db, *self).fmt(f)
+            } else {
+                write!(f, "Text({:?})", self.id)
+            }
+        })
     }
 }

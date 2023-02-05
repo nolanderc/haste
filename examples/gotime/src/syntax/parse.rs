@@ -164,6 +164,60 @@ impl Data {
     }
 }
 
+trait Spanned {
+    fn range(self, parser: &Parser) -> FileRange;
+}
+impl Spanned for FileRange {
+    fn range(self, _parser: &Parser) -> FileRange {
+        self
+    }
+}
+impl Spanned for SpannedToken {
+    fn range(self, _parser: &Parser) -> FileRange {
+        self.file_range()
+    }
+}
+impl Spanned for SpanId {
+    fn range(self, parser: &Parser) -> FileRange {
+        parser.span_range(self)
+    }
+}
+impl Spanned for Identifier {
+    fn range(self, parser: &Parser) -> FileRange {
+        parser.span_range(self.span)
+    }
+}
+
+impl Spanned for NodeId {
+    fn range(self, parser: &Parser) -> FileRange {
+        parser.node_span(self)
+    }
+}
+impl Spanned for NodeRange {
+    fn range(self, parser: &Parser) -> FileRange {
+        parser.node_range_span(self)
+    }
+}
+
+macro_rules! spanned_node_wrapper {
+    ($id:ident, $range:ident) => {
+        impl Spanned for $id {
+            fn range(self, parser: &Parser) -> FileRange {
+                parser.node_span(self.node)
+            }
+        }
+        impl Spanned for $range {
+            fn range(self, parser: &Parser) -> FileRange {
+                parser.node_range_span(self.nodes)
+            }
+        }
+    };
+}
+
+spanned_node_wrapper!(StmtId, StmtRange);
+spanned_node_wrapper!(ExprId, ExprRange);
+spanned_node_wrapper!(TypeId, TypeRange);
+
 type Result<T, E = ()> = std::result::Result<T, E>;
 
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
@@ -331,8 +385,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn emit_span(&mut self, file_range: FileRange) -> SpanId {
-        let key = self.data.span_ranges.push(file_range);
+    fn emit_span(&mut self, spanned: impl Spanned) -> SpanId {
+        let range = spanned.range(self);
+        let key = self.data.span_ranges.push(range);
         self.data.base.spans.relative_to(key)
     }
 
@@ -350,6 +405,14 @@ impl<'a> Parser<'a> {
 
     fn node_span(&self, id: NodeId) -> FileRange {
         self.span_range(self.node_span_id(id))
+    }
+
+    fn join(&self, a: impl Spanned, b: impl Spanned) -> FileRange {
+        a.range(self).join(b.range(self))
+    }
+
+    fn emit_join(&mut self, a: impl Spanned, b: impl Spanned) -> SpanId {
+        self.emit_span(self.join(a, b))
     }
 
     fn node_range_span(&self, range: NodeRange) -> FileRange {
@@ -554,8 +617,7 @@ impl<'a> Parser<'a> {
         let base_type = self.emit_type(Node::Name(base_name.text), base_name.span);
 
         let typ = if let Some(pointer) = pointer {
-            let base_range = self.get_span(base_name.span).range;
-            let span = self.emit_span(pointer.file_range().join(base_range));
+            let span = self.emit_join(pointer, base_name.span);
             self.emit_type(Node::Pointer(base_type), span)
         } else {
             base_type
@@ -566,8 +628,7 @@ impl<'a> Parser<'a> {
             typ,
         };
 
-        let range = self.span_range(name.span).join(self.node_span(typ.node));
-        let span = self.emit_span(range);
+        let span = self.emit_join(name, typ);
         Ok(Some(self.emit_node(Node::Parameter(parameter), span)))
     }
 
@@ -660,9 +721,8 @@ impl<'a> Parser<'a> {
             }
 
             if allow_variadic {
-                if let Some(ellipses) = self.try_expect(Token::Ellipses) {
-                    let span = self.emit_span(ellipses.file_range());
-                    variadic = Some(Variadic { span });
+                if self.eat(Token::Ellipses) {
+                    variadic = Some(Variadic {});
                 }
             };
 
@@ -673,8 +733,7 @@ impl<'a> Parser<'a> {
             } else {
                 for index in names_start..self.data.identifiers.len() {
                     let ident = self.data.identifiers[index];
-                    let range = self.span_range(ident.span).join(self.node_span(typ.node));
-                    let span = self.emit_span(range);
+                    let span = self.emit_join(ident, typ);
                     self.push_parameter(ident.text, typ, span);
                 }
                 self.data.identifiers.truncate(names_start);
@@ -720,7 +779,7 @@ impl<'a> Parser<'a> {
 
         if let Some(pointer) = self.try_expect(Token::Times) {
             let inner = self.typ()?;
-            let span = self.emit_span(pointer.file_range());
+            let span = self.emit_span(pointer);
             return Ok(Some(self.emit_type(Node::Pointer(inner), span)));
         }
 
@@ -736,12 +795,9 @@ impl<'a> Parser<'a> {
     fn named_type(&mut self) -> Result<TypeId> {
         let name = self.identifier()?;
         if self.eat(Token::Dot) {
-            let member = self.identifier()?;
             let package = self.emit_node(Node::Name(name.text), name.span);
-            let range = self
-                .span_range(name.span)
-                .join(self.span_range(member.span));
-            let span = self.emit_span(range);
+            let member = self.identifier()?;
+            let span = self.emit_join(name, member);
             Ok(self.emit_type(Node::Selector(package, member), span))
         } else {
             Ok(self.emit_type(Node::Name(name.text), name.span))
@@ -778,7 +834,7 @@ impl<'a> Parser<'a> {
         })?;
 
         let end = self.expect(Token::RCurly)?.file_range();
-        let span = self.emit_span(start.join(end));
+        let span = self.emit_join(start, end);
 
         Ok(self.emit_stmt(Node::Block(StmtRange::new(statements)), span))
     }
@@ -792,7 +848,7 @@ impl<'a> Parser<'a> {
         if !is_multi {
             let mut range = return_token.file_range();
             if let Some(expr) = expr {
-                range = range.join(self.node_span(expr.node));
+                range = self.join(range, expr);
             }
             let span = self.emit_span(range);
             return Ok(self.emit_stmt(Node::Return(expr), span));
@@ -809,8 +865,7 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
-        let exprs_span = self.node_range_span(exprs);
-        let span = self.emit_span(return_token.file_range().join(exprs_span));
+        let span = self.emit_join(return_token, exprs);
         Ok(self.emit_stmt(Node::ReturnMulti(ExprRange::new(exprs)), span))
     }
 
@@ -847,7 +902,7 @@ impl<'a> Parser<'a> {
             } else {
                 Node::Assignment(range)
             };
-            let span = self.emit_span(self.node_range_span(full_range));
+            let span = self.emit_span(full_range);
             return Ok(Some(self.emit_stmt(kind, span)));
         }
 
@@ -862,21 +917,18 @@ impl<'a> Parser<'a> {
         let expr = first;
 
         if let Some(token) = self.try_expect(Token::PlusPlus) {
-            let range = self.node_span(expr.node).join(token.file_range());
-            let span = self.emit_span(range);
+            let span = self.emit_join(expr, token);
             return Ok(Some(self.emit_stmt(Node::Increment(expr), span)));
         }
 
         if let Some(token) = self.try_expect(Token::MinusMinus) {
-            let range = self.node_span(expr.node).join(token.file_range());
-            let span = self.emit_span(range);
+            let span = self.emit_join(expr, token);
             return Ok(Some(self.emit_stmt(Node::Decrement(expr), span)));
         }
 
         if self.eat(Token::LThinArrow) {
             let message = self.expression()?;
-            let range = self.node_span(expr.node).join(self.node_span(message.node));
-            let span = self.emit_span(range);
+            let span = self.emit_join(expr, message);
             return Ok(Some(self.emit_stmt(Node::Send(expr, message), span)));
         }
 
@@ -919,8 +971,7 @@ impl<'a> Parser<'a> {
             let mut rhs = self.unary_expr()?;
             rhs = self.binary_expr(rhs, current_precedence)?;
 
-            let range = self.node_span(lhs.node).join(self.node_span(rhs.node));
-            let span = self.emit_span(range);
+            let span = self.emit_join(lhs, rhs);
             lhs = self.emit_expr(Node::Binary(lhs, op, rhs), span);
         }
         Ok(lhs)
@@ -976,8 +1027,7 @@ impl<'a> Parser<'a> {
         };
 
         while let Some((op, range)) = prefixes.pop() {
-            let range = self.node_span(inner.node).join(range);
-            let span = self.emit_span(range);
+            let span = self.emit_join(inner, range);
             inner = self.emit_expr(Node::Unary(op, inner), span);
         }
 
@@ -1007,10 +1057,17 @@ impl<'a> Parser<'a> {
 
         loop {
             if self.eat(Token::Dot) {
+                if self.eat(Token::LParens) {
+                    // type assertion: `x.(T)`
+                    let typ = self.typ()?;
+                    self.expect(Token::RParens)?;
+                    let span = self.emit_join(base, typ);
+                    base = self.emit_expr(Node::TypeAssertion(base, typ), span);
+                    continue;
+                }
+
                 let member = self.identifier()?;
-                let member_range = self.span_range(member.span);
-                let range = self.node_span(base.node).join(member_range);
-                let span = self.emit_span(range);
+                let span = self.emit_join(base, member);
                 base = self.emit_expr(Node::Selector(base.node, member), span);
                 continue;
             }
@@ -1045,15 +1102,13 @@ impl<'a> Parser<'a> {
                 self.data.push_indirect(end.unwrap().node);
                 self.data.push_indirect(cap.node);
                 let end_cap = self.data.pop_indirect_tuple();
-                let range = self.node_span(base.node).join(bracket.file_range());
-                let span = self.emit_span(range);
+                let span = self.emit_join(base, bracket);
                 return Ok(self.emit_expr(Node::SliceCapacity(base, start, end_cap), span));
             }
 
             // `arr[ start? : end? ]`
             let bracket = self.expect(Token::RBracket)?;
-            let range = self.node_span(base.node).join(bracket.file_range());
-            let span = self.emit_span(range);
+            let span = self.emit_join(base, bracket);
             return Ok(self.emit_expr(Node::Slice(base, start, end), span));
         }
 
@@ -1062,8 +1117,7 @@ impl<'a> Parser<'a> {
         // `arr[ index ]`
         self.eat(Token::Comma);
         let bracket = self.expect(Token::RBracket)?;
-        let range = self.node_span(base.node).join(bracket.file_range());
-        let span = self.emit_span(range);
+        let span = self.emit_join(base, bracket);
         Ok(self.emit_expr(Node::Index(base, index), span))
     }
 
@@ -1088,8 +1142,7 @@ impl<'a> Parser<'a> {
         })?;
 
         let end = self.expect(Token::RParens)?.file_range();
-        let range = self.node_span(base.node).join(end);
-        let span = self.emit_span(range);
+        let span = self.emit_join(base, end);
         Ok(self.emit_expr(Node::Call(base, ExprRange::new(arguments), spread), span))
     }
 
@@ -1133,13 +1186,10 @@ impl<'a> Parser<'a> {
                 let (rune, span) = this.parse_rune_token(token)?;
                 return Ok(this.emit_expr(Node::Rune(rune), span));
             }),
-            (Token::Func, |this, _| {
+            (Token::Func, |this, func_token| {
                 let signature = this.signature(None)?;
                 let body = this.block()?;
-                let range = this
-                    .node_range_span(signature.inputs())
-                    .join(this.node_span(body.node));
-                let span = this.emit_span(range);
+                let span = this.emit_join(func_token, body);
                 return Ok(this.emit_expr(Node::FuncDecl(signature, body), span));
             }),
         ]);
@@ -1149,7 +1199,7 @@ impl<'a> Parser<'a> {
 
     fn parse_integer_expr<const BASE: u32>(&mut self, token: SpannedToken) -> Result<ExprId> {
         let bits = self.parse_integer_token::<BASE>(token)?;
-        let span = self.emit_span(token.file_range());
+        let span = self.emit_span(token);
         let node = match bits {
             IntegerBits::Small(small) => Node::IntegerSmall(small),
             IntegerBits::Arbitrary(arbitrary) => Node::IntegerArbitrary(arbitrary),
@@ -1173,7 +1223,7 @@ impl<'a> Parser<'a> {
 
     fn parse_float_expr<const BASE: u32>(&mut self, token: SpannedToken) -> Result<ExprId> {
         let bits = self.parse_float_token::<BASE>(token)?;
-        let span = self.emit_span(token.file_range());
+        let span = self.emit_span(token);
         let node = match bits {
             FloatBits::Small(small) => Node::FloatSmall(small),
             FloatBits::Arbitrary(arbitrary) => Node::FloatArbitrary(arbitrary),
@@ -1227,7 +1277,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_string_token(&mut self, token: SpannedToken) -> Result<(StringRange, SpanId)> {
-        let span = self.emit_span(token.file_range());
+        let span = self.emit_span(token);
         let text = &self.source[token.range()];
         let contents = &text[1..text.len() - 1];
 
@@ -1262,7 +1312,7 @@ impl<'a> Parser<'a> {
     /// Expects an identifier or `_`.
     fn identifier(&mut self) -> Result<Identifier> {
         let token = self.expect(Token::Identifier)?;
-        let span = self.emit_span(token.file_range());
+        let span = self.emit_span(token);
         let source = &self.source[token.range()];
         if source == "_" {
             return Ok(Identifier { text: None, span });

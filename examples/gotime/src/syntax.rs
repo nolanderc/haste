@@ -191,10 +191,9 @@ pub struct Parameter {
     pub typ: TypeId,
 }
 
+/// Marks that there is variadic arguments
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Variadic {
-    pub span: SpanId,
-}
+pub struct Variadic {}
 
 /// Contains information about all expressions and types in a declaration
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -330,6 +329,9 @@ pub enum Node {
 
     /// A call to a method/function. Optionally uses the last argument as the variadic arguments.
     Call(ExprId, ExprRange, Option<ArgumentSpread>),
+
+    /// Asserts that the expression is of the given type.
+    TypeAssertion(ExprId, TypeId),
 
     /// A unary/prefix operator (eg. `!true`)
     Unary(UnaryOperator, ExprId),

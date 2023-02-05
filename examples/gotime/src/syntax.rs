@@ -62,6 +62,9 @@ pub enum PackageName {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decl {
+    /// All `SpanId`s are relative to this offset in the parent file
+    pub base_span: Base<Key<Span>>,
+
     /// Name of the declaration (or `_`).
     pub ident: Identifier,
 
@@ -70,9 +73,6 @@ pub struct Decl {
 
     /// All syntax nodes that occur in the declaration
     pub nodes: NodeStorage,
-
-    /// All `SpanId`s are relative to this offset in the parent file
-    pub base_span: Base<Key<Span>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -128,33 +128,65 @@ pub struct MethodDecl {
     pub func: FuncDecl,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Points to a sequence of nodes representing the parameters of a function.
+///
+/// First comes the input arguments, followed by the function outputs. The number of each is
+/// determined by the `inputs` and `outputs` fields, respectively. However, if the function is
+/// variadic (ie. accepts an arbitrary number of arguments), `inputs` will be negative, and the
+/// total number of parameters becomes `(-inputs) + outputs`.
+///
+/// For example, the signature `func(a int, b int, c ...int) int` would become:
+/// ```
+/// parameters: [{a int} {b int} {c int} {_ int}]
+/// inputs: -3
+/// outputs: 1
+/// ```
+///
+/// The method receiver is the first parameter of the inputs.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
-    /// All parameters in the signature of the function.
-    ///
-    /// First comes the input arguments, followed by the function outputs. The number of inputs is
-    /// `parameters.len() - outputs`, and the number of outputs are simply `outputs`.
-    ///
-    /// For example, given the signature `func(a int, b int) int` we would have:
-    ///
-    /// ```
-    /// parameters: [{a int} {b int} {_ int}]
-    /// outputs: 1
-    /// variadic: false
-    /// ```
-    pub parameters: Box<[Parameter]>,
-
-    /// Number of outputs from the function
-    pub outputs: u32,
-
-    /// Determines if the function accepts an arbitrary number of input arguments
-    pub variadic: Option<Variadic>,
+    /// The index of the first parmeter in the `indirect` node list.
+    start: NonMaxU32,
+    /// The number of input parameters, or negative if variadic.
+    inputs: i16,
+    /// The number of output values.
+    outputs: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Signature {
+    fn new(nodes: NodeRange, outputs: u16) -> Self {
+        let inputs = nodes.length.get() - outputs as u32;
+        Self {
+            start: nodes.start,
+            inputs: i16::try_from(inputs).expect("too many function parameters"),
+            outputs,
+        }
+    }
+
+    fn new_variadic(nodes: NodeRange, outputs: u16) -> Self {
+        let mut range = Self::new(nodes, outputs);
+        range.inputs = -range.inputs;
+        range
+    }
+
+    pub fn inputs(&self) -> NodeRange {
+        let start = self.start;
+        let length = NonMaxU32::new(self.inputs.abs() as u32).unwrap();
+        NodeRange { start, length }
+    }
+
+    pub fn outputs(&self) -> NodeRange {
+        let start = self.start.get() + self.inputs.abs() as u32;
+        let start = NonMaxU32::new(start).unwrap();
+        let length = NonMaxU32::new(self.outputs as u32).unwrap();
+        NodeRange { start, length }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Parameter {
     /// The name of the parameter
-    pub name: Option<Identifier>,
+    pub name: Option<Text>,
     /// The type of the parameter. The same `TypeId` may be reused for multiple parameters.
     pub typ: TypeId,
 }
@@ -195,7 +227,28 @@ pub struct NodeRange {
 
 impl std::fmt::Debug for NodeRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}..{}", self.start, self.start.get() + self.length.get())
+        write!(
+            f,
+            "{}..{}",
+            self.start,
+            self.start.get() + self.length.get()
+        )
+    }
+}
+
+/// Refers to `N` consecutive nodes in the `indirect` list
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeTuple<const N: usize> {
+    start: NonMaxU32,
+}
+
+impl<const N: usize> std::fmt::Debug for NodeTuple<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut tuple = f.debug_tuple("");
+        for i in 0..N {
+            tuple.field(&(self.start.get() as usize + i));
+        }
+        tuple.finish()
     }
 }
 
@@ -249,25 +302,58 @@ pub enum Node {
     /// References an item within the inner node (could be a field, method or package member)
     Selector(NodeId, Identifier),
 
+    /// A function/method parameter.
+    Parameter(Parameter),
+
     // === Types === //
     /// An array/slice of the given type, possibly with a fixed size
     Pointer(TypeId),
 
-    // === Expressions ===
-    Integer(IntegerBits),
-    Float(FloatBits),
-    Imaginary(FloatBits),
+    // === Expressions === //
+    /// An integer literal.
+    IntegerSmall(u64),
+    IntegerArbitrary(()),
+
+    /// A floating point literal.
+    FloatSmall(FloatBits64),
+    FloatArbitrary(()),
+
+    /// The imaginary part of a complex number.
+    ImaginarySmall(FloatBits64),
+    ImaginaryArbitrary(()),
+
+    /// A character literal.
     Rune(char),
+
+    /// A string literal.
     String(StringRange),
+
+    /// A call to a method/function. Optionally uses the last argument as the variadic arguments.
     Call(ExprId, ExprRange, Option<ArgumentSpread>),
+
+    /// A unary/prefix operator (eg. `!true`)
     Unary(UnaryOperator, ExprId),
+
+    /// A binary operator (eg. `a + b`)
     Binary(ExprId, BinaryOperator, ExprId),
 
-    // === Statements ===
+    /// A function literal with a body
+    FuncDecl(Signature, StmtId),
+
+    /// Index into a container
+    Index(ExprId, ExprId),
+
+    /// Slice start and end.
+    Slice(ExprId, Option<ExprId>, Option<ExprId>),
+
+    /// Slice start, end and capacity. The start index is optional and implicitly `0`.
+    SliceCapacity(ExprId, Option<ExprId>, NodeTuple<2>),
+
+    // === Statements === //
     Block(StmtRange),
     Return(Option<ExprId>),
     ReturnMulti(ExprRange),
-    VarDecl(AssignRange),
+    VarDecl(AssignRange, Option<TypeId>),
     Assignment(AssignRange),
     Increment(ExprId),
     Decrement(ExprId),
@@ -318,19 +404,27 @@ impl AssignRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IntegerBits {
-    /// A small integer representable in 32-bits
-    Small(u32),
-    /// TODO: intern large integers
-    Large(),
+enum IntegerBits {
+    Small(u64),
+    Arbitrary(()),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FloatBits {
-    /// A float representable using an `f32`.
-    Small(u32),
-    /// TODO: intern large floats.
-    Large(),
+enum FloatBits {
+    Small(FloatBits64),
+    Arbitrary(()),
+}
+
+/// A float representable using an `f64`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FloatBits64 {
+    pub bits: u64,
+}
+
+impl std::fmt::Debug for FloatBits64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", f64::from_bits(self.bits))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

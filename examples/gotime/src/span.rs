@@ -23,6 +23,13 @@ impl Span {
             range: self.range.join(other.range),
         }
     }
+
+    pub(crate) fn join_range(&self, range: FileRange) -> Span {
+        Self {
+            path: self.path,
+            range: self.range.join(range),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

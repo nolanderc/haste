@@ -313,8 +313,11 @@ pub trait DatabaseExt: Database {
         value
     }
 
-    fn fmt<T>(&self, value: T) -> fmt::Adapter<'_, T>
-    {
+    /// Returns a wrapper which allows the value to be formatted using this database.
+    ///
+    /// The returned adapter makes `self` available through `fmt::with_storage` for the inner
+    /// value's `Debug` and `Display` impls.
+    fn fmt<T>(&self, value: T) -> fmt::Adapter<'_, T> {
         fmt::Adapter::new(self.as_dyn(), value)
     }
 }

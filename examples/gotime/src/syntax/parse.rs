@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ops::Range};
 
-use bstr::{BString, ByteVec};
+use bstr::{BString, ByteSlice, ByteVec};
 use haste::non_max::NonMaxU32;
 use smallvec::SmallVec;
 
@@ -30,7 +30,7 @@ pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Resul
 
     match parser.file() {
         Ok(file) => return Ok(file),
-        Err(()) => Err(Diagnostic::combine(parser.diagnostics)),
+        Err(()) => Err(Diagnostic::combine(parser.diagnostics.into_iter())),
     }
 }
 
@@ -75,9 +75,6 @@ struct Data {
 
     /// a stack of identifiers when parsing identifier lists (in assignments and parameter lists)
     identifiers: Vec<Identifier>,
-
-    /// a stack of identifiers when parsing function parameters and outputs
-    parameters: Vec<Parameter>,
 
     /// When producing declarations that index into any of the lists in this struct, those indices
     /// should be relative to the ones in this struct so that they become position independent.
@@ -153,9 +150,24 @@ impl Data {
             length: NonMaxU32::new(length as u32).unwrap(),
         }
     }
+
+    fn pop_indirect_tuple<const N: usize>(&mut self) -> NodeTuple<N> {
+        let start = self.node.indirect.len() - N;
+        let base = self.node.indirect_stack.len() - N;
+        let nodes = &self.node.indirect_stack[base..];
+        self.node.indirect.extend_from_slice(nodes);
+        self.node.indirect_stack.truncate(base);
+
+        NodeTuple {
+            start: NonMaxU32::new(start as u32).unwrap(),
+        }
+    }
 }
 
 type Result<T, E = ()> = std::result::Result<T, E>;
+
+type ParseFn<T> = fn(&mut Parser) -> Result<T>;
+type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
 
 impl<'a> Parser<'a> {
     fn advance(&mut self) {
@@ -210,6 +222,18 @@ impl<'a> Parser<'a> {
 
     fn eat(&mut self, token: Token) -> bool {
         self.try_expect(token).is_some()
+    }
+
+    fn try_branch_token<T, const N: usize>(
+        &mut self,
+        table: &LookupTable<ParseTokenFn<T>, N>,
+    ) -> Result<Option<T>> {
+        self.expected.merge(table.tokens);
+        let Some(next) = self.peek() else { return Ok(None) };
+        let Some(parser) = table.lookup(next.token()) else { return Ok(None) };
+        self.advance();
+        let output = parser(self, next)?;
+        Ok(Some(output))
     }
 
     fn unexpected_range(&self) -> FileRange {
@@ -518,7 +542,7 @@ impl<'a> Parser<'a> {
         Ok((ident, DeclKind::Function(FuncDecl { signature, body })))
     }
 
-    fn try_receiver(&mut self) -> Result<Option<Parameter>> {
+    fn try_receiver(&mut self) -> Result<Option<NodeId>> {
         if !self.eat(Token::LParens) {
             return Ok(None);
         }
@@ -537,32 +561,46 @@ impl<'a> Parser<'a> {
             base_type
         };
 
-        Ok(Some(Parameter {
-            name: Some(name),
+        let parameter = Parameter {
+            name: name.text,
             typ,
-        }))
+        };
+
+        let range = self.span_range(name.span).join(self.node_span(typ.node));
+        let span = self.emit_span(range);
+        Ok(Some(self.emit_node(Node::Parameter(parameter), span)))
     }
 
-    fn signature(&mut self, receiver: Option<Parameter>) -> Result<Signature> {
-        let input_start = self.data.parameters.len();
-        self.data.parameters.extend(receiver);
+    fn signature(&mut self, receiver: Option<NodeId>) -> Result<Signature> {
+        let input_start = self.data.node.indirect_stack.len();
+
+        if let Some(receiver) = receiver {
+            self.data.push_indirect(receiver);
+        }
         let variadic = self.push_parameter_list(true)?;
 
-        let output_start = self.data.parameters.len();
+        let output_start = self.data.node.indirect_stack.len();
         if self.peek_is(Token::LParens) {
             self.push_parameter_list(false)?;
         } else if let Some(typ) = self.try_type()? {
-            self.data.parameters.push(Parameter { name: None, typ });
+            let span = self.node_span_id(typ.node);
+            self.push_parameter(None, typ, span);
         }
 
-        let outputs = (self.data.parameters.len() - output_start) as u32;
-        let parameters = self.data.parameters.split_off(input_start).into();
+        let outputs = u16::try_from(self.data.node.indirect_stack.len() - output_start)
+            .expect("too many function outputs");
+        let parameters = self.data.pop_indirect(input_start);
 
-        Ok(Signature {
-            parameters,
-            outputs,
-            variadic,
-        })
+        if variadic.is_some() {
+            Ok(Signature::new_variadic(parameters, outputs))
+        } else {
+            Ok(Signature::new(parameters, outputs))
+        }
+    }
+
+    fn push_parameter(&mut self, name: Option<Text>, typ: TypeId, span: SpanId) {
+        let node = self.emit_node(Node::Parameter(Parameter { name, typ }), span);
+        self.data.node.indirect_stack.push(node);
     }
 
     /// Returns whether the parameter list's last type is variadic
@@ -603,7 +641,7 @@ impl<'a> Parser<'a> {
             for i in names_start..self.data.identifiers.len() {
                 let ident = self.data.identifiers[i];
                 let typ = self.emit_type(Node::Name(ident.text), ident.span);
-                self.data.parameters.push(Parameter { name: None, typ });
+                self.push_parameter(None, typ, ident.span);
             }
             self.data.identifiers.truncate(names_start);
         }
@@ -631,15 +669,15 @@ impl<'a> Parser<'a> {
             let typ = self.typ()?;
 
             if all_types {
-                self.data.parameters.push(Parameter { name: None, typ });
+                self.push_parameter(None, typ, self.node_span_id(typ.node));
             } else {
-                let idents = self.data.identifiers.drain(names_start..);
-                for ident in idents {
-                    self.data.parameters.push(Parameter {
-                        name: Some(ident),
-                        typ,
-                    });
+                for index in names_start..self.data.identifiers.len() {
+                    let ident = self.data.identifiers[index];
+                    let range = self.span_range(ident.span).join(self.node_span(typ.node));
+                    let span = self.emit_span(range);
+                    self.push_parameter(ident.text, typ, span);
                 }
+                self.data.identifiers.truncate(names_start);
             }
 
             if !self.eat(Token::Comma) {
@@ -805,7 +843,7 @@ impl<'a> Parser<'a> {
             let full_range = self.data.pop_indirect(binding_base);
             let range = AssignRange::from_full(full_range);
             let kind = if is_definition {
-                Node::VarDecl(range)
+                Node::VarDecl(range, None)
             } else {
                 Node::Assignment(range)
             };
@@ -982,8 +1020,51 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            if self.peek_is(Token::LBracket) {
+                base = self.indexing(base)?;
+                continue;
+            }
+
             return Ok(Some(base));
         }
+    }
+
+    fn indexing(&mut self, base: ExprId) -> Result<ExprId> {
+        self.expect(Token::LBracket)?;
+
+        let start = self.try_expression()?;
+
+        if self.eat(Token::Colon) {
+            // found slicing syntax
+            let end = self.try_expression()?;
+
+            if end.is_some() && self.eat(Token::Colon) {
+                // `arr[ start? : end : cap ]`
+                let cap = self.expression()?;
+                let bracket = self.expect(Token::RBracket)?;
+                self.data.push_indirect(end.unwrap().node);
+                self.data.push_indirect(cap.node);
+                let end_cap = self.data.pop_indirect_tuple();
+                let range = self.node_span(base.node).join(bracket.file_range());
+                let span = self.emit_span(range);
+                return Ok(self.emit_expr(Node::SliceCapacity(base, start, end_cap), span));
+            }
+
+            // `arr[ start? : end? ]`
+            let bracket = self.expect(Token::RBracket)?;
+            let range = self.node_span(base.node).join(bracket.file_range());
+            let span = self.emit_span(range);
+            return Ok(self.emit_expr(Node::Slice(base, start, end), span));
+        }
+
+        let index = start.ok_or_else(|| self.emit_expected("an expression"))?;
+
+        // `arr[ index ]`
+        self.eat(Token::Comma);
+        let bracket = self.expect(Token::RBracket)?;
+        let range = self.node_span(base.node).join(bracket.file_range());
+        let span = self.emit_span(range);
+        Ok(self.emit_expr(Node::Index(base, index), span))
     }
 
     fn call(&mut self, base: ExprId) -> Result<ExprId> {
@@ -1013,31 +1094,139 @@ impl<'a> Parser<'a> {
     }
 
     fn try_operand(&mut self) -> Result<Option<ExprId>> {
+        // fast path for identifiers
         if self.peek_is(Token::Identifier) {
             let ident = self.identifier()?;
             return Ok(Some(self.emit_expr(Node::Name(ident.text), ident.span)));
         }
 
-        if let Some(token) = self.try_expect(Token::Integer) {
-            let value = match self.source[token.range()].parse() {
-                Ok(value) => value,
+        static OPERANDS: LookupTable<ParseTokenFn<ExprId>, 11> = LookupTable::new([
+            (Token::LParens, |this, _| {
+                let inner = this.expression()?;
+                this.expect(Token::RParens)?;
+                Ok(inner)
+            }),
+            (Token::Integer, |this, token| {
+                this.parse_integer_expr::<10>(token)
+            }),
+            (Token::IntegerBinary, |this, token| {
+                this.parse_integer_expr::<2>(token)
+            }),
+            (Token::IntegerOctal, |this, token| {
+                this.parse_integer_expr::<8>(token)
+            }),
+            (Token::IntegerHex, |this, token| {
+                this.parse_integer_expr::<16>(token)
+            }),
+            (Token::Float, |this, token| {
+                this.parse_float_expr::<10>(token)
+            }),
+            (Token::FloatHex, |this, token| {
+                this.parse_float_expr::<16>(token)
+            }),
+            (Token::Imaginary, |_this, _| todo!("parse imaginary number")),
+            (Token::String, |this, token| {
+                let (range, span) = this.parse_string_token(token)?;
+                return Ok(this.emit_expr(Node::String(range), span));
+            }),
+            (Token::Rune, |this, token| {
+                let (rune, span) = this.parse_rune_token(token)?;
+                return Ok(this.emit_expr(Node::Rune(rune), span));
+            }),
+            (Token::Func, |this, _| {
+                let signature = this.signature(None)?;
+                let body = this.block()?;
+                let range = this
+                    .node_range_span(signature.inputs())
+                    .join(this.node_span(body.node));
+                let span = this.emit_span(range);
+                return Ok(this.emit_expr(Node::FuncDecl(signature, body), span));
+            }),
+        ]);
+
+        self.try_branch_token(&OPERANDS)
+    }
+
+    fn parse_integer_expr<const BASE: u32>(&mut self, token: SpannedToken) -> Result<ExprId> {
+        let bits = self.parse_integer_token::<BASE>(token)?;
+        let span = self.emit_span(token.file_range());
+        let node = match bits {
+            IntegerBits::Small(small) => Node::IntegerSmall(small),
+            IntegerBits::Arbitrary(arbitrary) => Node::IntegerArbitrary(arbitrary),
+        };
+        Ok(self.emit_expr(node, span))
+    }
+
+    fn parse_integer_token<const BASE: u32>(&mut self, token: SpannedToken) -> Result<IntegerBits> {
+        let text = &self.source[token.range()];
+        match parse_integer::<BASE>(text) {
+            Ok(bits) => Ok(bits),
+            Err(error) => {
+                let offset = token.file_range().start.get();
+                let start = error.range.start + offset;
+                let end = error.range.end + offset;
+                let span = Span::new(self.path, FileRange::from(start..end));
+                Err(self.emit(Diagnostic::error("invalid number literal").label(span, error.kind)))
+            }
+        }
+    }
+
+    fn parse_float_expr<const BASE: u32>(&mut self, token: SpannedToken) -> Result<ExprId> {
+        let bits = self.parse_float_token::<BASE>(token)?;
+        let span = self.emit_span(token.file_range());
+        let node = match bits {
+            FloatBits::Small(small) => Node::FloatSmall(small),
+            FloatBits::Arbitrary(arbitrary) => Node::FloatArbitrary(arbitrary),
+        };
+        Ok(self.emit_expr(node, span))
+    }
+
+    fn parse_float_token<const BASE: u32>(&mut self, token: SpannedToken) -> Result<FloatBits> {
+        let text = &self.source[token.range()];
+        if BASE == 10 {
+            match text.parse::<f64>() {
+                Ok(float) => Ok(FloatBits::Small(FloatBits64 {
+                    bits: float.to_bits(),
+                })),
                 Err(error) => {
                     let span = Span::new(self.path, token.file_range());
-                    let diagnostic =
-                        Diagnostic::error("invalid integer literal").label(span, error);
-                    return Err(self.emit(diagnostic));
+                    Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
                 }
-            };
-            let integer = IntegerBits::Small(value);
-            let span = self.emit_span(token.file_range());
-            return Ok(Some(self.emit_expr(Node::Integer(integer), span)));
+            }
+        } else {
+            todo!("parse hex float: {:?}", text)
+        }
+    }
+
+    fn parse_rune_token(&mut self, token: SpannedToken) -> Result<(char, SpanId)> {
+        const MESSAGE: &'static str = "rune literal must contain exactly one codepoint";
+
+        let (range, span) = self.parse_string_token(token)?;
+        let bytes = self.data.string_bytes(range);
+        let mut chars = bytes.chars();
+
+        let Some(rune) = chars.next() else {
+            let span = self.get_span(span);
+            let diagnostic = Diagnostic::error(MESSAGE).label(span, "empty rune literal");
+            return Err(self.emit(diagnostic));
+        };
+
+        if chars.next().is_some() {
+            let span = self.get_span(span);
+            let diagnostic =
+                Diagnostic::error(MESSAGE).label(span, "too many characters in rune literal");
+            return Err(self.emit(diagnostic));
         }
 
-        Ok(None)
+        Ok((rune, span))
     }
 
     fn string(&mut self) -> Result<(StringRange, SpanId)> {
         let token = self.expect(Token::String)?;
+        self.parse_string_token(token)
+    }
+
+    fn parse_string_token(&mut self, token: SpannedToken) -> Result<(StringRange, SpanId)> {
         let span = self.emit_span(token.file_range());
         let text = &self.source[token.range()];
         let contents = &text[1..text.len() - 1];
@@ -1135,7 +1324,7 @@ fn decode_string(contents: &str, out: &mut BString) -> Result<(), EscapeError> {
 
         out.push_str(&contents[last_flush..i]);
 
-        while bytes[i] == b'\\' {
+        while i < bytes.len() && bytes[i] == b'\\' {
             i = decode_escape_sequence(&contents, i, out)?;
         }
 
@@ -1180,6 +1369,7 @@ fn decode_escape_sequence(
                 return Err(EscapeErrorKind::ValueTooLarge.range(start..i + 3));
             }
             out.push(value as u8);
+            i += 2;
         }
         b'x' => {
             let digits = &bytes[i..i + 2];
@@ -1188,6 +1378,7 @@ fn decode_escape_sequence(
             }
             let value = u8::from_str_radix(&text[i..i + 2], 16).unwrap();
             out.push(value);
+            i += 2;
         }
         b'u' => {
             let digits = &bytes[i..i + 4];
@@ -1200,6 +1391,7 @@ fn decode_escape_sequence(
             } else {
                 return Err(EscapeErrorKind::InvalidCodepoint.range(start..i + 4));
             }
+            i += 4;
         }
         b'U' => {
             let digits = &bytes[i..i + 8];
@@ -1212,6 +1404,7 @@ fn decode_escape_sequence(
             } else {
                 return Err(EscapeErrorKind::InvalidCodepoint.range(start..i + 8));
             }
+            i += 8;
         }
         _ => {
             let char = text[start + 1..].chars().next().unwrap();
@@ -1235,13 +1428,13 @@ impl<T: Copy, const N: usize> LookupTable<T, N> {
         while i < N {
             let mut j = i;
             while j > 0 {
-                j -= 1;
-                if (branches[j].0 as u8) < (branches[i].0 as u8) {
+                if (branches[j - 1].0 as u8) <= (branches[j].0 as u8) {
                     break;
                 }
-                let old_j = branches[j];
-                branches[j] = branches[i];
-                branches[i] = old_j;
+                let tmp = branches[j - 1];
+                branches[j - 1] = branches[j];
+                branches[j] = tmp;
+                j -= 1;
             }
             i += 1;
         }
@@ -1260,11 +1453,167 @@ impl<T: Copy, const N: usize> LookupTable<T, N> {
         Self { tokens, values }
     }
 
-    pub const fn lookup(&self, token: Token) -> Option<T> {
+    pub fn lookup(&self, token: Token) -> Option<T> {
         if let Some(index) = self.tokens.find(token) {
             Some(self.values[index])
         } else {
             None
         }
     }
+}
+
+struct IntParser<const BASE: u32> {
+    value: u128,
+}
+
+struct IntError {
+    range: std::ops::Range<u32>,
+    kind: IntErrorKind,
+}
+
+enum IntErrorKind {
+    InvalidDigit,
+    Overflow,
+    InvalidUnderscore,
+    UnexpectedEnd,
+}
+
+impl std::fmt::Display for IntErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IntErrorKind::InvalidDigit => write!(f, "invalid digit"),
+            IntErrorKind::Overflow => write!(f, "too large to represent without overflow"),
+            IntErrorKind::InvalidUnderscore => {
+                write!(f, "`_` must only occur next to other digits")
+            }
+            IntErrorKind::UnexpectedEnd => write!(f, "expected another digit after this"),
+        }
+    }
+}
+
+fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
+    let bytes = text.as_bytes();
+
+    let mut value = 0u128;
+    let mut overflow = false;
+    let mut invalid_digit = None;
+    let mut invalid_underscore = None;
+    let mut missing_digit = false;
+
+    let mut i = 0;
+
+    if bytes[0] == b'0' {
+        match BASE {
+            // skip `0b`
+            2 => i += 2,
+            // skip `0x`
+            16 => i += 2,
+
+            // skip `0o` or leading zero.
+            8 => {
+                if matches!(bytes[1], b'o' | b'O') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+
+            10 => {
+                if bytes.len() != 1 {
+                    // a leading zero would produce an octal value
+                    invalid_digit = Some(1);
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    let mut emit_digit = |index: usize| {
+        let Some(&digit) = bytes.get(index) else {
+            missing_digit = true;
+            return;
+        };
+        let digit_value = match BASE {
+            2 => matches!(digit, b'0' | b'1').then(|| digit - b'0'),
+            8 => matches!(digit, b'0'..=b'7').then(|| digit - b'0'),
+            10 => matches!(digit, b'0'..=b'9').then(|| digit - b'0'),
+            16 => match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                b'A'..=b'F' => Some(digit - b'A' + 10),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(digit_value) = digit_value {
+            let new_value = value
+                .wrapping_mul(BASE as u128)
+                .wrapping_add(digit_value as u128);
+            overflow |= new_value < value;
+            value = new_value;
+        } else {
+            if digit == b'_' {
+                invalid_underscore = invalid_underscore.or(Some(index));
+            } else {
+                invalid_digit = invalid_digit.or(Some(index));
+            }
+        }
+    };
+
+    loop {
+        if matches!(bytes.get(i), Some(b'_')) {
+            i += 1;
+        }
+        emit_digit(i);
+        i += 1;
+
+        if i < bytes.len() {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if let Some(start) = invalid_digit {
+        let length = text[start..].chars().next().unwrap().len_utf8();
+        let start = start as u32;
+        let end = start + length as u32;
+        return Err(IntError {
+            range: start..end,
+            kind: IntErrorKind::InvalidDigit,
+        });
+    }
+
+    if let Some(start) = invalid_underscore {
+        return Err(IntError {
+            range: start as u32..start as u32 + 1,
+            kind: IntErrorKind::InvalidUnderscore,
+        });
+    }
+
+    if missing_digit {
+        let last_start = text.chars().next_back().unwrap().len_utf8();
+        let end = text.len() as u32;
+        let start = end - last_start as u32;
+        return Err(IntError {
+            range: start..end,
+            kind: IntErrorKind::UnexpectedEnd,
+        });
+    }
+
+    if overflow {
+        return Err(IntError {
+            range: 0..bytes.len() as u32,
+            kind: IntErrorKind::Overflow,
+        });
+    }
+
+    let bits = match u64::try_from(value) {
+        Ok(bits) => IntegerBits::Small(bits),
+        Err(_) => todo!("intern large integers"),
+    };
+
+    Ok(bits)
 }

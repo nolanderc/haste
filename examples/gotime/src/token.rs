@@ -661,7 +661,13 @@ const _: () = assert!(std::mem::size_of::<TokenSetBits>() * 8 >= Token::COUNT);
 
 #[derive(Default, Clone, Copy)]
 pub struct TokenSet {
-    bits: TokenSetBits,
+    pub(crate) bits: TokenSetBits,
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
 }
 
 impl TokenSet {
@@ -708,7 +714,7 @@ impl TokenSet {
         })
     }
 
-    pub const fn find(self, token: Token) -> Option<usize> {
+    pub fn find(self, token: Token) -> Option<usize> {
         let mask = Self::mask(token);
         if self.bits & mask == 0 {
             // the token is not in the set

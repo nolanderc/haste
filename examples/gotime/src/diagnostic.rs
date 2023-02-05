@@ -87,11 +87,11 @@ impl Diagnostic {
     }
 
     /// Combine multiple diagnostics into one
-    pub fn combine(mut diagnostics: Vec<Diagnostic>) -> Self {
+    pub fn combine(mut diagnostics: impl Iterator<Item = Diagnostic> + ExactSizeIterator) -> Self {
         if diagnostics.len() == 1 {
-            diagnostics.swap_remove(0)
+            diagnostics.next().unwrap()
         } else {
-            Self::new(Inner::Combine(diagnostics))
+            Self::new(Inner::Combine(diagnostics.collect()))
         }
     }
 

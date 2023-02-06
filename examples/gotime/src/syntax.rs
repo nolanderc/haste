@@ -1,7 +1,9 @@
 mod parse;
 
+use std::num::{NonZeroU16, NonZeroUsize};
+
 use bstr::BStr;
-use haste::non_max::NonMaxU32;
+use haste::non_max::{NonMaxU16, NonMaxU32};
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
@@ -137,7 +139,7 @@ pub struct FuncDecl {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
     /// The index of the first parmeter in the `indirect` node list.
-    start: NonMaxU32,
+    start: NonMaxU16,
     /// The number of input parameters, or negative if variadic.
     inputs: i16,
     /// The number of output values.
@@ -146,7 +148,7 @@ pub struct Signature {
 
 impl Signature {
     fn new(nodes: NodeRange, outputs: u16) -> Self {
-        let inputs = nodes.length.get() - outputs as u32;
+        let inputs = nodes.length.get() - outputs;
         Self {
             start: nodes.start,
             inputs: i16::try_from(inputs).expect("too many function parameters"),
@@ -162,14 +164,14 @@ impl Signature {
 
     pub fn inputs(&self) -> NodeRange {
         let start = self.start;
-        let length = NonMaxU32::new(self.inputs.abs() as u32).unwrap();
+        let length = NonMaxU16::new(self.inputs.unsigned_abs()).unwrap();
         NodeRange { start, length }
     }
 
     pub fn outputs(&self) -> NodeRange {
-        let start = self.start.get() + self.inputs.abs() as u32;
-        let start = NonMaxU32::new(start).unwrap();
-        let length = NonMaxU32::new(self.outputs as u32).unwrap();
+        let start = self.start.get() + self.inputs.unsigned_abs();
+        let start = NonMaxU16::new(start).unwrap();
+        let length = NonMaxU16::new(self.outputs).unwrap();
         NodeRange { start, length }
     }
 }
@@ -206,13 +208,35 @@ pub struct NodeStorage {
 }
 
 /// References a node in the current declaration.
-pub type NodeId = Key<Node>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    raw: NonZeroU16,
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeId({})", self.raw)
+    }
+}
+
+impl crate::key::KeyOps for NodeId {
+    fn from_index(index: usize) -> Self {
+        let index = NonZeroUsize::new(1 + index).unwrap();
+        let raw = NonZeroU16::try_from(index)
+            .expect("exhausted syntax node IDs, try reducing the size of declarations");
+        Self { raw }
+    }
+
+    fn index(self) -> usize {
+        (self.raw.get() - 1) as usize
+    }
+}
 
 /// Refers to a range of nodes in the `indirect` list.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeRange {
-    pub start: NonMaxU32,
-    pub length: NonMaxU32,
+    pub start: NonMaxU16,
+    pub length: NonMaxU16,
 }
 
 impl std::fmt::Debug for NodeRange {
@@ -223,22 +247,6 @@ impl std::fmt::Debug for NodeRange {
             self.start,
             self.start.get() + self.length.get()
         )
-    }
-}
-
-/// Refers to `N` consecutive nodes in the `indirect` list
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeTuple<const N: usize> {
-    start: NonMaxU32,
-}
-
-impl<const N: usize> std::fmt::Debug for NodeTuple<N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut tuple = f.debug_tuple("");
-        for i in 0..N {
-            tuple.field(&(self.start.get() as usize + i));
-        }
-        tuple.finish()
     }
 }
 
@@ -321,16 +329,13 @@ pub enum Node {
     /// A list of fields
     Struct(NodeRange),
     /// `<name> <type> <tag?>`
-    Field(Option<Text>, TypeId, Option<ExprId>),
+    Field(Identifier, TypeId, Option<ExprId>),
 
     /// A list of methods and types
     Interface(NodeRange),
-    MethodElement(Text, Signature),
+    MethodElement(Identifier, Signature),
 
     // === Expressions === //
-    /// The default value for whatever type in initializes.
-    DefaultInit,
-
     /// An integer literal.
     IntegerSmall(u64),
     IntegerArbitrary(()),
@@ -377,11 +382,10 @@ pub enum Node {
 
     /// Slice start and end: `arr[ <start?> : <end?> ]`
     Slice(ExprId, Option<ExprId>, Option<ExprId>),
-
     /// Slice start, end and capacity: `arr[ <start?> : <end> : <cap> ]`
     ///
     /// The start index is optional and implicitly `0`.
-    SliceCapacity(ExprId, Option<ExprId>, NodeTuple<2>),
+    SliceCapacity(ExprId, Option<ExprId>, ExprId, ExprId),
 
     // === Statements === //
     /// Defines a new type (eg. `type Foo struct { ... }`)
@@ -392,12 +396,12 @@ pub enum Node {
     TypeList(NodeRange),
 
     /// A single const-declaration
-    ConstDecl(AssignRange, Option<TypeId>),
+    ConstDecl(NodeRange, Option<TypeId>, ExprRange),
     /// A sequence of `ConstDecl`s
     ConstList(NodeRange),
 
     /// A single var-declaration
-    VarDecl(AssignRange, Option<TypeId>),
+    VarDecl(NodeRange, Option<TypeId>, Option<ExprRange>),
     /// A sequence of `VarDecl`s
     VarList(NodeRange),
 
@@ -409,8 +413,8 @@ pub enum Node {
     /// Return multiple values
     ReturnMulti(ExprRange),
 
-    /// Assign a value to an expression.
-    Assign(AssignRange),
+    /// Bind the expressions to the values
+    Assign(NodeRange, ExprRange),
 
     /// Apply a binary operator and store the result in the lhs: `lhs += rhs`
     AssignOp(ExprId, BinaryOperator, ExprId),
@@ -441,34 +445,26 @@ pub enum Node {
     /// Continue on the next branch on the switch statement
     Fallthrough,
 
-    /// `if <expr> { ... }` with an optional `init`-statement (which is the first in the range).
-    If(HasInitStmt, ExprId, StmtRange),
-    /// `if <expr> { ... } else ...` where the `else` statement is the last in the range (either a
-    /// block or another if-statement)
-    IfElse(HasInitStmt, ExprId, StmtRange),
+    /// `if <init?>; <expr> { ... } else ...` with an optional `init`-statement and `else`-branch.
+    If(Option<StmtId>, ExprId, StmtRange, Option<StmtId>),
 
     /// Wait until one of the given branches succeeds.
     Select(NodeRange),
-    /// Select the first send/recv statement that succeeds
-    SelectCase(StmtId, StmtRange),
+    /// Waits until the send/recv statement is ready, and then executes the given statements.
+    /// If there's no send/recv statement, this is a default case.
+    SelectCase(Option<StmtId>, StmtRange),
     /// Binds the values on the left to the result of waiting on the channel
-    SelectRecv(Option<ExprRange>, ExprId),
-    /// Binds the names on the left to the result of waiting on the channel
-    SelectRecvDef(NodeRange, ExprId),
+    SelectRecv(ExprRange, AssignOrDefine, ExprId),
 
-    /// An empty statement
-    Empty,
+    /// Choose one of the listed cases that match the expression
+    Switch(Option<StmtId>, Option<ExprId>, StmtRange),
+    /// Matches the value of the expression. A missing expression is the `default` case.
+    SwitchCase(Option<ExprId>, StmtRange),
 
     /// `for <init?> ; <condition?> ; <post?> {...}`
-    For(NodeTuple<3>, StmtRange),
-    /// `for <condition?> {...}`
-    ForWhile(Option<ExprId>, StmtRange),
-    /// `for range <expr> {...} `
-    ForRange(ExprId, StmtRange),
-    /// `for <expr> = range <expr> {...} `
-    ForRange1(NodeTuple<2>, AssignOrDefine, StmtRange),
-    /// `for <expr>, <expr> = range <expr> {...} `
-    ForRange2(NodeTuple<3>, AssignOrDefine, StmtRange),
+    For(Option<StmtId>, Option<ExprId>, Option<StmtId>, StmtRange),
+    /// `for <expr>, <expr?> = range <expr> {...} `
+    ForRange(Option<ForRangeBinding>, ExprId, StmtRange),
 }
 
 const _: () = assert!(
@@ -476,7 +472,15 @@ const _: () = assert!(
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
 
-pub type HasInitStmt = bool;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForRangeBinding {
+    /// The first expression to bind a value to
+    pub first: ExprId,
+    /// The second expression to bind a value to
+    pub second: Option<ExprId>,
+    /// Are the names defined or simply assigned to
+    pub kind: AssignOrDefine,
+}
 
 /// Certain syntax forms accepts both `:=` and `=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -501,9 +505,9 @@ pub struct ArgumentSpread {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AssignRange {
     /// The index of the first range.
-    start: NonMaxU32,
+    start: NonMaxU16,
     /// The length of each half (ie. the total length is twice this value).
-    half_length: NonMaxU32,
+    half_length: NonMaxU16,
 }
 
 impl AssignRange {
@@ -512,7 +516,7 @@ impl AssignRange {
         let half = nodes.length.get() / 2;
         Self {
             start: nodes.start,
-            half_length: NonMaxU32::new(half).unwrap(),
+            half_length: NonMaxU16::new(half).unwrap(),
         }
     }
 
@@ -525,7 +529,7 @@ impl AssignRange {
 
     pub fn values(self) -> ExprRange {
         ExprRange::new(NodeRange {
-            start: NonMaxU32::new(self.start.get() + self.half_length.get()).unwrap(),
+            start: NonMaxU16::new(self.start.get() + self.half_length.get()).unwrap(),
             length: self.half_length,
         })
     }

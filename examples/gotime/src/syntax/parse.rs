@@ -165,20 +165,8 @@ impl Data {
         self.node.indirect_stack.truncate(base);
 
         NodeRange {
-            start: NonMaxU32::new(start as u32).unwrap(),
-            length: NonMaxU32::new(length as u32).unwrap(),
-        }
-    }
-
-    fn pop_indirect_tuple<const N: usize>(&mut self) -> NodeTuple<N> {
-        let start = self.node.indirect.len() - N;
-        let base = self.node.indirect_stack.len() - N;
-        let nodes = &self.node.indirect_stack[base..];
-        self.node.indirect.extend_from_slice(nodes);
-        self.node.indirect_stack.truncate(base);
-
-        NodeTuple {
-            start: NonMaxU32::new(start as u32).unwrap(),
+            start: NonMaxU16::new(start as u16).unwrap(),
+            length: NonMaxU16::new(length as u16).unwrap(),
         }
     }
 
@@ -498,7 +486,7 @@ impl<'a> Parser<'a> {
         let index = self.data.node.kinds.len() - self.data.base.nodes;
         self.data.node.kinds.push(node);
         self.data.node.spans.push(span);
-        Key::from_index(index)
+        NodeId::from_index(index)
     }
 
     fn emit_stmt(&mut self, node: Node, span: SpanId) -> StmtId {
@@ -703,56 +691,72 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn const_spec(&mut self, prev: &mut Option<AssignRange>) -> Result<NodeId> {
-        let mut typ = None;
-
-        let nodes = self.multi(|this| {
-            let mut name_count = 0;
+    fn const_spec(&mut self, prev: &mut Option<ExprRange>) -> Result<NodeId> {
+        let names = self.multi(|this| {
             loop {
                 let name = this.identifier()?;
                 let node = this.emit_node(Node::Name(name.text), name.span);
                 this.data.push_indirect(node);
-                name_count += 1;
-
                 if !this.eat(Token::Comma) {
                     break;
                 }
             }
-
-            typ = this.try_type()?;
-
-            if this.eat(Token::Assign) {
-                for i in 0..name_count {
-                    if i != 0 {
-                        this.expect(Token::Comma)?;
-                    }
-                    let expr = this.expression()?;
-                    this.data.push_indirect(expr.node);
-                }
-            } else if let Some(prev) = prev {
-                this.data.duplicate_indirect(prev.values().nodes);
-            } else {
-                return Err(this.emit_expected("a constant initializer: `= <expr>`"));
-            }
-
             Ok(())
         })?;
 
-        if let Some(prev) = prev {
-            if nodes.length.get() != 2 * prev.half_length.get() {
-                let span = Span::new(self.path, nodes.range(self));
-                return Err(self.emit(Diagnostic::error("invalid const declaration")
-                        .label(span, "all declarations in the list must have the same number of identifiers and expressions")));
+        let typ = self.try_type()?;
+
+        let values = if self.eat(Token::Assign) {
+            ExprRange::new(self.multi(|this| loop {
+                let expr = this.expression()?;
+                this.data.push_indirect(expr.node);
+                if !this.eat(Token::Comma) {
+                    break Ok(());
+                }
+            })?)
+        } else if let Some(prev) = prev {
+            *prev
+        } else {
+            return Err(self.emit_expected("a constant initializer: `= <expr>`"));
+        };
+
+        if names.length != values.nodes.length {
+            self.emit(
+                Diagnostic::error("the number of identifiers and expressions must match")
+                    .label(
+                        self.get_span(names),
+                        format!("found {} identifiers", names.length),
+                    )
+                    .label(
+                        self.get_span(values),
+                        format!("found {} expressions", values.nodes.length),
+                    ),
+            );
+        } else if let Some(prev) = *prev {
+            if prev.nodes.length != values.nodes.length {
+                self.emit(
+                    Diagnostic::error(
+                        "the number of expressions must match across all constants in the list",
+                    )
+                    .label(
+                        self.get_span(prev),
+                        format!("this has {} expressions", prev.nodes.length),
+                    )
+                    .label(
+                        self.get_span(values),
+                        format!("this has {} expressions", values.nodes.length),
+                    ),
+                );
             }
         }
 
+        *prev = Some(values);
         let span = match typ {
-            Some(typ) => self.emit_join(nodes, typ),
-            None => self.emit_span(nodes),
+            _ if *prev != Some(values) => self.emit_join(names, values),
+            Some(typ) => self.emit_join(names, typ),
+            None => self.emit_span(names),
         };
-        let range = AssignRange::from_full(nodes);
-        *prev = Some(range);
-        return Ok(self.emit_node(Node::ConstDecl(range, typ), span));
+        return Ok(self.emit_node(Node::ConstDecl(names, typ, values), span));
     }
 
     fn var_declaration(&mut self) -> Result<DeclKind> {
@@ -776,58 +780,61 @@ impl<'a> Parser<'a> {
     }
 
     fn var_spec(&mut self) -> Result<NodeId> {
-        let mut typ = None;
-
-        let nodes = self.multi(|this| {
-            let mut name_count = 0;
-            loop {
-                let name = this.identifier()?;
-                let node = this.emit_node(Node::Name(name.text), name.span);
-                this.data.push_indirect(node);
-                name_count += 1;
-
-                if !this.eat(Token::Comma) {
-                    break;
-                }
-            }
-
-            typ = this.try_type()?;
-
-            if typ.is_some() && !this.peek_is(Token::Assign) {
-                // no expression given, so use default initialization
-
-                for _ in 0..name_count {
-                    let span = this.emit_span(typ.unwrap());
-                    let node = this.emit_node(Node::DefaultInit, span);
-                    this.data.push_indirect(node);
-                }
-
-                Ok(())
-            } else {
-                if let Err(error) = this.expect(Token::Assign) {
-                    if typ.is_none() {
-                        this.diagnostics.pop();
-                        return Err(this.emit_expected("a type or `=`"));
-                    } else {
-                        return Err(error);
-                    }
-                }
-
-                for i in 0..name_count {
-                    if i != 0 {
-                        this.expect(Token::Comma)?;
-                    }
-                    let expr = this.expression()?;
-                    this.data.push_indirect(expr.node);
-                }
-
-                Ok(())
+        let names = self.multi(|this| loop {
+            let name = this.identifier()?;
+            let node = this.emit_node(Node::Name(name.text), name.span);
+            this.data.push_indirect(node);
+            if !this.eat(Token::Comma) {
+                break Ok(());
             }
         })?;
 
-        let span = self.emit_span(nodes);
-        let range = AssignRange::from_full(nodes);
-        return Ok(self.emit_node(Node::VarDecl(range, typ), span));
+        let typ = self.try_type()?;
+
+        let values = if typ.is_some() && !self.peek_is(Token::Assign) {
+            // no expression given, so use default initialization
+            None
+        } else {
+            self.expect(Token::Assign).map_err(|error| {
+                if typ.is_none() {
+                    self.diagnostics.pop();
+                    self.emit_expected("a type or `=`");
+                } else {
+                    error
+                }
+            })?;
+
+            let values = self.multi(|this| loop {
+                let expr = this.expression()?;
+                this.data.push_indirect(expr.node);
+                if !this.eat(Token::Comma) {
+                    break Ok(());
+                }
+            })?;
+
+            if names.length != values.length {
+                self.emit(
+                    Diagnostic::error("the number of identifiers and expressions must match")
+                        .label(
+                            self.get_span(names),
+                            format!("found {} identifiers", names.length),
+                        )
+                        .label(
+                            self.get_span(values),
+                            format!("found {} expressions", values.length),
+                        ),
+                );
+            }
+
+            Some(ExprRange::new(values))
+        };
+
+        let span = match (values, typ) {
+            (Some(values), _) => self.emit_join(names, values),
+            (None, Some(typ)) => self.emit_join(names, typ),
+            (None, None) => self.emit_span(names),
+        };
+        return Ok(self.emit_node(Node::VarDecl(names, typ, values), span));
     }
 
     fn func_declaration(&mut self) -> Result<DeclKind> {
@@ -1155,7 +1162,7 @@ impl<'a> Parser<'a> {
         for ident in idents {
             let end_span = tag.map(|tag| tag.node).unwrap_or(typ.node);
             let span = self.emit_join(ident, end_span);
-            let field = self.emit_node(Node::Field(ident.text, typ, None), span);
+            let field = self.emit_node(Node::Field(ident, typ, None), span);
             self.data.push_indirect(field);
         }
 
@@ -1187,13 +1194,6 @@ impl<'a> Parser<'a> {
             let name = self.identifier()?;
             let signature = self.signature(None)?;
 
-            let Some(name_text) = name.text else {
-                return Err(self.emit(
-                    Diagnostic::error("interface method names may not be blank")
-                        .label(self.get_span(name.span), "may not be blank"),
-                ));
-            };
-
             let range = match () {
                 _ if signature.outputs != 0 => signature.outputs().range(self),
                 _ if signature.inputs != 0 => signature.inputs().range(self),
@@ -1201,7 +1201,7 @@ impl<'a> Parser<'a> {
             };
             let span = self.emit_join(name, range);
 
-            Ok(self.emit_node(Node::MethodElement(name_text, signature), span))
+            Ok(self.emit_node(Node::MethodElement(name, signature), span))
         } else {
             // a type name
             Ok(self.named_type()?.node)
@@ -1331,44 +1331,62 @@ impl<'a> Parser<'a> {
     fn try_simple_statement(&mut self) -> Result<Option<StmtId>> {
         let Some(first) = self.try_expression()? else { return Ok(None) };
 
-        let binding_base = self.data.node.indirect_stack.len();
+        let mut names = None;
 
         if self.peek_is(Token::Comma) {
-            self.data.push_indirect(first.node);
-            while self.eat(Token::Comma) {
-                let binding = self.expression()?;
-                self.data.push_indirect(binding.node);
-            }
+            names = Some(self.multi(|this| {
+                this.data.push_indirect(first.node);
+                while this.eat(Token::Comma) {
+                    let binding = this.expression()?;
+                    this.data.push_indirect(binding.node);
+                }
+                Ok(())
+            })?);
         }
 
-        let mut binding_count = self.data.node.indirect_stack.len() - binding_base;
-
         let is_definition = self.eat(Token::Define);
-        let is_assignment = self.eat(Token::Assign);
+        if is_definition || self.eat(Token::Assign) {
+            let names = match names {
+                Some(names) => names,
+                None => self.multi(|this| {
+                    this.data.push_indirect(first.node);
+                    Ok(())
+                })?,
+            };
 
-        if is_definition || is_assignment {
-            if binding_count == 0 {
-                self.data.push_indirect(first.node);
-                binding_count += 1;
+            let values = ExprRange::new(self.multi(|this| loop {
+                let expr = this.expression()?;
+                this.data.push_indirect(expr.node);
+                if !this.eat(Token::Comma) {
+                    break Ok(());
+                }
+            })?);
+
+            if names.length != values.nodes.length {
+                self.emit(
+                    Diagnostic::error("the number of identifiers and expressions must match")
+                        .label(
+                            self.get_span(names),
+                            format!("found {} identifiers", names.length),
+                        )
+                        .label(
+                            self.get_span(values),
+                            format!("found {} expressions", values.nodes.length),
+                        ),
+                );
             }
 
-            self.push_expression_list(binding_count)?;
-
-            let full_range = self.data.pop_indirect(binding_base);
-            let range = AssignRange::from_full(full_range);
             let kind = if is_definition {
-                Node::VarDecl(range, None)
+                Node::VarDecl(names, None, Some(values))
             } else {
-                Node::Assign(range)
+                Node::Assign(names, values)
             };
-            let span = self.emit_span(full_range);
+            let span = self.emit_join(names, values);
             return Ok(Some(self.emit_stmt(kind, span)));
         }
 
-        self.data.node.indirect_stack.truncate(binding_base);
-
         // we found an expression list, but no `=` or `:=`
-        if binding_count != 0 {
+        if names.is_some() {
             return Err(self.emit_unexpected_token());
         }
 
@@ -1436,18 +1454,6 @@ impl<'a> Parser<'a> {
         ]);
 
         self.lookup(&ASSIGNMENTS).map(|(op, _)| op)
-    }
-
-    fn push_expression_list(&mut self, count: usize) -> Result<()> {
-        for i in 0..count {
-            if i != 0 {
-                self.expect(Token::Comma)?;
-            }
-
-            let expr = self.expression()?;
-            self.data.push_indirect(expr.node);
-        }
-        Ok(())
     }
 
     fn expression(&mut self) -> Result<ExprId> {
@@ -1657,13 +1663,11 @@ impl<'a> Parser<'a> {
 
             if end.is_some() && self.eat(Token::Colon) {
                 // `arr[ start? : end : cap ]`
+                let end = end.unwrap();
                 let cap = self.expression()?;
                 let bracket = self.expect(Token::RBracket)?;
-                self.data.push_indirect(end.unwrap().node);
-                self.data.push_indirect(cap.node);
-                let end_cap = self.data.pop_indirect_tuple();
                 let span = self.emit_join(base, bracket);
-                return Ok(self.emit_expr(Node::SliceCapacity(base, start, end_cap), span));
+                return Ok(self.emit_expr(Node::SliceCapacity(base, start, end, cap), span));
             }
 
             // `arr[ start? : end? ]`

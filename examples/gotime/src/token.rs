@@ -724,6 +724,10 @@ impl TokenSet {
             Some((self.bits & (mask - 1)).count_ones() as usize)
         }
     }
+
+    pub fn contains(&self, token: Token) -> bool {
+        (self.bits & Self::mask(token)) != 0
+    }
 }
 
 #[cfg(test)]

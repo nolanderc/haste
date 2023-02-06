@@ -23,6 +23,7 @@ pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Resul
         tokens: &tokens,
         source,
         current_token: 0,
+        expression_depth: 0,
         expected: TokenSet::default(),
         diagnostics: Vec::new(),
         data: Data::default(),
@@ -54,6 +55,17 @@ struct Parser<'a> {
 
     /// Set of tokens expected at the current position.
     expected: TokenSet,
+
+    /// Keeps track of the level of expression nesting in order to avoid ambiguous syntax.
+    ///
+    /// Every time we enter a nested expression this is incremented, and every time it is exited we
+    /// decrement it.
+    ///
+    /// Initially this is set to `0`. But if we encounter an expression that is followed by a block
+    /// (such as the `condition` in `if condition {}`) we set this to `-1`. If we encounter a
+    /// composite literal (eg. `Point{...}`) when this value is `-1`, the block is instead treated
+    /// as the block of the `if`-statement.
+    expression_depth: i32,
 
     /// Temporary working data for reducing allocation pressure.
     ///
@@ -169,6 +181,10 @@ impl Data {
             start: NonMaxU32::new(start as u32).unwrap(),
         }
     }
+
+    fn node(&self, node: NodeId) -> Node {
+        self.node.kinds[node.index() - self.base.nodes]
+    }
 }
 
 trait Spanned {
@@ -231,6 +247,27 @@ type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
 
 impl<'a> Parser<'a> {
+    /// Determines if the current expression is followed by a block.
+    ///
+    /// This is used to resolve ambiguities when parsing composite literals: `if Point{} {}` could
+    /// either be seen as `if (Point{}) {}` or `(if Point{}) {}`. But we always want the latter (to
+    /// allow syntax such as `if is_condition_true {}`. We could arguably use the whitespace
+    /// between the type and composite literal to disamgibuate these cases (eg. `Point {}` would
+    /// become illegal syntax, but `Point{}` is allowed).
+    ///
+    /// However, the Go reference compiler instead uses a variable to keep track of the depth of
+    /// the current expression. The depth is set to `-1` when we parse the condition of an `if`
+    /// statement, and then incremented when we enter a nested expression (such as a function
+    /// call), and decremented when it is exited. Then, we only parse composite literals `Point{}`
+    /// if the nesting depth is non-negative.
+    fn expects_block(&self) -> bool {
+        self.expression_depth < 0
+    }
+
+    fn prev_token(&self) -> Option<Token> {
+        Some(self.tokens.get(self.current_token.checked_sub(1)?)?.token())
+    }
+
     fn advance(&mut self) {
         self.current_token += 1;
         self.expected.clear();
@@ -426,8 +463,8 @@ impl<'a> Parser<'a> {
         self.data.span_ranges[self.data.base.spans.offset(id)]
     }
 
-    fn get_span(&self, id: SpanId) -> Span {
-        Span::new(self.path, self.span_range(id))
+    fn get_span(&self, spanned: impl Spanned) -> Span {
+        Span::new(self.path, spanned.range(self))
     }
 
     fn node_span_id(&self, id: NodeId) -> SpanId {
@@ -622,7 +659,7 @@ impl<'a> Parser<'a> {
                 Ok(())
             })?;
             self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Types(specs))
+            Ok(DeclKind::TypeList(specs))
         } else {
             let spec = self.type_spec()?;
             self.expect(Token::SemiColon)?;
@@ -658,7 +695,7 @@ impl<'a> Parser<'a> {
                 Ok(())
             })?;
             self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Consts(specs))
+            Ok(DeclKind::ConstList(specs))
         } else {
             let spec = self.const_spec(&mut None)?;
             self.expect(Token::SemiColon)?;
@@ -730,7 +767,7 @@ impl<'a> Parser<'a> {
                 Ok(())
             })?;
             self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Vars(specs))
+            Ok(DeclKind::VarList(specs))
         } else {
             let spec = self.var_spec()?;
             self.expect(Token::SemiColon)?;
@@ -985,7 +1022,7 @@ impl<'a> Parser<'a> {
     }
 
     fn try_type(&mut self) -> Result<Option<TypeId>> {
-        static BRANCHES: LookupTable<ParseFn<TypeId>, 9> = LookupTable::new([
+        static BRANCHES: LookupTable<ParseFn<TypeId>, 10> = LookupTable::new([
             (Token::Identifier, |this| this.named_type()),
             (Token::Interface, |this| this.interface_type()),
             (Token::Struct, |this| this.struct_type()),
@@ -993,6 +1030,12 @@ impl<'a> Parser<'a> {
             (Token::Map, |this| this.map_type()),
             (Token::Chan, |this| this.chan_type()),
             (Token::LThinArrow, |this| this.chan_type()),
+            (Token::Func, |this| {
+                let func_token = this.expect(Token::Func)?;
+                let signature = this.signature(None)?;
+                let span = this.emit_span(func_token);
+                Ok(this.emit_type(Node::FunctionType(signature), span))
+            }),
             (Token::Times, |this| {
                 let token = this.expect(Token::Times)?;
                 let inner = this.typ()?;
@@ -1166,27 +1209,70 @@ impl<'a> Parser<'a> {
     }
 
     fn named_type(&mut self) -> Result<TypeId> {
-        let name = self.identifier()?;
+        let ident = self.identifier()?;
+        let name = self.emit_node(Node::Name(ident.text), ident.span);
+
         if self.eat(Token::Dot) {
-            let package = self.emit_node(Node::Name(name.text), name.span);
+            let package = name;
             let member = self.identifier()?;
-            let span = self.emit_join(name, member);
+            let span = self.emit_join(package, member);
             Ok(self.emit_type(Node::Selector(package, member), span))
         } else {
-            Ok(self.emit_type(Node::Name(name.text), name.span))
+            Ok(TypeId::new(name))
+        }
+    }
+
+    fn statement(&mut self) -> Result<StmtId> {
+        match self.try_statement()? {
+            Some(stmt) => Ok(stmt),
+            None => Err(self.emit_expected("a statement")),
         }
     }
 
     fn try_statement(&mut self) -> Result<Option<StmtId>> {
-        if self.peek_is(Token::LCurly) {
-            return Ok(Some(self.block()?));
-        }
+        static STATEMENTS: LookupTable<ParseFn<StmtId>, 5> = LookupTable::new([
+            (Token::LCurly, |this| this.block()),
+            (Token::Return, |this| this.return_statement()),
+            (Token::Type, |this| match this.type_declaration()? {
+                DeclKind::Type(node) => Ok(StmtId::new(node)),
+                DeclKind::TypeList(nodes) => {
+                    let span = this.emit_span(nodes);
+                    let node = this.emit_node(Node::TypeList(nodes), span);
+                    Ok(StmtId::new(node))
+                }
+                _ => unreachable!(),
+            }),
+            (Token::Var, |this| match this.var_declaration()? {
+                DeclKind::Var(node) => Ok(StmtId::new(node)),
+                DeclKind::VarList(nodes) => {
+                    let span = this.emit_span(nodes);
+                    let node = this.emit_node(Node::VarList(nodes), span);
+                    Ok(StmtId::new(node))
+                }
+                _ => unreachable!(),
+            }),
+            (Token::Const, |this| match this.const_declaration()? {
+                DeclKind::Const(node) => Ok(StmtId::new(node)),
+                DeclKind::ConstList(nodes) => {
+                    let span = this.emit_span(nodes);
+                    let node = this.emit_node(Node::ConstList(nodes), span);
+                    Ok(StmtId::new(node))
+                }
+                _ => unreachable!(),
+            }),
+        ]);
 
-        if self.peek_is(Token::Return) {
-            return Ok(Some(self.return_statement()?));
+        if let Some(stmt) = self.try_branch(&STATEMENTS)? {
+            return Ok(Some(stmt));
+        } else if self.peek_is(Token::Identifier) && self.peek2_is(Token::Colon) {
+            let label = self.identifier()?;
+            self.eat(Token::Colon);
+            let inner = self.statement()?;
+            let span = self.emit_join(label, inner);
+            Ok(Some(self.emit_stmt(Node::Label(label, inner), span)))
+        } else {
+            self.try_simple_statement()
         }
-
-        self.try_simple_statement()
     }
 
     fn block(&mut self) -> Result<StmtId> {
@@ -1273,7 +1359,7 @@ impl<'a> Parser<'a> {
             let kind = if is_definition {
                 Node::VarDecl(range, None)
             } else {
-                Node::Assignment(range)
+                Node::Assign(range)
             };
             let span = self.emit_span(full_range);
             return Ok(Some(self.emit_stmt(kind, span)));
@@ -1305,7 +1391,51 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.emit_stmt(Node::Send(expr, message), span)));
         }
 
+        if let Some(op) = self.peek_assignment_operator() {
+            self.advance();
+            let value = self.expression()?;
+            let span = self.emit_join(expr, value);
+            return Ok(Some(self.emit_stmt(Node::AssignOp(expr, op, value), span)));
+        }
+
+        if !self.is_valid_statement_expr(expr) {
+            self.emit(
+                Diagnostic::error(
+                    "only function/method calls and receive operations are allowed in statement position",
+                )
+                .label(
+                    self.get_span(expr),
+                    "invalid expression in statement position",
+                ),
+            )
+        }
+
         Ok(Some(StmtId { node: expr.node }))
+    }
+
+    fn is_valid_statement_expr(&self, expr: ExprId) -> bool {
+        match self.data.node(expr.node) {
+            Node::Call { .. } | Node::Unary(UnaryOperator::Recv, _) => true,
+            _ => false,
+        }
+    }
+
+    fn peek_assignment_operator(&mut self) -> Option<BinaryOperator> {
+        static ASSIGNMENTS: LookupTable<BinaryOperator, 11> = LookupTable::new([
+            (Token::PlusAssign, BinaryOperator::Add),
+            (Token::MinusAssign, BinaryOperator::Sub),
+            (Token::TimesAssign, BinaryOperator::Mul),
+            (Token::DivAssign, BinaryOperator::Div),
+            (Token::RemAssign, BinaryOperator::Rem),
+            (Token::AndAssign, BinaryOperator::BitAnd),
+            (Token::OrAssign, BinaryOperator::BitOr),
+            (Token::XorAssign, BinaryOperator::BitXor),
+            (Token::ShlAssign, BinaryOperator::ShiftLeft),
+            (Token::ShrAssign, BinaryOperator::ShiftRight),
+            (Token::NandAssign, BinaryOperator::BitNand),
+        ]);
+
+        self.lookup(&ASSIGNMENTS).map(|(op, _)| op)
     }
 
     fn push_expression_list(&mut self, count: usize) -> Result<()> {
@@ -1327,10 +1457,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn with_expr_depth<T>(&mut self, f: impl FnOnce(&mut Parser) -> T) -> T {
+        self.expression_depth += 1;
+        let output = f(self);
+        self.expression_depth -= 1;
+        output
+    }
+
     fn try_expression(&mut self) -> Result<Option<ExprId>> {
-        let Some(lhs) = self.try_unary_expr()? else { return Ok(None) };
-        let expr = self.binary_expr(lhs, 0)?;
-        Ok(Some(expr))
+        self.with_expr_depth(|this| {
+            let Some(lhs) = this.try_unary_expr()? else { return Ok(None) };
+            let expr = this.binary_expr(lhs, 0)?;
+            Ok(Some(expr))
+        })
     }
 
     fn binary_expr(&mut self, mut lhs: ExprId, min_precedence: u8) -> Result<ExprId> {
@@ -1455,7 +1594,55 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            if self.peek_is(Token::LCurly) && !self.expects_block() {
+                // we don't allow parenthized types
+                if self.prev_token() != Some(Token::RParens) {
+                    base = self.composite_init(TypeId::new(base.node))?;
+                    continue;
+                }
+            }
+
             return Ok(Some(base));
+        }
+    }
+
+    fn composite_init(&mut self, base: TypeId) -> Result<ExprId> {
+        let (elements, range) = self.composite_literal()?;
+        let span = self.emit_join(base, range);
+        Ok(self.emit_expr(Node::Composite(base, elements), span))
+    }
+
+    fn composite_literal(&mut self) -> Result<(NodeRange, FileRange)> {
+        let start = self.expect(Token::LCurly)?;
+        let elements = self.multi(|this| {
+            while !this.peek_is(Token::RCurly) {
+                let key = this.composite_element()?;
+                if this.eat(Token::Colon) {
+                    let value = this.composite_element()?;
+                    let span = this.emit_join(key, value);
+                    let pair = this.emit_node(Node::CompositeKey(key, value), span);
+                    this.data.push_indirect(pair);
+                } else {
+                    this.data.push_indirect(key.node);
+                }
+            }
+            Ok(())
+        })?;
+        let end = self.expect(Token::RCurly)?;
+
+        Ok((elements, self.join(start, end)))
+    }
+
+    /// In addition to accepting arbitrary expressions, it allows composite literals without
+    /// specifying the type (eg. instead of `Point{1,2}` we can write `{1,2}`). Only allowed nested
+    /// instide another composite literal.
+    fn composite_element(&mut self) -> Result<ExprId> {
+        if self.peek_is(Token::RCurly) {
+            let (elements, range) = self.composite_literal()?;
+            let span = self.emit_span(range);
+            return Ok(self.emit_expr(Node::CompositeLiteral(elements), span));
+        } else {
+            self.expression()
         }
     }
 
@@ -1561,13 +1748,26 @@ impl<'a> Parser<'a> {
             }),
             (Token::Func, |this, func_token| {
                 let signature = this.signature(None)?;
-                let body = this.block()?;
-                let span = this.emit_join(func_token, body);
-                return Ok(this.emit_expr(Node::Function(signature, body), span));
+                if this.peek_is(Token::LCurly) {
+                    let body = this.block()?;
+                    let span = this.emit_join(func_token, body);
+                    Ok(this.emit_expr(Node::Function(signature, body), span))
+                } else {
+                    let span = this.emit_span(func_token);
+                    Ok(this.emit_expr(Node::FunctionType(signature), span))
+                }
             }),
         ]);
 
-        self.try_branch_token(&OPERANDS)
+        if let Some(expr) = self.try_branch_token(&OPERANDS)? {
+            return Ok(Some(expr));
+        }
+
+        if let Some(typ) = self.try_type()? {
+            return Ok(Some(ExprId::new(typ.node)));
+        }
+
+        Ok(None)
     }
 
     fn parse_integer_expr<const BASE: u32>(&mut self, token: SpannedToken) -> Result<ExprId> {
@@ -1849,7 +2049,13 @@ fn decode_escape_sequence(
 }
 
 struct LookupTable<T, const N: usize> {
+    /// The tokens that are accepted by this lookup-table
     tokens: TokenSet,
+
+    /// For each token in the set, the corresponding value.
+    ///
+    /// The values are sorted such that the `n`th token in the set (as ordered by `u8` their
+    /// representation) has its value in `values[n]`.
     values: [T; N],
 }
 
@@ -1871,6 +2077,7 @@ impl<T: Copy, const N: usize> LookupTable<T, N> {
             i += 1;
         }
 
+        // populate the token set and values
         let mut tokens = TokenSet::new();
         let mut values = [branches[0].1; N];
 

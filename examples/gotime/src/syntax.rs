@@ -77,17 +77,17 @@ pub enum DeclKind {
     /// Points to either `TypeDef` or `TypeAlias`
     Type(NodeId),
     /// Indirectly points to a sequence of `TypeDef` or `TypeAlias`
-    Types(NodeRange),
+    TypeList(NodeRange),
 
     /// Points to a `ConstDecl`
     Const(NodeId),
     /// Indirectly points to a sequence of `ConstDecl`
-    Consts(NodeRange),
+    ConstList(NodeRange),
 
     /// Points to a `VarDecl`
     Var(NodeId),
     /// Indirectly points to a sequence of `VarDecl`
-    Vars(NodeRange),
+    VarList(NodeRange),
 
     /// A function
     Function(FuncDecl),
@@ -255,6 +255,13 @@ macro_rules! node_id_wrapper {
             }
         }
 
+        #[allow(unused)]
+        impl $id {
+            fn new(node: NodeId) -> Self {
+                Self { node }
+            }
+        }
+
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $range {
             pub nodes: NodeRange,
@@ -292,11 +299,6 @@ pub enum Node {
     /// References an item within the inner node (could be a field, method or package member)
     Selector(NodeId, Identifier),
 
-    /// Defines a new type (eg. `type Foo struct { ... }`)
-    TypeDef(TypeSpec),
-    /// An alias for a type (eg. `type Foo = Bar`)
-    TypeAlias(TypeSpec),
-
     /// A function/method parameter.
     Parameter(Parameter),
 
@@ -312,6 +314,9 @@ pub enum Node {
 
     /// A channel through which values can be sent and received
     Channel(ChannelKind, TypeId),
+
+    /// A function type
+    FunctionType(Signature),
 
     /// A list of fields
     Struct(NodeRange),
@@ -347,6 +352,14 @@ pub enum Node {
     /// A call to a method/function. Optionally uses the last argument as the variadic arguments.
     Call(ExprId, ExprRange, Option<ArgumentSpread>),
 
+    /// Initializes a composite type (eg. array, struct, map) using the given values.
+    /// The values may either be expressions, `CompositeLiteral` or `CompositeKey`.
+    Composite(TypeId, NodeRange),
+    /// A sequence of expressions or `CompositeKey`. Only allowed within a `Composite`.
+    CompositeLiteral(NodeRange),
+    /// A key-value pair in a composite initializer. Only allowed within a `Composite`.
+    CompositeKey(ExprId, ExprId),
+
     /// Asserts that the expression is of the given type.
     TypeAssertion(ExprId, TypeId),
 
@@ -371,21 +384,106 @@ pub enum Node {
     SliceCapacity(ExprId, Option<ExprId>, NodeTuple<2>),
 
     // === Statements === //
-    VarDecl(AssignRange, Option<TypeId>),
+    /// Defines a new type (eg. `type Foo struct { ... }`)
+    TypeDef(TypeSpec),
+    /// An alias for a type (eg. `type Foo = Bar`)
+    TypeAlias(TypeSpec),
+    /// A list of `TypeDef`s and `TypeAlias`es
+    TypeList(NodeRange),
+
+    /// A single const-declaration
     ConstDecl(AssignRange, Option<TypeId>),
+    /// A sequence of `ConstDecl`s
+    ConstList(NodeRange),
+
+    /// A single var-declaration
+    VarDecl(AssignRange, Option<TypeId>),
+    /// A sequence of `VarDecl`s
+    VarList(NodeRange),
+
+    /// Execute a sequence of statements
     Block(StmtRange),
+
+    /// Return a single value
     Return(Option<ExprId>),
+    /// Return multiple values
     ReturnMulti(ExprRange),
-    Assignment(AssignRange),
+
+    /// Assign a value to an expression.
+    Assign(AssignRange),
+
+    /// Apply a binary operator and store the result in the lhs: `lhs += rhs`
+    AssignOp(ExprId, BinaryOperator, ExprId),
+
+    /// Increment the value `i++`
     Increment(ExprId),
+    /// Decrement the value `i--`
     Decrement(ExprId),
+
+    /// Send a value on a channel: `channel <- value`
     Send(ExprId, ExprId),
+
+    /// A labeled statement: `loop: for condition { ... }`
+    Label(Identifier, StmtId),
+
+    /// Execute an function/method call on a new thread
+    Go(ExprId),
+
+    /// Defer the execution of the expression until the end of the function
+    Defer(ExprId),
+
+    /// Stop iteration of the given loop
+    Break(Option<Identifier>),
+    /// Continue with the next iteration of the given loop
+    Continue(Option<Identifier>),
+    /// Transfer control flow to the given label
+    Goto(Identifier),
+    /// Continue on the next branch on the switch statement
+    Fallthrough,
+
+    /// `if <expr> { ... }` with an optional `init`-statement (which is the first in the range).
+    If(HasInitStmt, ExprId, StmtRange),
+    /// `if <expr> { ... } else ...` where the `else` statement is the last in the range (either a
+    /// block or another if-statement)
+    IfElse(HasInitStmt, ExprId, StmtRange),
+
+    /// Wait until one of the given branches succeeds.
+    Select(NodeRange),
+    /// Select the first send/recv statement that succeeds
+    SelectCase(StmtId, StmtRange),
+    /// Binds the values on the left to the result of waiting on the channel
+    SelectRecv(Option<ExprRange>, ExprId),
+    /// Binds the names on the left to the result of waiting on the channel
+    SelectRecvDef(NodeRange, ExprId),
+
+    /// An empty statement
+    Empty,
+
+    /// `for <init?> ; <condition?> ; <post?> {...}`
+    For(NodeTuple<3>, StmtRange),
+    /// `for <condition?> {...}`
+    ForWhile(Option<ExprId>, StmtRange),
+    /// `for range <expr> {...} `
+    ForRange(ExprId, StmtRange),
+    /// `for <expr> = range <expr> {...} `
+    ForRange1(NodeTuple<2>, AssignOrDefine, StmtRange),
+    /// `for <expr>, <expr> = range <expr> {...} `
+    ForRange2(NodeTuple<3>, AssignOrDefine, StmtRange),
 }
 
 const _: () = assert!(
     std::mem::size_of::<Node>() <= 16,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
+
+pub type HasInitStmt = bool;
+
+/// Certain syntax forms accepts both `:=` and `=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignOrDefine {
+    Assign,
+    Define,
+}
 
 /// A channel may be send-only, receive-only or bidirectional
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

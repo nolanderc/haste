@@ -51,7 +51,7 @@ impl FileRange {
 
     pub fn join(self, other: Self) -> Self {
         Self {
-            start: self.start.max(other.start),
+            start: self.start.min(other.start),
             end: self.end.max(other.end),
         }
     }

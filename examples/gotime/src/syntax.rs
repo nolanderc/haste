@@ -19,6 +19,9 @@ pub struct File {
     /// The path to the source file this represents
     pub path: SourcePath,
 
+    /// List of all spans that occur in the source file
+    pub span_ranges: KeyList<Key<Span>, FileRange>,
+
     /// The name of the package this file is part of
     pub package: Identifier,
 
@@ -27,9 +30,6 @@ pub struct File {
 
     /// List of all declarations in the file.
     pub declarations: KeyList<Key<Decl>, Decl>,
-
-    /// List of all spans that occur in the source file
-    pub span_ranges: KeyList<Key<Span>, FileRange>,
 }
 
 /// References a span relative to the `Base<Key<Span>>` in the closest declaration. If outside a
@@ -65,9 +65,6 @@ pub struct Decl {
     /// All `SpanId`s are relative to this offset in the parent file
     pub base_span: Base<Key<Span>>,
 
-    /// Name of the declaration (or `_`).
-    pub ident: Identifier,
-
     /// The type of declaration.
     pub kind: DeclKind,
 
@@ -77,55 +74,49 @@ pub struct Decl {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeclKind {
-    Type(TypeDecl),
-    Constant(ConstDecl),
-    Variable(VarDecl),
+    /// Points to either `TypeDef` or `TypeAlias`
+    Type(NodeId),
+    /// Indirectly points to a sequence of `TypeDef` or `TypeAlias`
+    Types(NodeRange),
+
+    /// Points to a `ConstDecl`
+    Const(NodeId),
+    /// Indirectly points to a sequence of `ConstDecl`
+    Consts(NodeRange),
+
+    /// Points to a `VarDecl`
+    Var(NodeId),
+    /// Indirectly points to a sequence of `VarDecl`
+    Vars(NodeRange),
+
+    /// A function
     Function(FuncDecl),
-    Method(MethodDecl),
+    /// A function, but its first parameter is the receiver
+    Method(FuncDecl),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TypeDecl {
-    pub kind: TypeDeclKind,
-    pub typ: TypeId,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct TypeSpec {
+    pub name: Identifier,
+    pub inner: TypeId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TypeDeclKind {
-    /// A structural alias to another type
-    Alias,
-    /// Defines a new nominal type
-    Definition,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConstDecl {
-    /// The value of `iota` for this declaration
-    pub iota: u32,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct ConstSpec {
+    /// A sequence of names followed by a sequnece of expressions.
+    /// The expressions may be shared with other constants.
+    ///
+    /// The value of `iota` in these expressions can be inferred from its index in the declaration.
+    pub name_values: AssignRange,
     /// The type of the declaration (or inferred from the value)
     pub typ: Option<TypeId>,
-    /// The value of the declaration
-    pub value: ExprId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VarDecl {
-    /// The type of the declaration (or inferred from the value)
-    pub typ: Option<TypeId>,
-    /// The value of the declaration (or zero-initialized)
-    pub value: Option<ExprId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncDecl {
+    pub name: Identifier,
     pub signature: Signature,
     pub body: Option<StmtId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MethodDecl {
-    /// A function, but its first parameter is the receiver.
-    pub func: FuncDecl,
 }
 
 /// Points to a sequence of nodes representing the parameters of a function.
@@ -301,14 +292,40 @@ pub enum Node {
     /// References an item within the inner node (could be a field, method or package member)
     Selector(NodeId, Identifier),
 
+    /// Defines a new type (eg. `type Foo struct { ... }`)
+    TypeDef(TypeSpec),
+    /// An alias for a type (eg. `type Foo = Bar`)
+    TypeAlias(TypeSpec),
+
     /// A function/method parameter.
     Parameter(Parameter),
 
     // === Types === //
-    /// An array/slice of the given type, possibly with a fixed size
+    /// Pointer to some type.
     Pointer(TypeId),
 
+    /// An array/slice of the given type, possibly with a fixed size
+    Array(Option<ExprId>, TypeId),
+
+    /// An map from the key type to the element type
+    Map(TypeId, TypeId),
+
+    /// A channel through which values can be sent and received
+    Channel(ChannelKind, TypeId),
+
+    /// A list of fields
+    Struct(NodeRange),
+    /// `<name> <type> <tag?>`
+    Field(Option<Text>, TypeId, Option<ExprId>),
+
+    /// A list of methods and types
+    Interface(NodeRange),
+    MethodElement(Text, Signature),
+
     // === Expressions === //
+    /// The default value for whatever type in initializes.
+    DefaultInit,
+
     /// An integer literal.
     IntegerSmall(u64),
     IntegerArbitrary(()),
@@ -340,22 +357,25 @@ pub enum Node {
     Binary(ExprId, BinaryOperator, ExprId),
 
     /// A function literal with a body
-    FuncDecl(Signature, StmtId),
+    Function(Signature, StmtId),
 
     /// Index into a container
     Index(ExprId, ExprId),
 
-    /// Slice start and end.
+    /// Slice start and end: `arr[ <start?> : <end?> ]`
     Slice(ExprId, Option<ExprId>, Option<ExprId>),
 
-    /// Slice start, end and capacity. The start index is optional and implicitly `0`.
+    /// Slice start, end and capacity: `arr[ <start?> : <end> : <cap> ]`
+    ///
+    /// The start index is optional and implicitly `0`.
     SliceCapacity(ExprId, Option<ExprId>, NodeTuple<2>),
 
     // === Statements === //
+    VarDecl(AssignRange, Option<TypeId>),
+    ConstDecl(AssignRange, Option<TypeId>),
     Block(StmtRange),
     Return(Option<ExprId>),
     ReturnMulti(ExprRange),
-    VarDecl(AssignRange, Option<TypeId>),
     Assignment(AssignRange),
     Increment(ExprId),
     Decrement(ExprId),
@@ -366,6 +386,14 @@ const _: () = assert!(
     std::mem::size_of::<Node>() <= 16,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
+
+/// A channel may be send-only, receive-only or bidirectional
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelKind {
+    SendRecv,
+    Send,
+    Recv,
+}
 
 /// Marks that the last call argument should be used as the variadic arguments
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

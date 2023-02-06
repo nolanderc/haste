@@ -136,6 +136,13 @@ impl Data {
         self.node.indirect_stack.push(node);
     }
 
+    fn duplicate_indirect(&mut self, values: NodeRange) {
+        let start = self.base.node_indirect + values.start.get() as usize;
+        let end = start + values.length.get() as usize;
+        let nodes = &self.node.indirect[start..end];
+        self.node.indirect_stack.extend_from_slice(nodes);
+    }
+
     fn pop_indirect(&mut self, base: usize) -> NodeRange {
         let nodes = &self.node.indirect_stack[base..];
 
@@ -278,16 +285,40 @@ impl<'a> Parser<'a> {
         self.try_expect(token).is_some()
     }
 
+    fn lookup<T: Copy, const N: usize>(
+        &mut self,
+        table: &LookupTable<T, N>,
+    ) -> Option<(T, SpannedToken)> {
+        let next = self.peek()?;
+        let value = table.lookup(next.token())?;
+        Some((value, next))
+    }
+
+    fn try_branch<T, const N: usize>(
+        &mut self,
+        table: &LookupTable<ParseFn<T>, N>,
+    ) -> Result<Option<T>> {
+        if let Some((parser, _)) = self.lookup(table) {
+            let output = parser(self)?;
+            Ok(Some(output))
+        } else {
+            self.expected.merge(table.tokens);
+            Ok(None)
+        }
+    }
+
     fn try_branch_token<T, const N: usize>(
         &mut self,
         table: &LookupTable<ParseTokenFn<T>, N>,
     ) -> Result<Option<T>> {
-        self.expected.merge(table.tokens);
-        let Some(next) = self.peek() else { return Ok(None) };
-        let Some(parser) = table.lookup(next.token()) else { return Ok(None) };
-        self.advance();
-        let output = parser(self, next)?;
-        Ok(Some(output))
+        if let Some((parser, token)) = self.lookup(table) {
+            self.advance();
+            let output = parser(self, token)?;
+            Ok(Some(output))
+        } else {
+            self.expected.merge(table.tokens);
+            Ok(None)
+        }
     }
 
     fn unexpected_range(&self) -> FileRange {
@@ -536,15 +567,18 @@ impl<'a> Parser<'a> {
     fn declarations(&mut self) -> Result<Vec<Decl>> {
         let mut declarations = Vec::new();
         while self.peek().is_some() {
-            declarations.push(self.declaration()?);
+            declarations.push(self.top_level_declaration()?);
         }
         Ok(declarations)
     }
 
-    fn declaration(&mut self) -> Result<Decl> {
+    fn wrap_decl(
+        &mut self,
+        parse_parts: impl FnOnce(&mut Parser) -> Result<DeclKind>,
+    ) -> Result<Decl> {
         let base = self.data.snapshot();
         let old_base = std::mem::replace(&mut self.data.base, base);
-        let result = self.declaration_raw();
+        let result = parse_parts(self);
         self.data.base = old_base;
 
         let base_span = base.spans;
@@ -558,43 +592,211 @@ impl<'a> Parser<'a> {
             },
         };
 
-        let (ident, kind) = result?;
+        let kind = result?;
         Ok(Decl {
-            ident,
             kind,
             nodes,
             base_span,
         })
     }
 
-    fn declaration_raw(&mut self) -> Result<(Identifier, DeclKind)> {
-        if self.peek_is(Token::Func) {
-            self.func_declaration()
-        } else if self.peek_is(Token::Type) {
-            self.type_declaration()
-        } else if self.peek_is(Token::Const) {
-            self.const_declaration()
-        } else if self.peek_is(Token::Var) {
-            self.var_declaration()
+    fn top_level_declaration(&mut self) -> Result<Decl> {
+        self.wrap_decl(|this| match () {
+            _ if this.peek_is(Token::Func) => this.func_declaration(),
+            _ if this.peek_is(Token::Type) => this.type_declaration(),
+            _ if this.peek_is(Token::Const) => this.const_declaration(),
+            _ if this.peek_is(Token::Var) => this.var_declaration(),
+            _ => Err(this.emit_unexpected_token()),
+        })
+    }
+
+    fn type_declaration(&mut self) -> Result<DeclKind> {
+        self.expect(Token::Type)?;
+        if self.eat(Token::LParens) {
+            let specs = self.multi(|this| {
+                while !this.eat(Token::RParens) {
+                    let spec = this.type_spec()?;
+                    this.data.push_indirect(spec);
+                    this.expect(Token::SemiColon)?;
+                }
+                Ok(())
+            })?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Types(specs))
         } else {
-            Err(self.emit_unexpected_token())
+            let spec = self.type_spec()?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Type(spec))
         }
     }
 
-    fn type_declaration(&mut self) -> Result<(Identifier, DeclKind)> {
-        todo!("parse type declaration")
-    }
-    fn const_declaration(&mut self) -> Result<(Identifier, DeclKind)> {
-        todo!("parse const declaration")
-    }
-    fn var_declaration(&mut self) -> Result<(Identifier, DeclKind)> {
-        todo!("parse var declaration")
+    fn type_spec(&mut self) -> Result<NodeId> {
+        let name = self.identifier()?;
+        let alias = self.eat(Token::Assign);
+        let inner = self.typ()?;
+
+        let span = self.emit_join(name, inner);
+        let spec = TypeSpec { name, inner };
+        let node = if alias {
+            Node::TypeAlias(spec)
+        } else {
+            Node::TypeDef(spec)
+        };
+        Ok(self.emit_node(node, span))
     }
 
-    fn func_declaration(&mut self) -> Result<(Identifier, DeclKind)> {
+    fn const_declaration(&mut self) -> Result<DeclKind> {
+        self.expect(Token::Const)?;
+        if self.eat(Token::LParens) {
+            let specs = self.multi(|this| {
+                let mut previous = None;
+                while !this.eat(Token::RParens) {
+                    let spec = this.const_spec(&mut previous)?;
+                    this.data.push_indirect(spec);
+                    this.expect(Token::SemiColon)?;
+                }
+                Ok(())
+            })?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Consts(specs))
+        } else {
+            let spec = self.const_spec(&mut None)?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Const(spec))
+        }
+    }
+
+    fn const_spec(&mut self, prev: &mut Option<AssignRange>) -> Result<NodeId> {
+        let mut typ = None;
+
+        let nodes = self.multi(|this| {
+            let mut name_count = 0;
+            loop {
+                let name = this.identifier()?;
+                let node = this.emit_node(Node::Name(name.text), name.span);
+                this.data.push_indirect(node);
+                name_count += 1;
+
+                if !this.eat(Token::Comma) {
+                    break;
+                }
+            }
+
+            typ = this.try_type()?;
+
+            if this.eat(Token::Assign) {
+                for i in 0..name_count {
+                    if i != 0 {
+                        this.expect(Token::Comma)?;
+                    }
+                    let expr = this.expression()?;
+                    this.data.push_indirect(expr.node);
+                }
+            } else if let Some(prev) = prev {
+                this.data.duplicate_indirect(prev.values().nodes);
+            } else {
+                return Err(this.emit_expected("a constant initializer: `= <expr>`"));
+            }
+
+            Ok(())
+        })?;
+
+        if let Some(prev) = prev {
+            if nodes.length.get() != 2 * prev.half_length.get() {
+                let span = Span::new(self.path, nodes.range(self));
+                return Err(self.emit(Diagnostic::error("invalid const declaration")
+                        .label(span, "all declarations in the list must have the same number of identifiers and expressions")));
+            }
+        }
+
+        let span = match typ {
+            Some(typ) => self.emit_join(nodes, typ),
+            None => self.emit_span(nodes),
+        };
+        let range = AssignRange::from_full(nodes);
+        *prev = Some(range);
+        return Ok(self.emit_node(Node::ConstDecl(range, typ), span));
+    }
+
+    fn var_declaration(&mut self) -> Result<DeclKind> {
+        self.expect(Token::Var)?;
+        if self.eat(Token::LParens) {
+            let specs = self.multi(|this| {
+                while !this.eat(Token::RParens) {
+                    let spec = this.var_spec()?;
+                    this.data.push_indirect(spec);
+                    this.expect(Token::SemiColon)?;
+                }
+                Ok(())
+            })?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Vars(specs))
+        } else {
+            let spec = self.var_spec()?;
+            self.expect(Token::SemiColon)?;
+            Ok(DeclKind::Var(spec))
+        }
+    }
+
+    fn var_spec(&mut self) -> Result<NodeId> {
+        let mut typ = None;
+
+        let nodes = self.multi(|this| {
+            let mut name_count = 0;
+            loop {
+                let name = this.identifier()?;
+                let node = this.emit_node(Node::Name(name.text), name.span);
+                this.data.push_indirect(node);
+                name_count += 1;
+
+                if !this.eat(Token::Comma) {
+                    break;
+                }
+            }
+
+            typ = this.try_type()?;
+
+            if typ.is_some() && !this.peek_is(Token::Assign) {
+                // no expression given, so use default initialization
+
+                for _ in 0..name_count {
+                    let span = this.emit_span(typ.unwrap());
+                    let node = this.emit_node(Node::DefaultInit, span);
+                    this.data.push_indirect(node);
+                }
+
+                Ok(())
+            } else {
+                if let Err(error) = this.expect(Token::Assign) {
+                    if typ.is_none() {
+                        this.diagnostics.pop();
+                        return Err(this.emit_expected("a type or `=`"));
+                    } else {
+                        return Err(error);
+                    }
+                }
+
+                for i in 0..name_count {
+                    if i != 0 {
+                        this.expect(Token::Comma)?;
+                    }
+                    let expr = this.expression()?;
+                    this.data.push_indirect(expr.node);
+                }
+
+                Ok(())
+            }
+        })?;
+
+        let span = self.emit_span(nodes);
+        let range = AssignRange::from_full(nodes);
+        return Ok(self.emit_node(Node::VarDecl(range, typ), span));
+    }
+
+    fn func_declaration(&mut self) -> Result<DeclKind> {
         self.expect(Token::Func)?;
         let receiver = self.try_receiver()?;
-        let ident = self.identifier()?;
+        let name = self.identifier()?;
         let signature = self.signature(receiver)?;
         let body = if self.peek_is(Token::LCurly) {
             Some(self.block()?)
@@ -602,7 +804,17 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect(Token::SemiColon)?;
-        Ok((ident, DeclKind::Function(FuncDecl { signature, body })))
+        let decl = FuncDecl {
+            name,
+            signature,
+            body,
+        };
+
+        if receiver.is_some() {
+            Ok(DeclKind::Method(decl))
+        } else {
+            Ok(DeclKind::Function(decl))
+        }
     }
 
     fn try_receiver(&mut self) -> Result<Option<NodeId>> {
@@ -773,23 +985,184 @@ impl<'a> Parser<'a> {
     }
 
     fn try_type(&mut self) -> Result<Option<TypeId>> {
-        if self.peek_is(Token::Identifier) {
-            return Ok(Some(self.named_type()?));
+        static BRANCHES: LookupTable<ParseFn<TypeId>, 9> = LookupTable::new([
+            (Token::Identifier, |this| this.named_type()),
+            (Token::Interface, |this| this.interface_type()),
+            (Token::Struct, |this| this.struct_type()),
+            (Token::LBracket, |this| this.array_type()),
+            (Token::Map, |this| this.map_type()),
+            (Token::Chan, |this| this.chan_type()),
+            (Token::LThinArrow, |this| this.chan_type()),
+            (Token::Times, |this| {
+                let token = this.expect(Token::Times)?;
+                let inner = this.typ()?;
+                let span = this.emit_join(token, inner);
+                Ok(this.emit_type(Node::Pointer(inner), span))
+            }),
+            (Token::LParens, |this| {
+                this.expect(Token::LParens)?;
+                let inner = this.typ()?;
+                this.expect(Token::RParens)?;
+                Ok(inner)
+            }),
+        ]);
+
+        self.try_branch(&BRANCHES)
+    }
+
+    fn array_type(&mut self) -> Result<TypeId> {
+        let open = self.expect(Token::LBracket)?;
+        let length = self.try_expression()?;
+        let _close = self.expect(Token::RBracket)?;
+        let inner = self.typ()?;
+        let span = self.emit_join(open, inner);
+        Ok(self.emit_type(Node::Array(length, inner), span))
+    }
+
+    pub fn map_type(&mut self) -> Result<TypeId> {
+        let map_token = self.expect(Token::Map)?;
+        self.expect(Token::LBracket)?;
+        let key = self.typ()?;
+        self.expect(Token::RBracket)?;
+        let element = self.typ()?;
+        let span = self.emit_join(map_token, element);
+        Ok(self.emit_type(Node::Map(key, element), span))
+    }
+
+    pub fn chan_type(&mut self) -> Result<TypeId> {
+        let recv_arrow = self.try_expect(Token::LThinArrow);
+        let chan = self.expect(Token::Chan)?;
+        let send_arrow = if recv_arrow.is_none() {
+            self.try_expect(Token::LThinArrow)
+        } else {
+            None
+        };
+        let element = self.typ()?;
+
+        let kind = match () {
+            _ if recv_arrow.is_some() => ChannelKind::Recv,
+            _ if send_arrow.is_some() => ChannelKind::Send,
+            _ => ChannelKind::SendRecv,
+        };
+
+        let span = match recv_arrow {
+            Some(recv) => self.emit_join(recv, element),
+            None => self.emit_join(chan, element),
+        };
+
+        Ok(self.emit_type(Node::Channel(kind, element), span))
+    }
+
+    fn struct_type(&mut self) -> Result<TypeId> {
+        let struct_token = self.expect(Token::Struct)?;
+        self.expect(Token::LCurly)?;
+
+        let fields = self.multi(|this| {
+            while !this.peek_is(Token::RCurly) {
+                this.push_field_decls()?;
+                this.expect(Token::SemiColon)?;
+            }
+            Ok(())
+        })?;
+
+        let end = self.expect(Token::RCurly)?;
+        let span = self.emit_join(struct_token, end);
+
+        Ok(self.emit_type(Node::Struct(fields), span))
+    }
+
+    fn push_field_decls(&mut self) -> Result<()> {
+        let pointer = self.try_expect(Token::Times);
+        let is_pointer = pointer.is_some();
+
+        let mut idents = SmallVec::<[Identifier; 4]>::new();
+        loop {
+            idents.push(self.identifier()?);
+            if is_pointer || !self.eat(Token::Comma) {
+                break;
+            }
         }
 
-        if let Some(pointer) = self.try_expect(Token::Times) {
-            let inner = self.typ()?;
-            let span = self.emit_span(pointer);
-            return Ok(Some(self.emit_type(Node::Pointer(inner), span)));
+        let inner = if is_pointer {
+            // embedded fields already specify their type
+            None
+        } else if idents.len() == 1 {
+            // we might have an embedded field
+            self.try_type()?
+        } else {
+            Some(self.typ()?)
+        };
+
+        let typ = match inner {
+            Some(typ) => typ,
+            None => {
+                // the name of the field is the type
+                let name = idents[0];
+                let mut typ = self.emit_type(Node::Name(name.text), name.span);
+                if let Some(pointer) = pointer {
+                    let span = self.emit_join(pointer, typ);
+                    typ = self.emit_type(Node::Pointer(typ), span);
+                }
+                typ
+            }
+        };
+
+        let tag = self.try_string()?;
+
+        for ident in idents {
+            let end_span = tag.map(|tag| tag.node).unwrap_or(typ.node);
+            let span = self.emit_join(ident, end_span);
+            let field = self.emit_node(Node::Field(ident.text, typ, None), span);
+            self.data.push_indirect(field);
         }
 
-        if self.eat(Token::LParens) {
-            let inner = self.typ()?;
-            self.expect(Token::RParens)?;
-            return Ok(Some(inner));
-        }
+        Ok(())
+    }
 
-        Ok(None)
+    fn interface_type(&mut self) -> Result<TypeId> {
+        let interface_token = self.expect(Token::Interface)?;
+        self.expect(Token::LCurly)?;
+
+        let fields = self.multi(|this| {
+            while !this.peek_is(Token::RCurly) {
+                let element = this.interface_element()?;
+                this.data.push_indirect(element);
+                this.expect(Token::SemiColon)?;
+            }
+            Ok(())
+        })?;
+
+        let end = self.expect(Token::RCurly)?;
+        let span = self.emit_join(interface_token, end);
+
+        Ok(self.emit_type(Node::Interface(fields), span))
+    }
+
+    fn interface_element(&mut self) -> Result<NodeId> {
+        if self.peek2_is(Token::LParens) {
+            // a method
+            let name = self.identifier()?;
+            let signature = self.signature(None)?;
+
+            let Some(name_text) = name.text else {
+                return Err(self.emit(
+                    Diagnostic::error("interface method names may not be blank")
+                        .label(self.get_span(name.span), "may not be blank"),
+                ));
+            };
+
+            let range = match () {
+                _ if signature.outputs != 0 => signature.outputs().range(self),
+                _ if signature.inputs != 0 => signature.inputs().range(self),
+                _ => name.range(self),
+            };
+            let span = self.emit_join(name, range);
+
+            Ok(self.emit_node(Node::MethodElement(name_text, signature), span))
+        } else {
+            // a type name
+            Ok(self.named_type()?.node)
+        }
     }
 
     fn named_type(&mut self) -> Result<TypeId> {
@@ -1190,7 +1563,7 @@ impl<'a> Parser<'a> {
                 let signature = this.signature(None)?;
                 let body = this.block()?;
                 let span = this.emit_join(func_token, body);
-                return Ok(this.emit_expr(Node::FuncDecl(signature, body), span));
+                return Ok(this.emit_expr(Node::Function(signature, body), span));
             }),
         ]);
 
@@ -1269,6 +1642,15 @@ impl<'a> Parser<'a> {
         }
 
         Ok((rune, span))
+    }
+
+    fn try_string(&mut self) -> Result<Option<ExprId>> {
+        if let Some(token) = self.try_expect(Token::String) {
+            let (range, span) = self.parse_string_token(token)?;
+            Ok(Some(self.emit_expr(Node::String(range), span)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn string(&mut self) -> Result<(StringRange, SpanId)> {

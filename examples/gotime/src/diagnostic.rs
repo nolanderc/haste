@@ -143,12 +143,17 @@ impl Diagnostic {
     pub async fn write(&self, db: &dyn crate::Db, out: &mut impl Write) -> std::fmt::Result {
         // for each source file: get its text and line numbers
         let sources = self.get_source_infos(db).await;
-        self.format(&sources, out)?;
+        self.format(&sources, &mut Vec::new(), out)?;
 
         Ok(())
     }
 
-    fn format(&self, sources: &SourceSet, out: &mut impl Write) -> FmtResult<Severity> {
+    fn format<'a>(
+        &'a self,
+        sources: &SourceSet,
+        attachments: &mut Vec<&'a Attachment>,
+        out: &mut impl Write,
+    ) -> FmtResult<()> {
         match &*self.inner {
             Inner::Message(message) => {
                 let severity_text = match message.severity {
@@ -163,22 +168,27 @@ impl Diagnostic {
                     severity_text, message.text
                 )?;
 
-                for attachment in message.attachments.iter() {
+                let self_attachments = message.attachments.iter();
+                let other_attachments = attachments.iter().copied();
+                for attachment in self_attachments.chain(other_attachments) {
                     attachment.format(message.severity, sources, out)?;
                 }
 
-                Ok(message.severity)
+                Ok(())
             }
-            Inner::Attachment(parent, attachments) => {
-                let parent_severity = parent.format(sources, out)?;
-
-                for attachment in attachments.iter() {
-                    attachment.format(parent_severity, sources, out)?;
+            Inner::Attachment(parent, new_attachments) => {
+                attachments.extend(new_attachments.iter());
+                parent.format(sources, attachments, out)?;
+                attachments.truncate(attachments.len() - new_attachments.len());
+                Ok(())
+            }
+            Inner::Combine(combined) => {
+                for diagnostic in combined {
+                    diagnostic.format(sources, attachments, out)?;
+                    writeln!(out)?;
                 }
-
-                Ok(parent_severity)
+                Ok(())
             }
-            Inner::Combine(_) => todo!(),
         }
     }
 }
@@ -216,7 +226,7 @@ impl Label {
         let underline_offset = " ".repeat(column);
 
         let underline_width = (range.end.get() - range.start.get()) as usize;
-        let underline = "^".repeat(underline_width);
+        let underline = "^".repeat(underline_width.max(1));
 
         let reset = Style::Default;
         let blue = Style::Blue;

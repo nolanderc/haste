@@ -1,4 +1,7 @@
 #![feature(type_alias_impl_trait)]
+#![allow(clippy::manual_is_ascii_check)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::uninlined_format_args)]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -74,11 +77,10 @@ async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let source_path = SourcePath::new(db, SourcePathData::new(arguments.path));
 
     let text = source_text(db, source_path).await.as_ref()?;
-    let ast = syntax::parse(db, &text, source_path)?;
+    let ast = syntax::parse(db, text, source_path)?;
 
-    std::io::BufWriter::new(std::io::stderr().lock())
-        .write_fmt(format_args!("{:#?}", db.fmt(ast)))
-        .unwrap();
+    let mut out = std::io::BufWriter::new(std::io::stderr().lock());
+    writeln!(out, "{:#?}", db.fmt(ast)).unwrap();
 
     Ok(())
 }

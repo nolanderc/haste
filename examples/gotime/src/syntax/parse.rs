@@ -30,8 +30,8 @@ pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Resul
     };
 
     match parser.file() {
-        Ok(file) => return Ok(file),
-        Err(()) => Err(Diagnostic::combine(parser.diagnostics.into_iter())),
+        Ok(file) => Ok(file),
+        Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics.into_iter())),
     }
 }
 
@@ -229,7 +229,11 @@ spanned_node_wrapper!(StmtId, StmtRange);
 spanned_node_wrapper!(ExprId, ExprRange);
 spanned_node_wrapper!(TypeId, TypeRange);
 
-type Result<T, E = ()> = std::result::Result<T, E>;
+/// Signals that an error has occured while parsing, which means the token stream may be in an
+/// unexpected state.
+struct ErrorToken;
+
+type Result<T, E = ErrorToken> = std::result::Result<T, E>;
 
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
@@ -388,12 +392,12 @@ impl<'a> Parser<'a> {
         Diagnostic::error(message).label(span, format!("expected {expected}"))
     }
 
-    fn emit_expected(&mut self, expected: &str) {
+    fn emit_expected(&mut self, expected: &str) -> ErrorToken {
         let diagnostic = self.error_expected(expected);
         self.emit(diagnostic)
     }
 
-    fn emit_unexpected_token(&mut self) {
+    fn emit_unexpected_token(&mut self) -> ErrorToken {
         let expected_count = self.expected.len();
         let mut expected = String::with_capacity(expected_count * 8);
         for (i, token) in self.expected.iter().enumerate() {
@@ -416,11 +420,12 @@ impl<'a> Parser<'a> {
             }
         }
 
-        self.emit_expected(&expected);
+        self.emit_expected(&expected)
     }
 
-    fn emit(&mut self, diagnostic: Diagnostic) {
+    fn emit(&mut self, diagnostic: Diagnostic) -> ErrorToken {
         self.diagnostics.push(diagnostic);
+        ErrorToken
     }
 
     fn snippet(&self, range: Range<usize>) -> Cow<'a, str> {
@@ -437,7 +442,7 @@ impl<'a> Parser<'a> {
 
     fn expect_eof(&mut self) -> Result<()> {
         if self.current_token == self.tokens.len() {
-            return Ok(());
+            Ok(())
         } else {
             Err(self.emit_unexpected_token())
         }
@@ -520,7 +525,7 @@ impl<'a> Parser<'a> {
         let base = self.data.node.indirect_stack.len();
         let result = f(self);
         let range = self.data.pop_indirect(base);
-        let () = result?;
+        result?;
         Ok(range)
     }
 
@@ -531,7 +536,7 @@ impl<'a> Parser<'a> {
         self.expect_eof()?;
 
         if !self.diagnostics.is_empty() {
-            return Err(());
+            return Err(ErrorToken);
         }
 
         let file = File {
@@ -765,7 +770,7 @@ impl<'a> Parser<'a> {
             Some(typ) => self.emit_join(names, typ),
             None => self.emit_span(names),
         };
-        return Ok(self.emit_node(Node::ConstDecl(names, typ, values), span));
+        Ok(self.emit_node(Node::ConstDecl(names, typ, values), span))
     }
 
     fn var_declaration(&mut self) -> Result<DeclKind> {
@@ -807,7 +812,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::Assign).map_err(|error| {
                 if typ.is_none() {
                     self.diagnostics.pop();
-                    self.emit_expected("a type or `=`");
+                    self.emit_expected("a type or `=`")
                 } else {
                     error
                 }
@@ -843,7 +848,7 @@ impl<'a> Parser<'a> {
             (None, Some(typ)) => self.emit_join(names, typ),
             (None, None) => self.emit_span(names),
         };
-        return Ok(self.emit_node(Node::VarDecl(names, typ, values), span));
+        Ok(self.emit_node(Node::VarDecl(names, typ, values), span))
     }
 
     fn func_declaration(&mut self) -> Result<DeclKind> {
@@ -986,11 +991,9 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            if allow_variadic {
-                if self.eat(Token::Ellipses) {
-                    variadic = Some(Variadic {});
-                }
-            };
+            if allow_variadic && self.eat(Token::Ellipses) {
+                variadic = Some(Variadic {});
+            }
 
             let typ = self.typ()?;
 
@@ -1318,7 +1321,7 @@ impl<'a> Parser<'a> {
         ]);
 
         if let Some(stmt) = self.try_branch(&STATEMENTS)? {
-            return Ok(Some(stmt));
+            Ok(Some(stmt))
         } else if self.peek_is(Token::Identifier) && self.peek2_is(Token::Colon) {
             let label = self.identifier()?;
             self.eat(Token::Colon);
@@ -1339,7 +1342,7 @@ impl<'a> Parser<'a> {
 
     fn make_expression_statement(&mut self, expr: ExprId) -> StmtId {
         if !self.is_valid_statement_expr(expr) {
-            self.emit(self.error_invalid_expression_statement(expr))
+            self.emit(self.error_invalid_expression_statement(expr));
         }
         StmtId::new(expr.node)
     }
@@ -1355,10 +1358,10 @@ impl<'a> Parser<'a> {
     }
 
     fn is_valid_statement_expr(&self, expr: ExprId) -> bool {
-        match self.data.node(expr.node) {
-            Node::Call { .. } | Node::Unary(UnaryOperator::Recv, _) => true,
-            _ => false,
-        }
+        matches!(
+            self.data.node(expr.node),
+            Node::Call { .. } | Node::Unary(UnaryOperator::Recv, _)
+        )
     }
 
     fn block(&mut self) -> Result<StmtId> {
@@ -1572,12 +1575,10 @@ impl<'a> Parser<'a> {
         if let Some(maybe) = self.maybe_type_switch()? {
             match maybe {
                 MaybeTypeSwitch::Expr(expr) | MaybeTypeSwitch::TypeSwitch(expr) => Ok(Some(expr)),
-                MaybeTypeSwitch::Stmt(stmt) => {
-                    return Err(self.emit(
-                        Diagnostic::error("unexpected statement in `switch`")
-                            .label(self.get_span(stmt), "expected an expression"),
-                    ))
-                }
+                MaybeTypeSwitch::Stmt(stmt) => Err(self.emit(
+                    Diagnostic::error("unexpected statement in `switch`")
+                        .label(self.get_span(stmt), "expected an expression"),
+                )),
             }
         } else {
             Ok(None)
@@ -1613,7 +1614,10 @@ impl<'a> Parser<'a> {
                     this.data.push_indirect(name);
                     Ok(())
                 })?;
-                let values = self.multi(|this| Ok(this.data.push_indirect(expr.node)))?;
+                let values = self.multi(|this| {
+                    this.data.push_indirect(expr.node);
+                    Ok(())
+                })?;
                 let span = self.emit_join(expr, name);
                 Ok(Some(MaybeTypeSwitch::Stmt(self.emit_stmt(
                     Node::VarDecl(names, None, Some(ExprRange::new(values))),
@@ -1756,7 +1760,7 @@ impl<'a> Parser<'a> {
                 self.emit(Diagnostic::error("too many bindings for `range`").label(
                     span,
                     format!("expected at most 2 bindings, found {}", names.len()),
-                ))
+                ));
             }
 
             let first = names[0];
@@ -2127,7 +2131,7 @@ impl<'a> Parser<'a> {
         if self.peek_is(Token::RCurly) {
             let (elements, range) = self.composite_literal()?;
             let span = self.emit_span(range);
-            return Ok(self.emit_expr(Node::CompositeLiteral(elements), span));
+            Ok(self.emit_expr(Node::CompositeLiteral(elements), span))
         } else {
             self.expression()
         }
@@ -2144,6 +2148,7 @@ impl<'a> Parser<'a> {
 
             if end.is_some() && self.eat(Token::Colon) {
                 // `arr[ start? : end : cap ]`
+                #[allow(clippy::unnecessary_unwrap)]
                 let end = end.unwrap();
                 let cap = self.expression()?;
                 let bracket = self.expect(Token::RBracket)?;
@@ -2228,15 +2233,15 @@ impl<'a> Parser<'a> {
                     this.snippet(token.range())
                 );
                 let span = this.emit_span(token);
-                return Ok(this.emit_expr(Node::Imaginary(()), span));
+                Ok(this.emit_expr(Node::Imaginary(()), span))
             }),
             (Token::String, |this, token| {
                 let (range, span) = this.parse_string_token(token)?;
-                return Ok(this.emit_expr(Node::String(range), span));
+                Ok(this.emit_expr(Node::String(range), span))
             }),
             (Token::Rune, |this, token| {
                 let (rune, span) = this.parse_rune_token(token)?;
-                return Ok(this.emit_expr(Node::Rune(rune), span));
+                Ok(this.emit_expr(Node::Rune(rune), span))
             }),
             (Token::Func, |this, func_token| {
                 let signature = this.signature(None)?;
@@ -2312,7 +2317,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_rune_token(&mut self, token: SpannedToken) -> Result<(char, SpanId)> {
-        const MESSAGE: &'static str = "rune literal must contain exactly one codepoint";
+        const MESSAGE: &str = "rune literal must contain exactly one codepoint";
 
         let (range, span) = self.parse_string_token(token)?;
         let bytes = self.data.string_bytes(range);
@@ -2355,21 +2360,19 @@ impl<'a> Parser<'a> {
 
         let start = self.data.string_position();
 
-        if contents.starts_with("`") {
+        if contents.as_bytes().starts_with(b"`") {
             // raw strings are already valid
             self.data.strings.push_str(contents);
-        } else {
-            if let Err(error) = decode_string(contents, &mut self.data.strings) {
-                // restore the string buffer to the original length
-                self.data.pop_string(start);
+        } else if let Err(error) = decode_string(contents, &mut self.data.strings) {
+            // restore the string buffer to the original length
+            self.data.pop_string(start);
 
-                let diagnostic = Diagnostic::error("could not decode string");
-                let mut range = token.file_range();
-                range.start = NonMaxU32::new(range.start.get() + error.start as u32).unwrap();
-                range.end = NonMaxU32::new(range.start.get() + error.length as u32).unwrap();
-                let span = Span::new(self.path, range);
-                return Err(self.emit(diagnostic.label(span, error.kind)));
-            }
+            let diagnostic = Diagnostic::error("could not decode string");
+            let mut range = token.file_range();
+            range.start = NonMaxU32::new(range.start.get() + error.start as u32).unwrap();
+            range.end = NonMaxU32::new(range.start.get() + error.length as u32).unwrap();
+            let span = Span::new(self.path, range);
+            return Err(self.emit(diagnostic.label(span, error.kind)));
         }
 
         let end = self.data.string_position();
@@ -2382,11 +2385,8 @@ impl<'a> Parser<'a> {
     }
 
     fn try_identifier(&mut self) -> Option<Identifier> {
-        if let Some(token) = self.try_expect(Token::Identifier) {
-            Some(self.parse_identifier_token(token))
-        } else {
-            None
-        }
+        self.try_expect(Token::Identifier)
+            .map(|token| self.parse_identifier_token(token))
     }
 
     /// Expects an identifier or `_`.
@@ -2459,7 +2459,7 @@ fn decode_string(contents: &str, out: &mut BString) -> Result<(), EscapeError> {
         out.push_str(&contents[last_flush..i]);
 
         while i < bytes.len() && bytes[i] == b'\\' {
-            i = decode_escape_sequence(&contents, i, out)?;
+            i = decode_escape_sequence(contents, i, out)?;
         }
 
         last_flush = i;
@@ -2595,11 +2595,7 @@ impl<T: Copy, const N: usize> LookupTable<T, N> {
     }
 
     pub fn lookup(&self, token: Token) -> Option<T> {
-        if let Some(index) = self.tokens.find(token) {
-            Some(self.values[index])
-        } else {
-            None
-        }
+        self.tokens.find(token).map(|index| self.values[index])
     }
 }
 
@@ -2681,6 +2677,7 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
             missing_digit = true;
             return;
         };
+
         let digit_value = match BASE {
             2 => matches!(digit, b'0' | b'1').then(|| digit - b'0'),
             8 => matches!(digit, b'0'..=b'7').then(|| digit - b'0'),
@@ -2700,12 +2697,10 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
                 .wrapping_add(digit_value as u128);
             overflow |= new_value < value;
             value = new_value;
+        } else if digit == b'_' {
+            invalid_underscore = invalid_underscore.or(Some(index));
         } else {
-            if digit == b'_' {
-                invalid_underscore = invalid_underscore.or(Some(index));
-            } else {
-                invalid_digit = invalid_digit.or(Some(index));
-            }
+            invalid_digit = invalid_digit.or(Some(index));
         }
     };
 

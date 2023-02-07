@@ -607,7 +607,7 @@ impl std::fmt::Debug for SpannedToken {
 }
 
 impl SpannedToken {
-    const MAX_LENGTH: u32 = 1u32 << 24 - 1;
+    const MAX_LENGTH: u32 = (1u32 << 24) - 1;
 
     pub fn new(token: Token, offset: u32, length: u32) -> Self {
         assert!(

@@ -88,6 +88,7 @@ where
 {
     fn clone(&self) -> Self {
         // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
+        #[allow(clippy::borrowed_box)]
         let slice: &Box<[T]> = unsafe { std::mem::transmute(self) };
 
         let clone: Box<[T]> = slice.clone();

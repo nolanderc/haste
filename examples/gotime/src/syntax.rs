@@ -1,5 +1,7 @@
 mod parse;
 
+pub use self::parse::parse;
+
 use std::num::{NonZeroU16, NonZeroUsize};
 
 use bstr::BStr;
@@ -11,8 +13,6 @@ use crate::{
     span::{FileRange, Span},
     Text,
 };
-
-pub use self::parse::parse;
 
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;
 
@@ -107,7 +107,7 @@ pub struct TypeSpec {
 pub struct FuncDecl {
     pub name: Identifier,
     pub signature: Signature,
-    pub body: Option<StmtRange>,
+    pub body: Option<Block>,
 }
 
 /// Points to a sequence of nodes representing the parameters of a function.
@@ -361,7 +361,7 @@ pub enum Node {
     Binary(ExprId, BinaryOperator, ExprId),
 
     /// A function literal with a body
-    Function(Signature, StmtRange),
+    Function(Signature, Block),
 
     /// Index into a container
     Index(ExprId, ExprId),
@@ -392,7 +392,9 @@ pub enum Node {
     VarList(NodeRange),
 
     /// Execute a sequence of statements
-    Block(StmtRange),
+    Block(Block),
+    /// A labeled statement: `label: ...`
+    Label(Identifier, StmtId),
 
     /// Return a single value
     Return(Option<ExprId>),
@@ -413,9 +415,6 @@ pub enum Node {
     /// Send a value on a channel: `channel <- value`
     Send(ExprId, ExprId),
 
-    /// A labeled statement: `loop: for condition { ... }`
-    Label(Identifier, StmtId),
-
     /// Execute an function/method call on a new thread
     Go(ExprId),
 
@@ -429,8 +428,9 @@ pub enum Node {
     /// Transfer control flow to the given label
     Goto(Identifier),
 
-    /// `if <init?>; <expr> { ... } else ...` with an optional `init`-statement and `else`-branch.
-    If(Option<StmtId>, ExprId, StmtRange, Option<Else>),
+    /// `if <init?>; <expr> { ... } else ...` with an optional `init`-statement and `else`-branch
+    /// which points to either another `If` or `Block`.
+    If(Option<StmtId>, ExprId, Block, Option<StmtId>),
 
     /// Wait until one of the given branches succeeds.
     Select(NodeRange),
@@ -448,9 +448,11 @@ pub enum Node {
     Fallthrough,
 
     /// `for <init?> ; <condition?> ; <post?> {...}`
-    For(Option<StmtId>, Option<ExprId>, Option<StmtId>, StmtRange),
+    For(Option<StmtId>, Option<ExprId>, Option<StmtId>, Block),
+    /// `for range <expr> {...} `
+    ForRangePlain(ExprId, Block),
     /// `for <expr>, <expr?> = range <expr> {...} `
-    ForRange(Option<ForRangeBinding>, ExprId, StmtRange),
+    ForRange(ExprId, Option<ExprId>, AssignOrDefine, ExprId, Block),
 }
 
 const _: () = assert!(
@@ -465,13 +467,11 @@ pub enum Else {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ForRangeBinding {
-    /// The first expression to bind a value to
-    pub first: ExprId,
-    /// The second expression to bind a value to
-    pub second: Option<ExprId>,
-    /// Are the names defined or simply assigned to
-    pub kind: AssignOrDefine,
+pub struct Block {
+    /// A sequence of statements to execute
+    pub statements: StmtRange,
+    /// A sequence of labels defined in the block.
+    pub labels: NodeRange,
 }
 
 /// Certain syntax forms accepts both `:=` and `=`.

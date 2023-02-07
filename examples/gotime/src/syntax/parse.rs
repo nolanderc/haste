@@ -228,6 +228,8 @@ type Result<T, E = ()> = std::result::Result<T, E>;
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
 
+type LabelList = SmallVec<[NodeId; 8]>;
+
 impl<'a> Parser<'a> {
     /// Determines if the current expression is followed by a block.
     ///
@@ -1224,14 +1226,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn statement(&mut self) -> Result<StmtId> {
-        match self.try_statement()? {
+    fn statement(&mut self, labels: &mut LabelList) -> Result<StmtId> {
+        match self.try_statement(labels)? {
             Some(stmt) => Ok(stmt),
             None => Err(self.emit_expected("a statement")),
         }
     }
 
-    fn try_statement(&mut self) -> Result<Option<StmtId>> {
+    fn try_statement(&mut self, labels: &mut LabelList) -> Result<Option<StmtId>> {
         static STATEMENTS: LookupTable<ParseFn<StmtId>, 14> = LookupTable::new([
             (Token::LCurly, |this| this.block()),
             (Token::Return, |this| this.return_statement()),
@@ -1303,9 +1305,10 @@ impl<'a> Parser<'a> {
         } else if self.peek_is(Token::Identifier) && self.peek2_is(Token::Colon) {
             let label = self.identifier()?;
             self.eat(Token::Colon);
-            let inner = self.statement()?;
+            let inner = self.statement(labels)?;
             let span = self.emit_join(label, inner);
-            Ok(Some(self.emit_stmt(Node::Label(label, inner), span)))
+            labels.push(self.emit_node(Node::Label(label, inner), span));
+            Ok(Some(inner))
         } else if let Some(expr) = self.try_expression()? {
             if let Some(simple) = self.try_simple_statement(expr)? {
                 Ok(Some(simple))
@@ -1342,17 +1345,18 @@ impl<'a> Parser<'a> {
     }
 
     fn block(&mut self) -> Result<StmtId> {
-        let (statements, range) = self.statement_block()?;
+        let (block, range) = self.statement_block()?;
         let span = self.emit_span(range);
-        Ok(self.emit_stmt(Node::Block(statements), span))
+        Ok(self.emit_stmt(Node::Block(block), span))
     }
 
-    fn statement_block(&mut self) -> Result<(StmtRange, FileRange)> {
+    fn statement_block(&mut self) -> Result<(Block, FileRange)> {
         let start = self.expect(Token::LCurly)?.file_range();
 
+        let mut labels = SmallVec::<[NodeId; 8]>::new();
         let statements = self.multi(|this| {
             loop {
-                if let Some(statement) = this.try_statement()? {
+                if let Some(statement) = this.try_statement(&mut labels)? {
                     this.data.push_indirect(statement.node);
                 }
 
@@ -1364,9 +1368,19 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
+        let labels = self.multi(|this| {
+            this.data.node.indirect_stack.extend_from_slice(&labels);
+            Ok(())
+        })?;
+
+        let block = Block {
+            statements: StmtRange::new(statements),
+            labels,
+        };
+
         let end = self.expect(Token::RCurly)?.file_range();
         let range = self.join(start, end);
-        Ok((StmtRange::new(statements), range))
+        Ok((block, range))
     }
 
     fn return_statement(&mut self) -> Result<StmtId> {
@@ -1404,7 +1418,7 @@ impl<'a> Parser<'a> {
             range: FileRange,
             init: Option<StmtId>,
             condition: ExprId,
-            block: StmtRange,
+            block: Block,
         }
 
         // We parse chains of `if`-statements in a loop instead of using recursion.
@@ -1438,8 +1452,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
 
-                let (block, _) = self.statement_block()?;
-                Some(Else::Block(block))
+                Some(self.block()?)
             } else {
                 None
             };
@@ -1451,12 +1464,7 @@ impl<'a> Parser<'a> {
         while let Some(header) = headers.pop() {
             let span = self.emit_join(header.range, stmt);
             stmt = self.emit_stmt(
-                Node::If(
-                    header.init,
-                    header.condition,
-                    header.block,
-                    Some(Else::If(stmt)),
-                ),
+                Node::If(header.init, header.condition, header.block, Some(stmt)),
                 span,
             );
         }
@@ -1507,7 +1515,7 @@ impl<'a> Parser<'a> {
                 let values = self.pre_block_expression()?;
                 let (block, range) = self.statement_block()?;
                 let span = self.emit_join(for_token, range);
-                return Ok(self.emit_stmt(Node::ForRange(None, values, block), span));
+                return Ok(self.emit_stmt(Node::ForRangePlain(values, block), span));
             } else {
                 return Err(self.emit_unexpected_token());
             }
@@ -1529,17 +1537,14 @@ impl<'a> Parser<'a> {
                 ))
             }
 
-            let bindings = ForRangeBinding {
-                first: names[0],
-                second: names.get(1).copied(),
-                kind,
-            };
+            let first = names[0];
+            let second = names.get(1).copied();
 
             self.expect(Token::Range)?;
             let values = self.pre_block_expression()?;
             let (block, range) = self.statement_block()?;
             let span = self.emit_join(for_token, range);
-            return Ok(self.emit_stmt(Node::ForRange(Some(bindings), values, block), span));
+            return Ok(self.emit_stmt(Node::ForRange(first, second, kind, values, block), span));
         }
 
         // we must have an `init` statement (if it were empty we would have caught that above)

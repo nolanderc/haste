@@ -58,13 +58,14 @@ struct Parser<'a> {
 
     /// Keeps track of the level of expression nesting in order to avoid ambiguous syntax.
     ///
-    /// Every time we enter a nested expression this is incremented, and every time it is exited we
-    /// decrement it.
+    /// Every time we begin parsing a potentially nested expression this is incremented, and every
+    /// time it is exited we decrement it.
     ///
     /// Initially this is set to `0`. But if we encounter an expression that is followed by a block
     /// (such as the `condition` in `if condition {}`) we set this to `-1`. If we encounter a
-    /// composite literal (eg. `Point{...}`) when this value is `-1`, the block is instead treated
-    /// as the block of the `if`-statement.
+    /// composite literal (eg. `Point{...}`) when this value is `0` or less (ie. the "parent"
+    /// context is not an expression), the block is instead
+    /// treated as the block of the `if`-statement.
     expression_depth: i32,
 
     /// Temporary working data for reducing allocation pressure.
@@ -146,13 +147,6 @@ impl Data {
 
     fn push_indirect(&mut self, node: NodeId) {
         self.node.indirect_stack.push(node);
-    }
-
-    fn duplicate_indirect(&mut self, values: NodeRange) {
-        let start = self.base.node_indirect + values.start.get() as usize;
-        let end = start + values.length.get() as usize;
-        let nodes = &self.node.indirect[start..end];
-        self.node.indirect_stack.extend_from_slice(nodes);
     }
 
     fn pop_indirect(&mut self, base: usize) -> NodeRange {
@@ -249,7 +243,7 @@ impl<'a> Parser<'a> {
     /// call), and decremented when it is exited. Then, we only parse composite literals `Point{}`
     /// if the nesting depth is non-negative.
     fn expects_block(&self) -> bool {
-        self.expression_depth < 0
+        self.expression_depth <= 0
     }
 
     fn prev_token(&self) -> Option<Token> {
@@ -469,6 +463,13 @@ impl<'a> Parser<'a> {
 
     fn emit_join(&mut self, a: impl Spanned, b: impl Spanned) -> SpanId {
         self.emit_span(self.join(a, b))
+    }
+
+    fn try_emit_join(&mut self, a: impl Spanned, b: Option<impl Spanned>) -> SpanId {
+        self.emit_span(match b {
+            None => a.range(self),
+            Some(b) => self.join(a, b),
+        })
     }
 
     fn node_range_span(&self, range: NodeRange) -> FileRange {
@@ -843,7 +844,8 @@ impl<'a> Parser<'a> {
         let name = self.identifier()?;
         let signature = self.signature(receiver)?;
         let body = if self.peek_is(Token::LCurly) {
-            Some(self.block()?)
+            let (body, _) = self.statement_block()?;
+            Some(body)
         } else {
             None
         };
@@ -1230,9 +1232,43 @@ impl<'a> Parser<'a> {
     }
 
     fn try_statement(&mut self) -> Result<Option<StmtId>> {
-        static STATEMENTS: LookupTable<ParseFn<StmtId>, 5> = LookupTable::new([
+        static STATEMENTS: LookupTable<ParseFn<StmtId>, 14> = LookupTable::new([
             (Token::LCurly, |this| this.block()),
             (Token::Return, |this| this.return_statement()),
+            (Token::If, |this| this.if_statement()),
+            (Token::Switch, |this| this.switch_statement()),
+            (Token::Select, |this| this.select_statement()),
+            (Token::For, |this| this.for_statement()),
+            (Token::Go, |this| {
+                let token = this.expect(Token::Go)?;
+                let expr = this.expression()?;
+                let span = this.emit_join(token, expr);
+                Ok(this.emit_stmt(Node::Go(expr), span))
+            }),
+            (Token::Defer, |this| {
+                let token = this.expect(Token::Defer)?;
+                let expr = this.expression()?;
+                let span = this.emit_join(token, expr);
+                Ok(this.emit_stmt(Node::Defer(expr), span))
+            }),
+            (Token::Break, |this| {
+                let token = this.expect(Token::Break)?;
+                let label = this.try_identifier();
+                let span = this.try_emit_join(token, label);
+                Ok(this.emit_stmt(Node::Break(label), span))
+            }),
+            (Token::Continue, |this| {
+                let token = this.expect(Token::Continue)?;
+                let label = this.try_identifier();
+                let span = this.try_emit_join(token, label);
+                Ok(this.emit_stmt(Node::Continue(label), span))
+            }),
+            (Token::Goto, |this| {
+                let token = this.expect(Token::Goto)?;
+                let label = this.identifier()?;
+                let span = this.emit_join(token, label);
+                Ok(this.emit_stmt(Node::Goto(label), span))
+            }),
             (Token::Type, |this| match this.type_declaration()? {
                 DeclKind::Type(node) => Ok(StmtId::new(node)),
                 DeclKind::TypeList(nodes) => {
@@ -1270,12 +1306,48 @@ impl<'a> Parser<'a> {
             let inner = self.statement()?;
             let span = self.emit_join(label, inner);
             Ok(Some(self.emit_stmt(Node::Label(label, inner), span)))
+        } else if let Some(expr) = self.try_expression()? {
+            if let Some(simple) = self.try_simple_statement(expr)? {
+                Ok(Some(simple))
+            } else {
+                Ok(Some(self.make_expression_statement(expr)))
+            }
         } else {
-            self.try_simple_statement()
+            Ok(None)
+        }
+    }
+
+    fn make_expression_statement(&mut self, expr: ExprId) -> StmtId {
+        if !self.is_valid_statement_expr(expr) {
+            self.emit(self.error_invalid_expression_statement(expr))
+        }
+        StmtId::new(expr.node)
+    }
+
+    fn error_invalid_expression_statement(&self, expr: ExprId) -> Diagnostic {
+        Diagnostic::error(
+            "only function/method calls and receive expressions are allowed in statement position",
+        )
+        .label(
+            self.get_span(expr),
+            "invalid expression in statement position",
+        )
+    }
+
+    fn is_valid_statement_expr(&self, expr: ExprId) -> bool {
+        match self.data.node(expr.node) {
+            Node::Call { .. } | Node::Unary(UnaryOperator::Recv, _) => true,
+            _ => false,
         }
     }
 
     fn block(&mut self) -> Result<StmtId> {
+        let (statements, range) = self.statement_block()?;
+        let span = self.emit_span(range);
+        Ok(self.emit_stmt(Node::Block(statements), span))
+    }
+
+    fn statement_block(&mut self) -> Result<(StmtRange, FileRange)> {
         let start = self.expect(Token::LCurly)?.file_range();
 
         let statements = self.multi(|this| {
@@ -1293,9 +1365,8 @@ impl<'a> Parser<'a> {
         })?;
 
         let end = self.expect(Token::RCurly)?.file_range();
-        let span = self.emit_join(start, end);
-
-        Ok(self.emit_stmt(Node::Block(StmtRange::new(statements)), span))
+        let range = self.join(start, end);
+        Ok((StmtRange::new(statements), range))
     }
 
     fn return_statement(&mut self) -> Result<StmtId> {
@@ -1328,65 +1399,194 @@ impl<'a> Parser<'a> {
         Ok(self.emit_stmt(Node::ReturnMulti(ExprRange::new(exprs)), span))
     }
 
-    fn try_simple_statement(&mut self) -> Result<Option<StmtId>> {
-        let Some(first) = self.try_expression()? else { return Ok(None) };
-
-        let mut names = None;
-
-        if self.peek_is(Token::Comma) {
-            names = Some(self.multi(|this| {
-                this.data.push_indirect(first.node);
-                while this.eat(Token::Comma) {
-                    let binding = this.expression()?;
-                    this.data.push_indirect(binding.node);
-                }
-                Ok(())
-            })?);
+    fn if_statement(&mut self) -> Result<StmtId> {
+        struct IfHeader {
+            range: FileRange,
+            init: Option<StmtId>,
+            condition: ExprId,
+            block: StmtRange,
         }
 
-        let is_definition = self.eat(Token::Define);
-        if is_definition || self.eat(Token::Assign) {
-            let names = match names {
-                Some(names) => names,
-                None => self.multi(|this| {
-                    this.data.push_indirect(first.node);
-                    Ok(())
-                })?,
-            };
+        // We parse chains of `if`-statements in a loop instead of using recursion.
+        // For this, we use a stack of if-headers which we then assemble into a full chain below.
+        let mut headers = SmallVec::<[IfHeader; 4]>::new();
 
-            let values = ExprRange::new(self.multi(|this| loop {
-                let expr = this.expression()?;
-                this.data.push_indirect(expr.node);
-                if !this.eat(Token::Comma) {
-                    break Ok(());
-                }
-            })?);
+        let mut stmt = loop {
+            let if_token = self.expect(Token::If)?;
 
-            if names.length != values.nodes.length {
-                self.emit(
-                    Diagnostic::error("the number of identifiers and expressions must match")
-                        .label(
-                            self.get_span(names),
-                            format!("found {} identifiers", names.length),
-                        )
-                        .label(
-                            self.get_span(values),
-                            format!("found {} expressions", values.nodes.length),
-                        ),
-                );
+            let mut condition = self.pre_block_expression()?;
+            let mut init = None;
+            if self.is_valid_statement_expr(condition) && self.eat(Token::SemiColon) {
+                init = Some(StmtId::new(condition.node));
+                condition = self.pre_block_expression()?;
+            } else if let Some(simple) = self.try_simple_statement(condition)? {
+                init = Some(simple);
+                self.expect(Token::SemiColon)?;
+                condition = self.pre_block_expression()?;
             }
 
-            let kind = if is_definition {
-                Node::VarDecl(names, None, Some(values))
+            let (block, block_range) = self.statement_block()?;
+
+            let else_kind = if self.eat(Token::Else) {
+                if self.peek_is(Token::If) {
+                    headers.push(IfHeader {
+                        range: self.join(if_token, block_range),
+                        init,
+                        condition,
+                        block,
+                    });
+                    continue;
+                }
+
+                let (block, _) = self.statement_block()?;
+                Some(Else::Block(block))
             } else {
-                Node::Assign(names, values)
+                None
             };
-            let span = self.emit_join(names, values);
-            return Ok(Some(self.emit_stmt(kind, span)));
+
+            let span = self.emit_join(if_token, block_range);
+            break self.emit_stmt(Node::If(init, condition, block, else_kind), span);
+        };
+
+        while let Some(header) = headers.pop() {
+            let span = self.emit_join(header.range, stmt);
+            stmt = self.emit_stmt(
+                Node::If(
+                    header.init,
+                    header.condition,
+                    header.block,
+                    Some(Else::If(stmt)),
+                ),
+                span,
+            );
         }
 
-        // we found an expression list, but no `=` or `:=`
-        if names.is_some() {
+        Ok(stmt)
+    }
+
+    fn switch_statement(&mut self) -> Result<StmtId> {
+        todo!("parse switch statement")
+    }
+
+    fn select_statement(&mut self) -> Result<StmtId> {
+        todo!("parse select statement")
+    }
+
+    fn for_statement(&mut self) -> Result<StmtId> {
+        let for_token = self.expect(Token::For)?;
+
+        let first = self.try_pre_block_expression()?;
+        if self.peek_is(Token::LCurly) {
+            let condition = first;
+            let (block, range) = self.statement_block()?;
+            let span = self.emit_join(for_token, range);
+            return Ok(self.emit_stmt(Node::For(None, condition, None, block), span));
+        }
+
+        if self.eat(Token::SemiColon) {
+            // init was either empty or a simple expression
+            let init = first.map(|init| self.make_expression_statement(init));
+            let condition = self.try_expression()?;
+            self.expect(Token::SemiColon)?;
+            let post = self.for_post_condition()?;
+            let (block, range) = self.statement_block()?;
+            let span = self.emit_join(for_token, range);
+            return Ok(self.emit_stmt(Node::For(init, condition, post, block), span));
+        }
+
+        let mut names = SmallVec::<[ExprId; 8]>::new();
+        if let Some(first) = first {
+            names.push(first);
+            while self.eat(Token::Comma) {
+                names.push(self.expression()?);
+            }
+        }
+
+        if names.is_empty() {
+            if self.eat(Token::Range) {
+                let values = self.pre_block_expression()?;
+                let (block, range) = self.statement_block()?;
+                let span = self.emit_join(for_token, range);
+                return Ok(self.emit_stmt(Node::ForRange(None, values, block), span));
+            } else {
+                return Err(self.emit_unexpected_token());
+            }
+        }
+
+        if self.peek2_is(Token::Range) {
+            let kind = if self.eat(Token::Assign) {
+                AssignOrDefine::Assign
+            } else {
+                self.expect(Token::Define)?;
+                AssignOrDefine::Define
+            };
+
+            if names.len() > 2 {
+                let span = self.get_span(self.join(names[0], names[names.len() - 1]));
+                self.emit(Diagnostic::error("too many bindings for `range`").label(
+                    span,
+                    format!("expected at most 2 bindings, found {}", names.len()),
+                ))
+            }
+
+            let bindings = ForRangeBinding {
+                first: names[0],
+                second: names.get(1).copied(),
+                kind,
+            };
+
+            self.expect(Token::Range)?;
+            let values = self.pre_block_expression()?;
+            let (block, range) = self.statement_block()?;
+            let span = self.emit_join(for_token, range);
+            return Ok(self.emit_stmt(Node::ForRange(Some(bindings), values, block), span));
+        }
+
+        // we must have an `init` statement (if it were empty we would have caught that above)
+        let init = if names.len() == 1 {
+            self.try_simple_statement(first.unwrap())?
+                .unwrap_or_else(|| self.make_expression_statement(first.unwrap()))
+        } else {
+            self.try_assign_or_define(names)?
+                .ok_or_else(|| self.emit_unexpected_token())?
+        };
+
+        self.expect(Token::SemiColon)?;
+        let condition = self.try_expression()?;
+        self.expect(Token::SemiColon)?;
+        let post = self.for_post_condition()?;
+        let (block, range) = self.statement_block()?;
+        let span = self.emit_join(for_token, range);
+        Ok(self.emit_stmt(Node::For(Some(init), condition, post, block), span))
+    }
+
+    fn for_post_condition(&mut self) -> Result<Option<StmtId>> {
+        match self.try_pre_block_expression()? {
+            Some(expr) => {
+                if let Some(simple) = self.try_simple_statement(expr)? {
+                    Ok(Some(simple))
+                } else {
+                    Ok(Some(self.make_expression_statement(expr)))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn try_simple_statement(&mut self, first: ExprId) -> Result<Option<StmtId>> {
+        let mut names = SmallVec::<[ExprId; 8]>::new();
+        names.push(first);
+        while self.eat(Token::Comma) {
+            names.push(self.expression()?);
+        }
+
+        let name_count = names.len();
+        if let Some(stmt) = self.try_assign_or_define(names)? {
+            return Ok(Some(stmt));
+        }
+
+        if name_count > 1 {
+            // we found an expression list, but no `=` or `:=`
             return Err(self.emit_unexpected_token());
         }
 
@@ -1416,26 +1616,56 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.emit_stmt(Node::AssignOp(expr, op, value), span)));
         }
 
-        if !self.is_valid_statement_expr(expr) {
-            self.emit(
-                Diagnostic::error(
-                    "only function/method calls and receive operations are allowed in statement position",
-                )
-                .label(
-                    self.get_span(expr),
-                    "invalid expression in statement position",
-                ),
-            )
-        }
-
-        Ok(Some(StmtId { node: expr.node }))
+        Ok(None)
     }
 
-    fn is_valid_statement_expr(&self, expr: ExprId) -> bool {
-        match self.data.node(expr.node) {
-            Node::Call { .. } | Node::Unary(UnaryOperator::Recv, _) => true,
-            _ => false,
+    fn try_assign_or_define(&mut self, names: SmallVec<[ExprId; 8]>) -> Result<Option<StmtId>> {
+        if names.is_empty() {
+            return Ok(None);
         }
+
+        let is_definition = self.eat(Token::Define);
+        if !(is_definition || self.eat(Token::Assign)) {
+            return Ok(None);
+        }
+
+        let names = self.multi(|this| {
+            for name in names {
+                this.data.push_indirect(name.node);
+            }
+            Ok(())
+        })?;
+
+        let values = ExprRange::new(self.multi(|this| loop {
+            let expr = this.expression()?;
+            this.data.push_indirect(expr.node);
+            if !this.eat(Token::Comma) {
+                break Ok(());
+            }
+        })?);
+
+        if names.length != values.nodes.length {
+            self.emit(
+                Diagnostic::error("the number of identifiers and expressions must match")
+                    .label(
+                        self.get_span(names),
+                        format!("found {} identifiers", names.length),
+                    )
+                    .label(
+                        self.get_span(values),
+                        format!("found {} expressions", values.nodes.length),
+                    ),
+            );
+        }
+
+        let kind = if is_definition {
+            Node::VarDecl(names, None, Some(values))
+        } else {
+            Node::Assign(names, values)
+        };
+
+        let span = self.emit_join(names, values);
+        Ok(Some(self.emit_stmt(kind, span)))
     }
 
     fn peek_assignment_operator(&mut self) -> Option<BinaryOperator> {
@@ -1461,6 +1691,20 @@ impl<'a> Parser<'a> {
             Some(expr) => Ok(expr),
             None => Err(self.emit_expected("an expression")),
         }
+    }
+
+    fn pre_block_expression(&mut self) -> Result<ExprId> {
+        let old_depth = std::mem::replace(&mut self.expression_depth, -1);
+        let result = self.expression();
+        self.expression_depth = old_depth;
+        result
+    }
+
+    fn try_pre_block_expression(&mut self) -> Result<Option<ExprId>> {
+        let old_depth = std::mem::replace(&mut self.expression_depth, -1);
+        let result = self.try_expression();
+        self.expression_depth = old_depth;
+        result
     }
 
     fn with_expr_depth<T>(&mut self, f: impl FnOnce(&mut Parser) -> T) -> T {
@@ -1600,7 +1844,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if self.peek_is(Token::LCurly) && !self.expects_block() {
+            if !self.expects_block() && self.peek_is(Token::LCurly) {
                 // we don't allow parenthized types
                 if self.prev_token() != Some(Token::RParens) {
                     base = self.composite_init(TypeId::new(base.node))?;
@@ -1753,8 +1997,8 @@ impl<'a> Parser<'a> {
             (Token::Func, |this, func_token| {
                 let signature = this.signature(None)?;
                 if this.peek_is(Token::LCurly) {
-                    let body = this.block()?;
-                    let span = this.emit_join(func_token, body);
+                    let (body, body_range) = this.statement_block()?;
+                    let span = this.emit_join(func_token, body_range);
                     Ok(this.emit_expr(Node::Function(signature, body), span))
                 } else {
                     let span = this.emit_span(func_token);
@@ -1779,7 +2023,6 @@ impl<'a> Parser<'a> {
         let span = self.emit_span(token);
         let node = match bits {
             IntegerBits::Small(small) => Node::IntegerSmall(small),
-            IntegerBits::Arbitrary(arbitrary) => Node::IntegerArbitrary(arbitrary),
         };
         Ok(self.emit_expr(node, span))
     }
@@ -1803,7 +2046,6 @@ impl<'a> Parser<'a> {
         let span = self.emit_span(token);
         let node = match bits {
             FloatBits::Small(small) => Node::FloatSmall(small),
-            FloatBits::Arbitrary(arbitrary) => Node::FloatArbitrary(arbitrary),
         };
         Ok(self.emit_expr(node, span))
     }
@@ -1895,16 +2137,28 @@ impl<'a> Parser<'a> {
         Ok((range, span))
     }
 
+    fn try_identifier(&mut self) -> Option<Identifier> {
+        if let Some(token) = self.try_expect(Token::Identifier) {
+            Some(self.parse_identifier_token(token))
+        } else {
+            None
+        }
+    }
+
     /// Expects an identifier or `_`.
     fn identifier(&mut self) -> Result<Identifier> {
         let token = self.expect(Token::Identifier)?;
+        Ok(self.parse_identifier_token(token))
+    }
+
+    fn parse_identifier_token(&mut self, token: SpannedToken) -> Identifier {
         let span = self.emit_span(token);
         let source = &self.source[token.range()];
         if source == "_" {
-            return Ok(Identifier { text: None, span });
+            return Identifier { text: None, span };
         }
         let text = Some(Text::new(self.db, source));
-        Ok(Identifier { text, span })
+        Identifier { text, span }
     }
 }
 
@@ -2105,8 +2359,14 @@ impl<T: Copy, const N: usize> LookupTable<T, N> {
     }
 }
 
-struct IntParser<const BASE: u32> {
-    value: u128,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IntegerBits {
+    Small(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FloatBits {
+    Small(FloatBits64),
 }
 
 struct IntError {

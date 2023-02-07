@@ -257,6 +257,7 @@ impl Label {
     }
 }
 
+#[allow(dead_code)]
 enum Style {
     Default,
     Red,

@@ -103,22 +103,11 @@ pub struct TypeSpec {
     pub inner: TypeId,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct ConstSpec {
-    /// A sequence of names followed by a sequnece of expressions.
-    /// The expressions may be shared with other constants.
-    ///
-    /// The value of `iota` in these expressions can be inferred from its index in the declaration.
-    pub name_values: AssignRange,
-    /// The type of the declaration (or inferred from the value)
-    pub typ: Option<TypeId>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncDecl {
     pub name: Identifier,
     pub signature: Signature,
-    pub body: Option<StmtId>,
+    pub body: Option<StmtRange>,
 }
 
 /// Points to a sequence of nodes representing the parameters of a function.
@@ -338,15 +327,12 @@ pub enum Node {
     // === Expressions === //
     /// An integer literal.
     IntegerSmall(u64),
-    IntegerArbitrary(()),
 
     /// A floating point literal.
     FloatSmall(FloatBits64),
-    FloatArbitrary(()),
 
     /// The imaginary part of a complex number.
     ImaginarySmall(FloatBits64),
-    ImaginaryArbitrary(()),
 
     /// A character literal.
     Rune(char),
@@ -375,7 +361,7 @@ pub enum Node {
     Binary(ExprId, BinaryOperator, ExprId),
 
     /// A function literal with a body
-    Function(Signature, StmtId),
+    Function(Signature, StmtRange),
 
     /// Index into a container
     Index(ExprId, ExprId),
@@ -442,11 +428,9 @@ pub enum Node {
     Continue(Option<Identifier>),
     /// Transfer control flow to the given label
     Goto(Identifier),
-    /// Continue on the next branch on the switch statement
-    Fallthrough,
 
     /// `if <init?>; <expr> { ... } else ...` with an optional `init`-statement and `else`-branch.
-    If(Option<StmtId>, ExprId, StmtRange, Option<StmtId>),
+    If(Option<StmtId>, ExprId, StmtRange, Option<Else>),
 
     /// Wait until one of the given branches succeeds.
     Select(NodeRange),
@@ -460,6 +444,8 @@ pub enum Node {
     Switch(Option<StmtId>, Option<ExprId>, StmtRange),
     /// Matches the value of the expression. A missing expression is the `default` case.
     SwitchCase(Option<ExprId>, StmtRange),
+    /// Continue on the next branch on the switch statement
+    Fallthrough,
 
     /// `for <init?> ; <condition?> ; <post?> {...}`
     For(Option<StmtId>, Option<ExprId>, Option<StmtId>, StmtRange),
@@ -471,6 +457,12 @@ const _: () = assert!(
     std::mem::size_of::<Node>() <= 16,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Else {
+    If(StmtId),
+    Block(StmtRange),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ForRangeBinding {
@@ -500,52 +492,6 @@ pub enum ChannelKind {
 /// Marks that the last call argument should be used as the variadic arguments
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArgumentSpread {}
-
-/// Stores two contiguous ranges of the same length. Used by assignment and declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AssignRange {
-    /// The index of the first range.
-    start: NonMaxU16,
-    /// The length of each half (ie. the total length is twice this value).
-    half_length: NonMaxU16,
-}
-
-impl AssignRange {
-    fn from_full(nodes: NodeRange) -> Self {
-        assert!(nodes.length.get() % 2 == 0);
-        let half = nodes.length.get() / 2;
-        Self {
-            start: nodes.start,
-            half_length: NonMaxU16::new(half).unwrap(),
-        }
-    }
-
-    pub fn bindings(self) -> ExprRange {
-        ExprRange::new(NodeRange {
-            start: self.start,
-            length: self.half_length,
-        })
-    }
-
-    pub fn values(self) -> ExprRange {
-        ExprRange::new(NodeRange {
-            start: NonMaxU16::new(self.start.get() + self.half_length.get()).unwrap(),
-            length: self.half_length,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum IntegerBits {
-    Small(u64),
-    Arbitrary(()),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum FloatBits {
-    Small(FloatBits64),
-    Arbitrary(()),
-}
 
 /// A float representable using an `f64`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -180,6 +180,9 @@ pub struct Variadic {}
 /// Contains information about all expressions and types in a declaration
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeStorage {
+    /// For each node, its location in the source file
+    pub spans: KeyList<NodeId, SpanId>,
+
     /// For each node, its kind
     pub kinds: KeyList<NodeId, Node>,
 
@@ -191,9 +194,6 @@ pub struct NodeStorage {
 
     /// All string literals refer to a range of bytes in this allocation.
     pub string_buffer: Box<BStr>,
-
-    /// For each node, its location in the source file
-    pub spans: KeyList<NodeId, SpanId>,
 }
 
 /// References a node in the current declaration.
@@ -332,7 +332,7 @@ pub enum Node {
     FloatSmall(FloatBits64),
 
     /// The imaginary part of a complex number.
-    ImaginarySmall(FloatBits64),
+    Imaginary(()),
 
     /// A character literal.
     Rune(char),
@@ -352,7 +352,8 @@ pub enum Node {
     CompositeKey(ExprId, ExprId),
 
     /// Asserts that the expression is of the given type.
-    TypeAssertion(ExprId, TypeId),
+    /// If `None` the type is the keyword `type`, which is only valid inside a type-switch.
+    TypeAssertion(ExprId, Option<TypeId>),
 
     /// A unary/prefix operator (eg. `!true`)
     Unary(UnaryOperator, ExprId),
@@ -381,12 +382,12 @@ pub enum Node {
     /// A list of `TypeDef`s and `TypeAlias`es
     TypeList(NodeRange),
 
-    /// A single const-declaration
+    /// A single const-declaration: `const a, b, c int = 1, 2, 3`
     ConstDecl(NodeRange, Option<TypeId>, ExprRange),
     /// A sequence of `ConstDecl`s
     ConstList(NodeRange),
 
-    /// A single var-declaration
+    /// A single var-declaration: `var a, b, c int = 1, 2, 3`
     VarDecl(NodeRange, Option<TypeId>, Option<ExprRange>),
     /// A sequence of `VarDecl`s
     VarList(NodeRange),
@@ -413,7 +414,7 @@ pub enum Node {
     Decrement(ExprId),
 
     /// Send a value on a channel: `channel <- value`
-    Send(ExprId, ExprId),
+    Send(SendStmt),
 
     /// Execute an function/method call on a new thread
     Go(ExprId),
@@ -434,17 +435,23 @@ pub enum Node {
 
     /// Wait until one of the given branches succeeds.
     Select(NodeRange),
-    /// Waits until the send/recv statement is ready, and then executes the given statements.
-    /// If there's no send/recv statement, this is a default case.
-    SelectCase(Option<StmtId>, StmtRange),
-    /// Binds the values on the left to the result of waiting on the channel
-    SelectRecv(ExprRange, AssignOrDefine, ExprId),
+    /// Waits until the `Send` statement succeeds, and then executes the given statements.
+    SelectSend(SendStmt, Block),
+    /// Binds the values on the left to the result of waiting on the channel on the right.
+    SelectRecv(Option<RecvBindings>, Option<AssignOrDefine>, ExprId, Block),
+    /// Case which is taken if all other cases fail.
+    SelectDefault(Block),
 
-    /// Choose one of the listed cases that match the expression
-    Switch(Option<StmtId>, Option<ExprId>, StmtRange),
-    /// Matches the value of the expression. A missing expression is the `default` case.
-    SwitchCase(Option<ExprId>, StmtRange),
-    /// Continue on the next branch on the switch statement
+    /// Choose one of the listed cases that match the expression.
+    /// A missing expression is the same as `true`.
+    /// As a special exception, the expression may be a `TypeSwitch`.
+    Switch(Option<StmtId>, Option<ExprId>, NodeRange),
+    /// Switches over the type of the expression, optionally binding the value to `name`.
+    /// `<name?> := <expr>.(type)`
+    TypeSwitch(Option<Identifier>, ExprId),
+    /// Matches the value of the expression(s). A missing expression is the `default` case.
+    SwitchCase(Option<ExprRange>, Block),
+    /// Continue on the next branch on the switch statement (not applicable to type switches).
     Fallthrough,
 
     /// `for <init?> ; <condition?> ; <post?> {...}`
@@ -461,9 +468,15 @@ const _: () = assert!(
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Else {
-    If(StmtId),
-    Block(StmtRange),
+pub struct SendStmt {
+    pub channel: ExprId,
+    pub value: ExprId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecvBindings {
+    pub value: ExprId,
+    pub success: Option<ExprId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

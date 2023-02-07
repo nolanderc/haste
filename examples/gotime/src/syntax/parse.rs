@@ -167,6 +167,12 @@ impl Data {
     fn node(&self, node: NodeId) -> Node {
         self.node.kinds[node.index() - self.base.nodes]
     }
+
+    fn set_node(&mut self, node: NodeId, kind: Node, span: SpanId) {
+        let index = node.index() - self.base.nodes;
+        self.node.kinds[index] = kind;
+        self.node.spans[index] = span;
+    }
 }
 
 trait Spanned {
@@ -1234,7 +1240,7 @@ impl<'a> Parser<'a> {
     }
 
     fn try_statement(&mut self, labels: &mut LabelList) -> Result<Option<StmtId>> {
-        static STATEMENTS: LookupTable<ParseFn<StmtId>, 14> = LookupTable::new([
+        static STATEMENTS: LookupTable<ParseFn<StmtId>, 15> = LookupTable::new([
             (Token::LCurly, |this| this.block()),
             (Token::Return, |this| this.return_statement()),
             (Token::If, |this| this.if_statement()),
@@ -1298,6 +1304,17 @@ impl<'a> Parser<'a> {
                 }
                 _ => unreachable!(),
             }),
+            (Token::Fallthrough, |this| {
+                let token = this.expect(Token::Fallthrough)?;
+                this.emit(
+                    Diagnostic::error(
+                        "`fallthrough` only allowed as the last statement in a `switch` case",
+                    )
+                    .label(this.get_span(token), ""),
+                );
+                let span = this.emit_span(token);
+                Ok(this.emit_stmt(Node::Fallthrough, span))
+            }),
         ]);
 
         if let Some(stmt) = self.try_branch(&STATEMENTS)? {
@@ -1351,8 +1368,14 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_block(&mut self) -> Result<(Block, FileRange)> {
-        let start = self.expect(Token::LCurly)?.file_range();
+        let start = self.expect(Token::LCurly)?;
+        let block = self.statement_list()?;
+        let end = self.expect(Token::RCurly)?;
+        let range = self.join(start, end);
+        Ok((block, range))
+    }
 
+    fn statement_list(&mut self) -> Result<Block> {
         let mut labels = SmallVec::<[NodeId; 8]>::new();
         let statements = self.multi(|this| {
             loop {
@@ -1373,14 +1396,10 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
-        let block = Block {
+        Ok(Block {
             statements: StmtRange::new(statements),
             labels,
-        };
-
-        let end = self.expect(Token::RCurly)?.file_range();
-        let range = self.join(start, end);
-        Ok((block, range))
+        })
     }
 
     fn return_statement(&mut self) -> Result<StmtId> {
@@ -1473,11 +1492,214 @@ impl<'a> Parser<'a> {
     }
 
     fn switch_statement(&mut self) -> Result<StmtId> {
-        todo!("parse switch statement")
+        let switch_token = self.expect(Token::Switch)?;
+
+        let mut init = None;
+        let mut condition = None;
+
+        match self.maybe_type_switch()? {
+            None => {
+                if self.eat(Token::SemiColon) {
+                    condition = self.switch_condition()?
+                }
+            }
+            Some(MaybeTypeSwitch::TypeSwitch(expr)) => condition = Some(expr),
+            Some(MaybeTypeSwitch::Stmt(stmt)) => {
+                init = Some(stmt);
+                self.expect(Token::SemiColon)?;
+                condition = self.switch_condition()?
+            }
+            Some(MaybeTypeSwitch::Expr(expr)) => {
+                if let Some(simple) = self.try_simple_statement(expr)? {
+                    if self.eat(Token::SemiColon) {
+                        init = Some(simple);
+                        condition = self.switch_condition()?;
+                    } else {
+                        return Err(self.emit(
+                            Diagnostic::error("unexpected statement in `switch`")
+                                .label(self.get_span(simple), "expected an expression"),
+                        ));
+                    }
+                } else {
+                    condition = Some(expr);
+                }
+            }
+        }
+
+        self.expect(Token::LCurly)?;
+        let cases = self.multi(|this| {
+            while let Some(case) = this.switch_case()? {
+                this.data.push_indirect(case);
+            }
+            Ok(())
+        })?;
+        let end = self.expect(Token::RCurly)?;
+
+        let span = self.emit_join(switch_token, end);
+        Ok(self.emit_stmt(Node::Switch(init, condition, cases), span))
+    }
+
+    fn switch_case(&mut self) -> Result<Option<NodeId>> {
+        if let Some(token) = self.try_expect(Token::Case) {
+            let exprs = self.multi(|this| loop {
+                if let Some(expr) = this.try_expression()? {
+                    this.data.push_indirect(expr.node);
+                }
+                if !this.eat(Token::Comma) {
+                    break Ok(());
+                }
+            })?;
+            let colon = self.expect(Token::Colon)?;
+            let block = self.statement_list()?;
+            let span = self.emit_join(token, colon);
+            return Ok(Some(self.emit_node(
+                Node::SwitchCase(Some(ExprRange::new(exprs)), block),
+                span,
+            )));
+        }
+
+        if let Some(token) = self.try_expect(Token::Default) {
+            let colon = self.expect(Token::Colon)?;
+            let block = self.statement_list()?;
+            let span = self.emit_join(token, colon);
+            return Ok(Some(self.emit_node(Node::SwitchCase(None, block), span)));
+        }
+
+        Ok(None)
+    }
+
+    fn switch_condition(&mut self) -> Result<Option<ExprId>> {
+        if let Some(maybe) = self.maybe_type_switch()? {
+            match maybe {
+                MaybeTypeSwitch::Expr(expr) | MaybeTypeSwitch::TypeSwitch(expr) => Ok(Some(expr)),
+                MaybeTypeSwitch::Stmt(stmt) => {
+                    return Err(self.emit(
+                        Diagnostic::error("unexpected statement in `switch`")
+                            .label(self.get_span(stmt), "expected an expression"),
+                    ))
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn maybe_type_switch(&mut self) -> Result<Option<MaybeTypeSwitch>> {
+        let mut name = None;
+        if self.peek_is(Token::Identifier) && self.peek2_is(Token::Define) {
+            name = Some(self.identifier()?);
+            self.expect(Token::Define)?;
+        }
+
+        let expr = if name.is_some() {
+            self.pre_block_expression()?
+        } else if let Some(expr) = self.try_pre_block_expression()? {
+            expr
+        } else {
+            return Ok(None);
+        };
+
+        match self.data.node(expr.node) {
+            Node::TypeAssertion(inner, None) => {
+                let span = self.try_emit_join(expr, name);
+                self.data
+                    .set_node(expr.node, Node::TypeSwitch(name, inner), span);
+                Ok(Some(MaybeTypeSwitch::TypeSwitch(expr)))
+            }
+            _ if name.is_some() => {
+                let name = name.unwrap();
+                let names = self.multi(|this| {
+                    let name = this.emit_node(Node::Name(name.text), name.span);
+                    this.data.push_indirect(name);
+                    Ok(())
+                })?;
+                let values = self.multi(|this| Ok(this.data.push_indirect(expr.node)))?;
+                let span = self.emit_join(expr, name);
+                Ok(Some(MaybeTypeSwitch::Stmt(self.emit_stmt(
+                    Node::VarDecl(names, None, Some(ExprRange::new(values))),
+                    span,
+                ))))
+            }
+            _ => Ok(Some(MaybeTypeSwitch::Expr(expr))),
+        }
     }
 
     fn select_statement(&mut self) -> Result<StmtId> {
-        todo!("parse select statement")
+        let select_token = self.expect(Token::Select)?;
+        self.expect(Token::LCurly)?;
+        let cases = self.multi(|this| {
+            while let Some(case) = this.try_select_case()? {
+                this.data.push_indirect(case);
+            }
+            Ok(())
+        })?;
+        let end = self.expect(Token::RCurly)?;
+        let span = self.emit_join(select_token, end);
+        Ok(self.emit_stmt(Node::Select(cases), span))
+    }
+
+    fn try_select_case(&mut self) -> Result<Option<NodeId>> {
+        if let Some(token) = self.try_expect(Token::Case) {
+            let expr = self.expression()?;
+
+            enum Kind {
+                Send(SendStmt),
+                Recv(Option<RecvBindings>, Option<AssignOrDefine>, ExprId),
+            }
+
+            let kind = if self.eat(Token::LThinArrow) {
+                let channel = expr;
+                let value = self.expression()?;
+                Kind::Send(SendStmt { channel, value })
+            } else {
+                let value = expr;
+                let success = if self.eat(Token::Comma) {
+                    Some(self.expression()?)
+                } else {
+                    None
+                };
+
+                let assign_kind = match () {
+                    _ if self.eat(Token::Define) => Some(AssignOrDefine::Define),
+                    _ if self.eat(Token::Assign) => Some(AssignOrDefine::Assign),
+                    _ if success.is_some() => return Err(self.emit_unexpected_token()),
+                    _ => None,
+                };
+
+                let bindings;
+                let channel;
+
+                if assign_kind.is_none() {
+                    bindings = None;
+                    channel = value;
+                } else {
+                    bindings = Some(RecvBindings { value, success });
+                    channel = self.expression()?;
+                }
+
+                Kind::Recv(bindings, assign_kind, channel)
+            };
+
+            let colon = self.expect(Token::Colon)?;
+            let block = self.statement_list()?;
+            let span = self.emit_join(token, colon);
+            let node = match kind {
+                Kind::Send(send) => Node::SelectSend(send, block),
+                Kind::Recv(bindings, kind, channel) => {
+                    Node::SelectRecv(bindings, kind, channel, block)
+                }
+            };
+            return Ok(Some(self.emit_node(node, span)));
+        }
+
+        if let Some(token) = self.try_expect(Token::Default) {
+            let colon = self.expect(Token::Colon)?;
+            let block = self.statement_list()?;
+            let span = self.emit_join(token, colon);
+            return Ok(Some(self.emit_node(Node::SelectDefault(block), span)));
+        }
+
+        Ok(None)
     }
 
     fn for_statement(&mut self) -> Result<StmtId> {
@@ -1611,7 +1833,13 @@ impl<'a> Parser<'a> {
         if self.eat(Token::LThinArrow) {
             let message = self.expression()?;
             let span = self.emit_join(expr, message);
-            return Ok(Some(self.emit_stmt(Node::Send(expr, message), span)));
+            return Ok(Some(self.emit_stmt(
+                Node::Send(SendStmt {
+                    channel: expr,
+                    value: message,
+                }),
+                span,
+            )));
         }
 
         if let Some(op) = self.peek_assignment_operator() {
@@ -1826,9 +2054,13 @@ impl<'a> Parser<'a> {
             if self.eat(Token::Dot) {
                 if self.eat(Token::LParens) {
                     // type assertion: `x.(T)`
-                    let typ = self.typ()?;
-                    self.expect(Token::RParens)?;
-                    let span = self.emit_join(base, typ);
+                    let typ = if self.eat(Token::Type) {
+                        None
+                    } else {
+                        Some(self.typ()?)
+                    };
+                    let end = self.expect(Token::RParens)?;
+                    let span = self.emit_join(base, end);
                     base = self.emit_expr(Node::TypeAssertion(base, typ), span);
                     continue;
                 }
@@ -1954,7 +2186,7 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
-        let end = self.expect(Token::RParens)?.file_range();
+        let end = self.expect(Token::RParens)?;
         let span = self.emit_join(base, end);
         Ok(self.emit_expr(Node::Call(base, ExprRange::new(arguments), spread), span))
     }
@@ -1990,7 +2222,14 @@ impl<'a> Parser<'a> {
             (Token::FloatHex, |this, token| {
                 this.parse_float_expr::<16>(token)
             }),
-            (Token::Imaginary, |_this, _| todo!("parse imaginary number")),
+            (Token::Imaginary, |this, token| {
+                eprintln!(
+                    "TODO: parse imaginary number: {}",
+                    this.snippet(token.range())
+                );
+                let span = this.emit_span(token);
+                return Ok(this.emit_expr(Node::Imaginary(()), span));
+            }),
             (Token::String, |this, token| {
                 let (range, span) = this.parse_string_token(token)?;
                 return Ok(this.emit_expr(Node::String(range), span));
@@ -2524,4 +2763,10 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
     };
 
     Ok(bits)
+}
+
+enum MaybeTypeSwitch {
+    TypeSwitch(ExprId),
+    Stmt(StmtId),
+    Expr(ExprId),
 }

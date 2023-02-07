@@ -1,5 +1,6 @@
 #![feature(type_alias_impl_trait)]
 
+use std::io::Write;
 use std::path::PathBuf;
 
 pub use diagnostic::{Diagnostic, Result};
@@ -54,8 +55,12 @@ fn main() {
         match result {
             Ok(()) => {}
             Err(diagnostic) => {
-                let display = crate::util::display_fn(|f| scope.block_on(diagnostic.write(db, f)));
-                eprintln!("{}", display);
+                let mut string = String::with_capacity(4096);
+                scope.block_on(diagnostic.write(db, &mut string)).unwrap();
+                std::io::stderr()
+                    .lock()
+                    .write_all(string.as_bytes())
+                    .unwrap();
             }
         }
     });
@@ -71,7 +76,9 @@ async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let text = source_text(db, source_path).await.as_ref()?;
     let ast = syntax::parse(db, &text, source_path)?;
 
-    dbg!(db.fmt(ast));
+    std::io::BufWriter::new(std::io::stderr().lock())
+        .write_fmt(format_args!("{:#?}", db.fmt(ast)))
+        .unwrap();
 
     Ok(())
 }

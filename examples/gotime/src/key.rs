@@ -139,6 +139,10 @@ impl<K, T> KeySlice<K, T> {
     pub fn len(&self) -> usize {
         self.data.len()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.data.iter()
+    }
 }
 
 impl<K: KeyOps, T> KeySlice<K, T> {

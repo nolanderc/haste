@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Text {
     id: haste::Id,
@@ -29,7 +27,7 @@ impl Text {
         haste::DatabaseExt::lookup(db, self)
     }
 
-    pub fn display(self, db: &dyn crate::Db) -> impl Debug + '_ {
+    pub fn display(self, db: &dyn crate::Db) -> impl std::fmt::Display + '_ {
         crate::util::display_fn(move |f| f.write_str(self.get(db)))
     }
 }
@@ -40,7 +38,19 @@ impl std::fmt::Debug for Text {
             if let Some(db) = db {
                 haste::DatabaseExt::lookup(db, *self).fmt(f)
             } else {
-                write!(f, "Text({:?})", self.id)
+                write!(f, "Text#{:?}", self.id)
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        haste::fmt::with_storage::<crate::Storage>(|db| {
+            if let Some(db) = db {
+                haste::DatabaseExt::lookup(db, *self).fmt(f)
+            } else {
+                write!(f, "Text#{:?}", self.id)
             }
         })
     }

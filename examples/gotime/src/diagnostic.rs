@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use haste::DatabaseExt;
 use smallvec::SmallVec;
 
 use crate::{
@@ -365,7 +366,7 @@ impl Diagnostic {
                 .as_str();
             let line_starts = line_starts(db, source).await.as_ref().unwrap().as_slice();
 
-            let display_path = source.display(db).to_string();
+            let display_path = db.fmt(source).to_string();
 
             infos.insert(
                 source,

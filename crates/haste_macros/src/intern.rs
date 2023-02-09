@@ -199,14 +199,27 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
             }
         }
 
-        impl std::fmt::Debug for #ident {
+        impl std::fmt::Debug for #ident where #data_ident: std::fmt::Debug {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 haste::fmt::with_storage::<#storage_path>(|db| {
                     if let Some(db) = db {
                         let value = haste::DatabaseExt::lookup(db, *self);
                         std::fmt::Debug::fmt(value, f)
                     } else {
-                        write!(f, concat!(#ident_text, "({:?})"), self.0)
+                        write!(f, concat!(#ident_text, "#{:?}"), self.0)
+                    }
+                })
+            }
+        }
+
+        impl std::fmt::Display for #ident where #data_ident: std::fmt::Display {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                haste::fmt::with_storage::<#storage_path>(|db| {
+                    if let Some(db) = db {
+                        let value = haste::DatabaseExt::lookup(db, *self);
+                        std::fmt::Display::fmt(value, f)
+                    } else {
+                        write!(f, concat!(#ident_text, "#{:?}"), self.0)
                     }
                 })
             }

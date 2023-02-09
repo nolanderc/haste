@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::PathBuf};
+use std::path::PathBuf;
 
 use crate::{Diagnostic, Result};
 
@@ -19,13 +19,13 @@ impl SourcePathData {
     }
 }
 
-impl SourcePath {
-    pub fn display(self, db: &dyn crate::Db) -> impl Display + '_ {
-        crate::util::display_fn(move |f| match self.get(db) {
+impl std::fmt::Display for SourcePathData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             SourcePathData::Absolute(path) | SourcePathData::Relative(path) => {
                 write!(f, "{}", path.display())
             }
-        })
+        }
     }
 }
 
@@ -44,9 +44,9 @@ pub async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<String>
         Err(error) => {
             let message = match error.kind() {
                 std::io::ErrorKind::NotFound => {
-                    format!("could not find file `{}`", path.display(db))
+                    format!("could not find file `{}`", path)
                 }
-                _ => format!("could not open file `{}`: {}", path.display(db), error),
+                _ => format!("could not open file `{}`: {}", path, error),
             };
             Err(Diagnostic::error(message))
         }

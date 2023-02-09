@@ -1,4 +1,5 @@
 mod parse;
+mod print;
 
 pub use self::parse::parse;
 
@@ -78,19 +79,10 @@ pub struct Decl {
 pub enum DeclKind {
     /// Points to either `TypeDef` or `TypeAlias`
     Type(NodeId),
-    /// Indirectly points to a sequence of `TypeDef` or `TypeAlias`
-    TypeList(NodeRange),
-
     /// Points to a `ConstDecl`
     Const(NodeId),
-    /// Indirectly points to a sequence of `ConstDecl`
-    ConstList(NodeRange),
-
     /// Points to a `VarDecl`
     Var(NodeId),
-    /// Indirectly points to a sequence of `VarDecl`
-    VarList(NodeRange),
-
     /// A function
     Function(FuncDecl),
     /// A function, but its first parameter is the receiver
@@ -168,7 +160,7 @@ impl Signature {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Parameter {
     /// The name of the parameter
-    pub name: Option<Text>,
+    pub name: Option<Identifier>,
     /// The type of the parameter. The same `TypeId` may be reused for multiple parameters.
     pub typ: TypeId,
 }
@@ -194,6 +186,19 @@ pub struct NodeStorage {
 
     /// All string literals refer to a range of bytes in this allocation.
     pub string_buffer: Box<BStr>,
+}
+
+impl NodeStorage {
+    pub fn indirect(&self, range: NodeRange) -> &[NodeId] {
+        &self.indirect[range.indices()]
+    }
+
+    pub fn parameter(&self, node: NodeId) -> Parameter {
+        match self.kinds[node] {
+            Node::Parameter(parameter) => parameter,
+            kind => unreachable!("expected a parameter but found {kind:?}"),
+        }
+    }
 }
 
 /// References a node in the current declaration.
@@ -226,6 +231,18 @@ impl crate::key::KeyOps for NodeId {
 pub struct NodeRange {
     pub start: NonMaxU16,
     pub length: NonMaxU16,
+}
+
+impl NodeRange {
+    fn indices(self) -> std::ops::Range<usize> {
+        let start = self.start.get() as usize;
+        let end = start + self.length.get() as usize;
+        start..end
+    }
+
+    fn is_empty(&self) -> bool {
+        self.length.get() == 0
+    }
 }
 
 impl std::fmt::Debug for NodeRange {
@@ -303,8 +320,12 @@ pub enum Node {
     /// Pointer to some type.
     Pointer(TypeId),
 
-    /// An array/slice of the given type, possibly with a fixed size
+    /// An array of the given type, if no size is given, it is inferred from the composite literal
+    /// it is used to initialize.
     Array(Option<ExprId>, TypeId),
+
+    /// A slice of dynamic size
+    Slice(TypeId),
 
     /// An map from the key type to the element type
     Map(TypeId, TypeId),
@@ -319,6 +340,8 @@ pub enum Node {
     Struct(NodeRange),
     /// `<name> <type> <tag?>`
     Field(Identifier, TypeId, Option<ExprId>),
+    /// `<name> <tag?>`
+    EmbeddedField(Identifier, TypeId, Option<ExprId>),
 
     /// A list of methods and types
     Interface(NodeRange),
@@ -345,11 +368,9 @@ pub enum Node {
 
     /// Initializes a composite type (eg. array, struct, map) using the given values.
     /// The values may either be expressions, `CompositeLiteral` or `CompositeKey`.
-    Composite(TypeId, NodeRange),
+    Composite(TypeId, CompositeRange),
     /// A sequence of expressions or `CompositeKey`. Only allowed within a `Composite`.
-    CompositeLiteral(NodeRange),
-    /// A key-value pair in a composite initializer. Only allowed within a `Composite`.
-    CompositeKey(ExprId, ExprId),
+    CompositeLiteral(CompositeRange),
 
     /// Asserts that the expression is of the given type.
     /// If `None` the type is the keyword `type`, which is only valid inside a type-switch.
@@ -368,7 +389,7 @@ pub enum Node {
     Index(ExprId, ExprId),
 
     /// Slice start and end: `arr[ <start?> : <end?> ]`
-    Slice(ExprId, Option<ExprId>, Option<ExprId>),
+    SliceIndex(ExprId, Option<ExprId>, Option<ExprId>),
     /// Slice start, end and capacity: `arr[ <start?> : <end> : <cap> ]`
     ///
     /// The start index is optional and implicitly `0`.
@@ -466,6 +487,14 @@ const _: () = assert!(
     std::mem::size_of::<Node>() <= 16,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompositeRange {
+    /// A list of values
+    Value(ExprRange),
+    /// A list of interleaved key-value pairs
+    KeyValue(ExprRange),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SendStmt {

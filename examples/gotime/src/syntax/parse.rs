@@ -1,7 +1,7 @@
 use std::{borrow::Cow, ops::Range};
 
 use bstr::{BString, ByteSlice, ByteVec};
-use haste::non_max::NonMaxU32;
+use haste::{non_max::NonMaxU32, DatabaseExt};
 use smallvec::SmallVec;
 
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
 use super::*;
 
 pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Result<File> {
-    eprintln!("{}", crate::util::TextBox::new(path.display(db), source));
+    eprintln!("{}", crate::util::TextBox::new(db.fmt(path), source));
 
     let tokens = crate::token::tokenize(source);
 
@@ -85,9 +85,6 @@ struct Data {
 
     /// Stores syntax nodes for declarations
     node: NodeData,
-
-    /// a stack of identifiers when parsing identifier lists (in assignments and parameter lists)
-    identifiers: Vec<Identifier>,
 
     /// When producing declarations that index into any of the lists in this struct, those indices
     /// should be relative to the ones in this struct so that they become position independent.
@@ -165,7 +162,7 @@ impl Data {
     }
 
     fn node(&self, node: NodeId) -> Node {
-        self.node.kinds[node.index() - self.base.nodes]
+        self.node.kinds[self.base.nodes..][node.index()]
     }
 
     fn set_node(&mut self, node: NodeId, kind: Node, span: SpanId) {
@@ -386,7 +383,7 @@ impl<'a> Parser<'a> {
             None => format!("unexpected end of file"),
         };
 
-        let range = self.unexpected_range();
+        let range = dbg!(self.unexpected_range());
         let span = Span::new(self.path, range);
 
         Diagnostic::error(message).label(span, format!("expected {expected}"))
@@ -553,6 +550,12 @@ impl<'a> Parser<'a> {
     fn package(&mut self) -> Result<Identifier> {
         self.expect(Token::Package)?;
         let identifier = self.identifier()?;
+        if identifier.text.is_none() {
+            self.emit(
+                Diagnostic::error("package name must not be `_`")
+                    .label(self.get_span(identifier), ""),
+            );
+        }
         self.expect(Token::SemiColon)?;
         Ok(identifier)
     }
@@ -564,10 +567,12 @@ impl<'a> Parser<'a> {
             if self.eat(Token::LParens) {
                 while !self.eat(Token::RParens) {
                     imports.push(self.import()?);
+                    self.expect(Token::SemiColon)?;
                 }
             } else {
                 imports.push(self.import()?);
             }
+            self.expect(Token::SemiColon)?;
         }
 
         Ok(imports)
@@ -583,7 +588,6 @@ impl<'a> Parser<'a> {
         };
 
         let path = self.import_path()?;
-        self.expect(Token::SemiColon)?;
 
         Ok(Import { name, path })
     }
@@ -607,6 +611,7 @@ impl<'a> Parser<'a> {
         let mut declarations = Vec::new();
         while self.peek().is_some() {
             declarations.push(self.top_level_declaration()?);
+            self.expect(Token::SemiColon)?;
         }
         Ok(declarations)
     }
@@ -642,31 +647,39 @@ impl<'a> Parser<'a> {
     fn top_level_declaration(&mut self) -> Result<Decl> {
         self.wrap_decl(|this| match () {
             _ if this.peek_is(Token::Func) => this.func_declaration(),
-            _ if this.peek_is(Token::Type) => this.type_declaration(),
-            _ if this.peek_is(Token::Const) => this.const_declaration(),
-            _ if this.peek_is(Token::Var) => this.var_declaration(),
+            _ if this.peek_is(Token::Type) => this.type_declaration().map(DeclKind::Type),
+            _ if this.peek_is(Token::Const) => this.const_declaration().map(DeclKind::Const),
+            _ if this.peek_is(Token::Var) => this.var_declaration().map(DeclKind::Var),
             _ => Err(this.emit_unexpected_token()),
         })
     }
 
-    fn type_declaration(&mut self) -> Result<DeclKind> {
-        self.expect(Token::Type)?;
+    fn multi_declaration(
+        &mut self,
+        start: Token,
+        mut parse_spec: impl FnMut(&mut Self) -> Result<NodeId>,
+        make_list: fn(NodeRange) -> Node,
+    ) -> Result<NodeId> {
+        let start_token = self.expect(start)?;
         if self.eat(Token::LParens) {
             let specs = self.multi(|this| {
-                while !this.eat(Token::RParens) {
-                    let spec = this.type_spec()?;
+                while !this.peek_is(Token::RParens) {
+                    let spec = parse_spec(this)?;
                     this.data.push_indirect(spec);
                     this.expect(Token::SemiColon)?;
                 }
                 Ok(())
             })?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::TypeList(specs))
+            let close = self.expect(Token::RParens)?;
+            let span = self.emit_join(start_token, close);
+            Ok(self.emit_node(make_list(specs), span))
         } else {
-            let spec = self.type_spec()?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Type(spec))
+            parse_spec(self)
         }
+    }
+
+    fn type_declaration(&mut self) -> Result<NodeId> {
+        self.multi_declaration(Token::Type, Self::type_spec, Node::TypeList)
     }
 
     fn type_spec(&mut self) -> Result<NodeId> {
@@ -684,25 +697,13 @@ impl<'a> Parser<'a> {
         Ok(self.emit_node(node, span))
     }
 
-    fn const_declaration(&mut self) -> Result<DeclKind> {
-        self.expect(Token::Const)?;
-        if self.eat(Token::LParens) {
-            let specs = self.multi(|this| {
-                let mut previous = None;
-                while !this.eat(Token::RParens) {
-                    let spec = this.const_spec(&mut previous)?;
-                    this.data.push_indirect(spec);
-                    this.expect(Token::SemiColon)?;
-                }
-                Ok(())
-            })?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::ConstList(specs))
-        } else {
-            let spec = self.const_spec(&mut None)?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Const(spec))
-        }
+    fn const_declaration(&mut self) -> Result<NodeId> {
+        let mut previous = None;
+        self.multi_declaration(
+            Token::Const,
+            |this| this.const_spec(&mut previous),
+            Node::ConstList,
+        )
     }
 
     fn const_spec(&mut self, prev: &mut Option<ExprRange>) -> Result<NodeId> {
@@ -773,24 +774,8 @@ impl<'a> Parser<'a> {
         Ok(self.emit_node(Node::ConstDecl(names, typ, values), span))
     }
 
-    fn var_declaration(&mut self) -> Result<DeclKind> {
-        self.expect(Token::Var)?;
-        if self.eat(Token::LParens) {
-            let specs = self.multi(|this| {
-                while !this.eat(Token::RParens) {
-                    let spec = this.var_spec()?;
-                    this.data.push_indirect(spec);
-                    this.expect(Token::SemiColon)?;
-                }
-                Ok(())
-            })?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::VarList(specs))
-        } else {
-            let spec = self.var_spec()?;
-            self.expect(Token::SemiColon)?;
-            Ok(DeclKind::Var(spec))
-        }
+    fn var_declaration(&mut self) -> Result<NodeId> {
+        self.multi_declaration(Token::Var, Self::var_spec, Node::VarList)
     }
 
     fn var_spec(&mut self) -> Result<NodeId> {
@@ -826,20 +811,6 @@ impl<'a> Parser<'a> {
                 }
             })?;
 
-            if names.length != values.length {
-                self.emit(
-                    Diagnostic::error("the number of identifiers and expressions must match")
-                        .label(
-                            self.get_span(names),
-                            format!("found {} identifiers", names.length),
-                        )
-                        .label(
-                            self.get_span(values),
-                            format!("found {} expressions", values.length),
-                        ),
-                );
-            }
-
             Some(ExprRange::new(values))
         };
 
@@ -862,7 +833,6 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect(Token::SemiColon)?;
         let decl = FuncDecl {
             name,
             signature,
@@ -881,25 +851,26 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let name = self.identifier()?;
+        let mut name = self.try_identifier();
 
-        let pointer = self.try_expect(Token::Times);
-        let base_name = self.identifier()?;
-        let base_type = self.emit_type(Node::Name(base_name.text), base_name.span);
-
-        let typ = if let Some(pointer) = pointer {
+        let typ = if let Some(pointer) = self.try_expect(Token::Times) {
+            let base_name = self.identifier()?;
+            let base_type = self.emit_type(Node::Name(base_name.text), base_name.span);
             let span = self.emit_join(pointer, base_name.span);
             self.emit_type(Node::Pointer(base_type), span)
         } else {
-            base_type
+            let base_name = self
+                .try_identifier()
+                .or_else(|| name.take())
+                .ok_or_else(|| self.emit_unexpected_token())?;
+            self.emit_type(Node::Name(base_name.text), base_name.span)
         };
 
-        let parameter = Parameter {
-            name: name.text,
-            typ,
-        };
+        self.expect(Token::RParens)?;
 
-        let span = self.emit_join(name, typ);
+        let parameter = Parameter { name, typ };
+
+        let span = self.try_emit_join(typ, name);
         Ok(Some(self.emit_node(Node::Parameter(parameter), span)))
     }
 
@@ -930,7 +901,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn push_parameter(&mut self, name: Option<Text>, typ: TypeId, span: SpanId) {
+    fn push_parameter(&mut self, name: Option<Identifier>, typ: TypeId, span: SpanId) {
         let node = self.emit_node(Node::Parameter(Parameter { name, typ }), span);
         self.data.node.indirect_stack.push(node);
     }
@@ -942,8 +913,8 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        // Keep track of where the list of parameter names starts
-        let names_start = self.data.identifiers.len();
+        // Keep track of all identifiers we have seen so far in the parameter list.
+        let mut idents = SmallVec::<[Identifier; 8]>::new();
 
         // By default we assume that all parameters are types until proven wrong
         let mut all_types = true;
@@ -954,7 +925,7 @@ impl<'a> Parser<'a> {
         while self.peek_is(Token::Identifier) {
             if self.peek2_is(Token::Comma) {
                 let ident = self.identifier()?;
-                self.data.identifiers.push(ident);
+                idents.push(ident);
                 self.eat(Token::Comma);
                 continue;
             }
@@ -970,12 +941,10 @@ impl<'a> Parser<'a> {
 
         if all_types {
             // all the previous identifiers were types
-            for i in names_start..self.data.identifiers.len() {
-                let ident = self.data.identifiers[i];
+            for ident in idents.drain(..) {
                 let typ = self.emit_type(Node::Name(ident.text), ident.span);
                 self.push_parameter(None, typ, ident.span);
             }
-            self.data.identifiers.truncate(names_start);
         }
 
         // The type of the last argument may be prefixed by an ellipses `...` to signal that an
@@ -984,8 +953,7 @@ impl<'a> Parser<'a> {
 
         while !self.peek_is(Token::RParens) {
             if !all_types {
-                let ident = self.identifier()?;
-                self.data.identifiers.push(ident);
+                idents.push(self.identifier()?);
                 if self.peek_is(Token::Comma) {
                     continue;
                 }
@@ -1000,12 +968,10 @@ impl<'a> Parser<'a> {
             if all_types {
                 self.push_parameter(None, typ, self.node_span_id(typ.node));
             } else {
-                for index in names_start..self.data.identifiers.len() {
-                    let ident = self.data.identifiers[index];
+                for ident in idents.drain(..) {
                     let span = self.emit_join(ident, typ);
-                    self.push_parameter(ident.text, typ, span);
+                    self.push_parameter(Some(ident), typ, span);
                 }
-                self.data.identifiers.truncate(names_start);
             }
 
             if !self.eat(Token::Comma) {
@@ -1017,14 +983,12 @@ impl<'a> Parser<'a> {
             }
         }
 
-        if names_start < self.data.identifiers.len() {
-            let mut idents = self.data.identifiers[names_start..].iter();
+        if !idents.is_empty() {
+            let mut idents = idents.into_iter();
             let mut span = self.get_span(idents.next().unwrap().span);
             for ident in idents {
                 span = span.join(self.get_span(ident.span));
             }
-            self.data.identifiers.truncate(names_start);
-
             self.emit(Diagnostic::error("missing type on parameters").label(span, ""));
         }
 
@@ -1074,12 +1038,25 @@ impl<'a> Parser<'a> {
     }
 
     fn array_type(&mut self) -> Result<TypeId> {
+        enum Kind {
+            Dynamic,
+            Fixed(Option<ExprId>),
+        }
+
         let open = self.expect(Token::LBracket)?;
-        let length = self.try_expression()?;
-        let _close = self.expect(Token::RBracket)?;
+        let kind = if self.eat(Token::Ellipses) {
+            Kind::Dynamic
+        } else {
+            Kind::Fixed(self.try_expression()?)
+        };
+        self.expect(Token::RBracket)?;
         let inner = self.typ()?;
         let span = self.emit_join(open, inner);
-        Ok(self.emit_type(Node::Array(length, inner), span))
+        let node = match kind {
+            Kind::Dynamic => Node::Slice(inner),
+            Kind::Fixed(size) => Node::Array(size, inner),
+        };
+        Ok(self.emit_type(node, span))
     }
 
     pub fn map_type(&mut self) -> Result<TypeId> {
@@ -1136,29 +1113,33 @@ impl<'a> Parser<'a> {
 
     fn push_field_decls(&mut self) -> Result<()> {
         let pointer = self.try_expect(Token::Times);
-        let is_pointer = pointer.is_some();
+        let mut is_embedded = pointer.is_some();
 
         let mut idents = SmallVec::<[Identifier; 4]>::new();
         loop {
             idents.push(self.identifier()?);
-            if is_pointer || !self.eat(Token::Comma) {
+            if is_embedded || !self.eat(Token::Comma) {
                 break;
             }
         }
 
-        let inner = if is_pointer {
+        let inner = if is_embedded {
             // embedded fields already specify their type
             None
         } else if idents.len() == 1 {
             // we might have an embedded field
             self.try_type()?
         } else {
+            // we have multiple identifiers, so we require a type
             Some(self.typ()?)
         };
 
         let typ = match inner {
             Some(typ) => typ,
             None => {
+                assert_eq!(idents.len(), 1);
+                is_embedded = true;
+
                 // the name of the field is the type
                 let name = idents[0];
                 let mut typ = self.emit_type(Node::Name(name.text), name.span);
@@ -1175,7 +1156,14 @@ impl<'a> Parser<'a> {
         for ident in idents {
             let end_span = tag.map(|tag| tag.node).unwrap_or(typ.node);
             let span = self.emit_join(ident, end_span);
-            let field = self.emit_node(Node::Field(ident, typ, None), span);
+
+            let kind = if is_embedded {
+                Node::EmbeddedField(ident, typ, tag)
+            } else {
+                Node::Field(ident, typ, tag)
+            };
+
+            let field = self.emit_node(kind, span);
             self.data.push_indirect(field);
         }
 
@@ -1280,32 +1268,10 @@ impl<'a> Parser<'a> {
                 let span = this.emit_join(token, label);
                 Ok(this.emit_stmt(Node::Goto(label), span))
             }),
-            (Token::Type, |this| match this.type_declaration()? {
-                DeclKind::Type(node) => Ok(StmtId::new(node)),
-                DeclKind::TypeList(nodes) => {
-                    let span = this.emit_span(nodes);
-                    let node = this.emit_node(Node::TypeList(nodes), span);
-                    Ok(StmtId::new(node))
-                }
-                _ => unreachable!(),
-            }),
-            (Token::Var, |this| match this.var_declaration()? {
-                DeclKind::Var(node) => Ok(StmtId::new(node)),
-                DeclKind::VarList(nodes) => {
-                    let span = this.emit_span(nodes);
-                    let node = this.emit_node(Node::VarList(nodes), span);
-                    Ok(StmtId::new(node))
-                }
-                _ => unreachable!(),
-            }),
-            (Token::Const, |this| match this.const_declaration()? {
-                DeclKind::Const(node) => Ok(StmtId::new(node)),
-                DeclKind::ConstList(nodes) => {
-                    let span = this.emit_span(nodes);
-                    let node = this.emit_node(Node::ConstList(nodes), span);
-                    Ok(StmtId::new(node))
-                }
-                _ => unreachable!(),
+            (Token::Type, |this| this.type_declaration().map(StmtId::new)),
+            (Token::Var, |this| this.var_declaration().map(StmtId::new)),
+            (Token::Const, |this| {
+                this.const_declaration().map(StmtId::new)
             }),
             (Token::Fallthrough, |this| {
                 let token = this.expect(Token::Fallthrough)?;
@@ -1372,26 +1338,32 @@ impl<'a> Parser<'a> {
 
     fn statement_block(&mut self) -> Result<(Block, FileRange)> {
         let start = self.expect(Token::LCurly)?;
-        let block = self.statement_list()?;
+        let block = self.statement_list(false)?;
         let end = self.expect(Token::RCurly)?;
         let range = self.join(start, end);
         Ok((block, range))
     }
 
-    fn statement_list(&mut self) -> Result<Block> {
+    fn statement_list(&mut self, allow_fallthough: bool) -> Result<Block> {
         let mut labels = SmallVec::<[NodeId; 8]>::new();
-        let statements = self.multi(|this| {
-            loop {
-                if let Some(statement) = this.try_statement(&mut labels)? {
-                    this.data.push_indirect(statement.node);
-                }
-
-                if !this.eat(Token::SemiColon) {
-                    break;
+        let statements = self.multi(|this| loop {
+            if allow_fallthough {
+                if let Some(token) = this.try_expect(Token::Fallthrough) {
+                    let span = this.emit_span(token);
+                    let node = this.emit_node(Node::Fallthrough, span);
+                    this.data.push_indirect(node);
+                    this.eat(Token::SemiColon);
+                    break Ok(());
                 }
             }
 
-            Ok(())
+            if let Some(statement) = this.try_statement(&mut labels)? {
+                this.data.push_indirect(statement.node);
+            }
+
+            if !this.eat(Token::SemiColon) {
+                break Ok(());
+            }
         })?;
 
         let labels = self.multi(|this| {
@@ -1553,7 +1525,7 @@ impl<'a> Parser<'a> {
                 }
             })?;
             let colon = self.expect(Token::Colon)?;
-            let block = self.statement_list()?;
+            let block = self.statement_list(true)?;
             let span = self.emit_join(token, colon);
             return Ok(Some(self.emit_node(
                 Node::SwitchCase(Some(ExprRange::new(exprs)), block),
@@ -1563,7 +1535,7 @@ impl<'a> Parser<'a> {
 
         if let Some(token) = self.try_expect(Token::Default) {
             let colon = self.expect(Token::Colon)?;
-            let block = self.statement_list()?;
+            let block = self.statement_list(true)?;
             let span = self.emit_join(token, colon);
             return Ok(Some(self.emit_node(Node::SwitchCase(None, block), span)));
         }
@@ -1685,7 +1657,7 @@ impl<'a> Parser<'a> {
             };
 
             let colon = self.expect(Token::Colon)?;
-            let block = self.statement_list()?;
+            let block = self.statement_list(false)?;
             let span = self.emit_join(token, colon);
             let node = match kind {
                 Kind::Send(send) => Node::SelectSend(send, block),
@@ -1698,7 +1670,7 @@ impl<'a> Parser<'a> {
 
         if let Some(token) = self.try_expect(Token::Default) {
             let colon = self.expect(Token::Colon)?;
-            let block = self.statement_list()?;
+            let block = self.statement_list(false)?;
             let span = self.emit_join(token, colon);
             return Ok(Some(self.emit_node(Node::SelectDefault(block), span)));
         }
@@ -1880,20 +1852,6 @@ impl<'a> Parser<'a> {
                 break Ok(());
             }
         })?);
-
-        if names.length != values.nodes.length {
-            self.emit(
-                Diagnostic::error("the number of identifiers and expressions must match")
-                    .label(
-                        self.get_span(names),
-                        format!("found {} identifiers", names.length),
-                    )
-                    .label(
-                        self.get_span(values),
-                        format!("found {} expressions", values.nodes.length),
-                    ),
-            );
-        }
 
         let kind = if is_definition {
             Node::VarDecl(names, None, Some(values))
@@ -2085,10 +2043,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if !self.expects_block() && self.peek_is(Token::LCurly) {
-                // we don't allow parenthized types
-                if self.prev_token() != Some(Token::RParens) {
-                    base = self.composite_init(TypeId::new(base.node))?;
+            if self.peek_is(Token::LCurly) {
+                if let Some(next) = self.try_composite_init(base.node)? {
+                    base = next;
                     continue;
                 }
             }
@@ -2097,31 +2054,68 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn composite_init(&mut self, base: TypeId) -> Result<ExprId> {
+    fn try_composite_init(&mut self, base: NodeId) -> Result<Option<ExprId>> {
+        // we don't allow parenthized types
+        if self.prev_token() == Some(Token::RParens) {
+            return Ok(None);
+        }
+
+        match self.data.node(base) {
+            Node::Name(_) | Node::Selector(_, _) if !self.expects_block() => {}
+            Node::Struct(_) | Node::Map(_, _) | Node::Array(_, _) | Node::Slice(_) => {}
+            _ => return Ok(None),
+        }
+
         let (elements, range) = self.composite_literal()?;
         let span = self.emit_join(base, range);
-        Ok(self.emit_expr(Node::Composite(base, elements), span))
+        Ok(Some(self.emit_expr(
+            Node::Composite(TypeId::new(base), elements),
+            span,
+        )))
     }
 
-    fn composite_literal(&mut self) -> Result<(NodeRange, FileRange)> {
+    fn composite_literal(&mut self) -> Result<(CompositeRange, FileRange)> {
+        let mut first_key = None;
+        let mut first_raw = None;
+
         let start = self.expect(Token::LCurly)?;
         let elements = self.multi(|this| {
             while !this.peek_is(Token::RCurly) {
                 let key = this.composite_element()?;
+                this.data.push_indirect(key.node);
+
                 if this.eat(Token::Colon) {
                     let value = this.composite_element()?;
-                    let span = this.emit_join(key, value);
-                    let pair = this.emit_node(Node::CompositeKey(key, value), span);
-                    this.data.push_indirect(pair);
+                    this.data.push_indirect(value.node);
+                    first_key = first_key.or(Some((key, value)));
                 } else {
-                    this.data.push_indirect(key.node);
+                    first_raw = first_raw.or(Some(key));
+                }
+                if !this.eat(Token::Comma) {
+                    break;
                 }
             }
             Ok(())
         })?;
         let end = self.expect(Token::RCurly)?;
+        let range = self.join(start, end);
 
-        Ok((elements, self.join(start, end)))
+        let elements = match (first_key, first_raw) {
+            (Some((key, value)), Some(raw)) => {
+                self.emit(
+                    Diagnostic::error(
+                        "cannot mix elements with and without key in composite literal",
+                    )
+                    .label(self.get_span(raw), "has no key")
+                    .label(self.get_span(key).join(self.get_span(value)), "has a key"),
+                );
+                CompositeRange::Value(ExprRange::new(elements))
+            }
+            (Some(_), None) => CompositeRange::KeyValue(ExprRange::new(elements)),
+            _ => CompositeRange::Value(ExprRange::new(elements)),
+        };
+
+        Ok((elements, range))
     }
 
     /// In addition to accepting arbitrary expressions, it allows composite literals without
@@ -2159,7 +2153,7 @@ impl<'a> Parser<'a> {
             // `arr[ start? : end? ]`
             let bracket = self.expect(Token::RBracket)?;
             let span = self.emit_join(base, bracket);
-            return Ok(self.emit_expr(Node::Slice(base, start, end), span));
+            return Ok(self.emit_expr(Node::SliceIndex(base, start, end), span));
         }
 
         let index = start.ok_or_else(|| self.emit_expected("an expression"))?;
@@ -2360,7 +2354,7 @@ impl<'a> Parser<'a> {
 
         let start = self.data.string_position();
 
-        if contents.as_bytes().starts_with(b"`") {
+        if text.as_bytes()[0] == b'`' {
             // raw strings are already valid
             self.data.strings.push_str(contents);
         } else if let Err(error) = decode_string(contents, &mut self.data.strings) {

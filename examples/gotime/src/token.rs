@@ -219,6 +219,7 @@ fn needs_semicolon(last: Option<&SpannedToken>) -> bool {
     )
 }
 
+#[derive(Debug)]
 struct Whitespace {
     len: usize,
     newline: bool,

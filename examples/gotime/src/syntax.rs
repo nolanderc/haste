@@ -12,6 +12,7 @@ use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
     source::SourcePath,
     span::{FileRange, Span},
+    token::Token,
     Text,
 };
 
@@ -306,6 +307,14 @@ pub struct StringRange {
     pub length: NonMaxU32,
 }
 
+impl StringRange {
+    fn indices(self) -> std::ops::Range<usize> {
+        let start = self.start.get() as usize;
+        let end = start + self.length.get() as usize;
+        start..end
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Node {
     /// A generic name (or `_`) that could reference a type or variable depending on context.
@@ -355,7 +364,7 @@ pub enum Node {
     FloatSmall(FloatBits64),
 
     /// The imaginary part of a complex number.
-    Imaginary(()),
+    ImaginarySmall(FloatBits64),
 
     /// A character literal.
     Rune(char),
@@ -367,9 +376,9 @@ pub enum Node {
     Call(ExprId, ExprRange, Option<ArgumentSpread>),
 
     /// Initializes a composite type (eg. array, struct, map) using the given values.
-    /// The values may either be expressions, `CompositeLiteral` or `CompositeKey`.
+    /// The values may either be expressions or `CompositeLiteral`.
     Composite(TypeId, CompositeRange),
-    /// A sequence of expressions or `CompositeKey`. Only allowed within a `Composite`.
+    /// A sequence of expressions or `CompositeLiteral`. Only allowed within a `Composite`.
     CompositeLiteral(CompositeRange),
 
     /// Asserts that the expression is of the given type.
@@ -543,7 +552,13 @@ pub struct FloatBits64 {
 
 impl std::fmt::Debug for FloatBits64 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", f64::from_bits(self.bits))
+        write!(f, "{}", self.get())
+    }
+}
+
+impl FloatBits64 {
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.bits)
     }
 }
 
@@ -556,6 +571,34 @@ pub enum UnaryOperator {
     Deref,
     Ref,
     Recv,
+}
+
+impl UnaryOperator {
+    const TOKEN_MAPPING: [(Token, UnaryOperator); 7] = [
+        (Token::Plus, UnaryOperator::Plus),
+        (Token::Minus, UnaryOperator::Minus),
+        (Token::LogicalNot, UnaryOperator::Not),
+        (Token::Xor, UnaryOperator::Xor),
+        (Token::Times, UnaryOperator::Deref),
+        (Token::And, UnaryOperator::Ref),
+        (Token::LThinArrow, UnaryOperator::Recv),
+    ];
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < UnaryOperator::TOKEN_MAPPING.len() {
+        let (_, op) = UnaryOperator::TOKEN_MAPPING[i];
+        assert!(op as usize == i);
+        i += 1;
+    }
+};
+
+impl std::fmt::Display for UnaryOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (token, _op) = Self::TOKEN_MAPPING[*self as usize];
+        write!(f, "{}", token.display())
+    }
 }
 
 /// All binary operators, listed in order of ascending precedence
@@ -583,6 +626,46 @@ pub enum BinaryOperator {
     ShiftRight,
     BitAnd,
     BitNand,
+}
+
+impl BinaryOperator {
+    const TOKEN_MAPPING: [(Token, BinaryOperator); 19] = [
+        (Token::LogicalOr, BinaryOperator::LogicalOr),
+        (Token::LogicalAnd, BinaryOperator::LogicalAnd),
+        (Token::Equal, BinaryOperator::Equal),
+        (Token::NotEqual, BinaryOperator::NotEqual),
+        (Token::Less, BinaryOperator::Less),
+        (Token::LessEqual, BinaryOperator::LessEqual),
+        (Token::Greater, BinaryOperator::Greater),
+        (Token::GreaterEqual, BinaryOperator::GreaterEqual),
+        (Token::Plus, BinaryOperator::Add),
+        (Token::Minus, BinaryOperator::Sub),
+        (Token::Or, BinaryOperator::BitOr),
+        (Token::Xor, BinaryOperator::BitXor),
+        (Token::Times, BinaryOperator::Mul),
+        (Token::Div, BinaryOperator::Div),
+        (Token::Rem, BinaryOperator::Rem),
+        (Token::Shl, BinaryOperator::ShiftLeft),
+        (Token::Shr, BinaryOperator::ShiftRight),
+        (Token::And, BinaryOperator::BitAnd),
+        (Token::Nand, BinaryOperator::BitNand),
+    ];
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < UnaryOperator::TOKEN_MAPPING.len() {
+        let (_, op) = UnaryOperator::TOKEN_MAPPING[i];
+        assert!(op as usize == i);
+        i += 1;
+    }
+};
+
+impl std::fmt::Display for BinaryOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (token, _op) = Self::TOKEN_MAPPING[*self as usize];
+        write!(f, "{}", token.display())
+    }
 }
 
 impl BinaryOperator {

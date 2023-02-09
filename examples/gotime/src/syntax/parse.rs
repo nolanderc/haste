@@ -1045,9 +1045,11 @@ impl<'a> Parser<'a> {
 
         let open = self.expect(Token::LBracket)?;
         let kind = if self.eat(Token::Ellipses) {
-            Kind::Dynamic
+            Kind::Fixed(None)
+        } else if let Some(size) = self.try_expression()? {
+            Kind::Fixed(Some(size))
         } else {
-            Kind::Fixed(self.try_expression()?)
+            Kind::Dynamic
         };
         self.expect(Token::RBracket)?;
         let inner = self.typ()?;
@@ -1935,27 +1937,8 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_binary_op(&mut self) -> Option<BinaryOperator> {
-        static OPERATORS: LookupTable<BinaryOperator, 19> = LookupTable::new([
-            (Token::LogicalOr, BinaryOperator::LogicalOr),
-            (Token::LogicalAnd, BinaryOperator::LogicalAnd),
-            (Token::Equal, BinaryOperator::Equal),
-            (Token::NotEqual, BinaryOperator::NotEqual),
-            (Token::Less, BinaryOperator::Less),
-            (Token::LessEqual, BinaryOperator::LessEqual),
-            (Token::Greater, BinaryOperator::Greater),
-            (Token::GreaterEqual, BinaryOperator::GreaterEqual),
-            (Token::Plus, BinaryOperator::Add),
-            (Token::Minus, BinaryOperator::Sub),
-            (Token::Or, BinaryOperator::BitOr),
-            (Token::Xor, BinaryOperator::BitXor),
-            (Token::Times, BinaryOperator::Mul),
-            (Token::Div, BinaryOperator::Div),
-            (Token::Rem, BinaryOperator::Rem),
-            (Token::Shl, BinaryOperator::ShiftLeft),
-            (Token::Shr, BinaryOperator::ShiftRight),
-            (Token::And, BinaryOperator::BitAnd),
-            (Token::Nand, BinaryOperator::BitNand),
-        ]);
+        static OPERATORS: LookupTable<BinaryOperator, 19> =
+            LookupTable::new(BinaryOperator::TOKEN_MAPPING);
 
         self.expected.merge(OPERATORS.tokens);
         let next = self.peek()?;
@@ -1992,15 +1975,8 @@ impl<'a> Parser<'a> {
     }
 
     fn try_unary_op(&mut self) -> Option<(UnaryOperator, FileRange)> {
-        static OPERATORS: LookupTable<UnaryOperator, 7> = LookupTable::new([
-            (Token::Plus, UnaryOperator::Plus),
-            (Token::Minus, UnaryOperator::Minus),
-            (Token::LogicalNot, UnaryOperator::Not),
-            (Token::Xor, UnaryOperator::Xor),
-            (Token::Times, UnaryOperator::Deref),
-            (Token::And, UnaryOperator::Ref),
-            (Token::LThinArrow, UnaryOperator::Recv),
-        ]);
+        static OPERATORS: LookupTable<UnaryOperator, 7> =
+            LookupTable::new(UnaryOperator::TOKEN_MAPPING);
 
         self.expected.merge(OPERATORS.tokens);
         let next = self.peek()?;
@@ -2222,12 +2198,7 @@ impl<'a> Parser<'a> {
                 this.parse_float_expr::<16>(token)
             }),
             (Token::Imaginary, |this, token| {
-                eprintln!(
-                    "TODO: parse imaginary number: {}",
-                    this.snippet(token.range())
-                );
-                let span = this.emit_span(token);
-                Ok(this.emit_expr(Node::Imaginary(()), span))
+                this.parse_imaginary_expr(token)
             }),
             (Token::String, |this, token| {
                 let (range, span) = this.parse_string_token(token)?;
@@ -2307,6 +2278,28 @@ impl<'a> Parser<'a> {
             }
         } else {
             todo!("parse hex float: {:?}", text)
+        }
+    }
+
+    fn parse_imaginary_expr(&mut self, token: SpannedToken) -> Result<ExprId> {
+        let bits = self.parse_imaginary_token(token)?;
+        let span = self.emit_span(token);
+        let node = match bits {
+            FloatBits::Small(small) => Node::ImaginarySmall(small),
+        };
+        Ok(self.emit_expr(node, span))
+    }
+
+    fn parse_imaginary_token(&mut self, token: SpannedToken) -> Result<FloatBits> {
+        let text = &self.source[token.range()];
+        match text[..text.len() - 1].parse::<f64>() {
+            Ok(float) => Ok(FloatBits::Small(FloatBits64 {
+                bits: float.to_bits(),
+            })),
+            Err(error) => {
+                let span = Span::new(self.path, token.file_range());
+                Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
+            }
         }
     }
 

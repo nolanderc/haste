@@ -151,6 +151,11 @@ impl FuncDecl {
         write!(out, "{}", self.name)?;
         write_signature(out, nodes, &inputs[is_method as usize..], outputs)?;
 
+        if let Some(body) = self.body {
+            write!(out, " ")?;
+            write_block(out, nodes, body)?;
+        }
+
         Ok(())
     }
 }
@@ -190,6 +195,17 @@ fn write_signature(
     Ok(())
 }
 
+fn write_parameter(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    param: Parameter,
+) -> std::fmt::Result {
+    if let Some(name) = param.name {
+        write!(out, "{name} ")?;
+    }
+    write_node(out, nodes, param.typ.node)
+}
+
 fn write_list<W: Write, T>(
     out: &mut PrettyWriter<W>,
     items: impl IntoIterator<Item = T>,
@@ -205,140 +221,510 @@ fn write_list<W: Write, T>(
     Ok(())
 }
 
-fn write_parameter(
+fn write_node_list<W: Write>(
+    out: &mut PrettyWriter<W>,
+    nodes: &NodeStorage,
+    range: NodeRange,
+) -> std::fmt::Result {
+    let list = nodes.indirect(range);
+    write_list(out, list, |out, node| write_node(out, nodes, *node))
+}
+
+fn write_block(
     out: &mut PrettyWriter<impl Write>,
     nodes: &NodeStorage,
-    param: Parameter,
+    block: Block,
 ) -> std::fmt::Result {
-    if let Some(name) = param.name {
-        write!(out, "{name} ")?;
+    let statements = nodes.indirect(block.statements.nodes);
+    match statements {
+        [] => write!(out, "{{}}"),
+        _ => {
+            writeln!(out, "{{")?;
+            out.indented(|out| {
+                for statement in statements {
+                    write_node(out, nodes, *statement)?;
+                    writeln!(out)?;
+                }
+                Ok(())
+            })?;
+            write!(out, "}}")?;
+            Ok(())
+        }
     }
-    write_node(out, nodes, param.typ.node)
+}
+
+fn write_case_statements(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    block: Block,
+) -> std::fmt::Result {
+    let statements = nodes.indirect(block.statements.nodes);
+    match statements {
+        [] => Ok(()),
+        [single] => {
+            write!(out, " ")?;
+            write_node(out, nodes, *single)?;
+            Ok(())
+        }
+        _ => {
+            out.indented(|out| {
+                for statement in statements {
+                    writeln!(out)?;
+                    write_node(out, nodes, *statement)?;
+                }
+                writeln!(out)?;
+                Ok(())
+            })?;
+            Ok(())
+        }
+    }
 }
 
 fn write_node(
     out: &mut PrettyWriter<impl Write>,
     nodes: &NodeStorage,
-    node: NodeId,
+    mut node: NodeId,
 ) -> std::fmt::Result {
-    match nodes.kinds[node] {
-        Node::Name(None) => write!(out, "_"),
-        Node::Name(Some(name)) => write!(out, "{name}"),
+    loop {
+        break match nodes.kinds[node] {
+            Node::Name(None) => write!(out, "_"),
+            Node::Name(Some(name)) => write!(out, "{name}"),
 
-        Node::Selector(node, name) => {
-            write_node(out, nodes, node)?;
-            write!(out, ".{name}")
-        }
+            Node::Selector(node, name) => {
+                write_node(out, nodes, node)?;
+                write!(out, ".{name}")
+            }
 
-        Node::Pointer(inner) => {
-            write!(out, "*")?;
-            write_node(out, nodes, inner.node)
-        }
+            Node::Pointer(inner) => {
+                write!(out, "*")?;
+                node = inner.node;
+                continue;
+            }
 
-        Node::FunctionType(signature) => {
-            let inputs = nodes.indirect(signature.inputs());
-            let outputs = nodes.indirect(signature.outputs());
-            write!(out, "func")?;
-            write_signature(out, nodes, inputs, outputs)
-        }
+            Node::FunctionType(signature) => {
+                let inputs = nodes.indirect(signature.inputs());
+                let outputs = nodes.indirect(signature.outputs());
+                write!(out, "func")?;
+                write_signature(out, nodes, inputs, outputs)
+            }
 
-        Node::TypeDef(spec) => {
-            write!(out, "type {} ", spec.name)?;
-            write_node(out, nodes, spec.inner.node)
-        }
-        Node::TypeAlias(spec) => {
-            write!(out, "type {} = ", spec.name)?;
-            write_node(out, nodes, spec.inner.node)
-        }
-        Node::TypeList(list) => {
-            writeln!(out, "type (")?;
-            out.indented(|out| {
-                for &item in nodes.indirect(list) {
-                    match nodes.kinds[item] {
-                        Node::TypeDef(spec) => {
-                            write!(out, "{} ", spec.name)?;
-                            write_node(out, nodes, spec.inner.node)?;
+            Node::TypeDef(spec) => {
+                write!(out, "type ")?;
+                write_type_spec(out, nodes, spec, false)
+            }
+            Node::TypeAlias(spec) => {
+                write!(out, "type ")?;
+                write_type_spec(out, nodes, spec, true)
+            }
+            Node::TypeList(list) => {
+                writeln!(out, "type (")?;
+                out.indented(|out| {
+                    for &item in nodes.indirect(list) {
+                        match nodes.kinds[item] {
+                            Node::TypeDef(spec) => write_type_spec(out, nodes, spec, false)?,
+                            Node::TypeAlias(spec) => write_type_spec(out, nodes, spec, true)?,
+                            _ => unreachable!(),
                         }
-                        Node::TypeAlias(spec) => {
-                            write!(out, "{} = ", spec.name)?;
-                            write_node(out, nodes, spec.inner.node)?;
-                        }
-                        _ => unreachable!(),
+                        writeln!(out)?;
                     }
-                    writeln!(out)?;
-                }
+                    Ok(())
+                })?;
+                write!(out, ")")?;
                 Ok(())
-            })?;
-            writeln!(out, ")")?;
-            Ok(())
-        }
-
-        Node::Interface(elements) => {
-            write!(out, "interface {{")?;
-            out.indented(|out| {
-                for &element in nodes.indirect(elements) {
-                    writeln!(out)?;
-                    write_node(out, nodes, element)?;
-                }
-                Ok(())
-            })?;
-            if !elements.is_empty() {
-                writeln!(out)?;
             }
-            write!(out, "}}")?;
-            Ok(())
-        }
-        Node::MethodElement(name, signature) => {
-            let inputs = nodes.indirect(signature.inputs());
-            let outputs = nodes.indirect(signature.outputs());
-            write!(out, "{name}")?;
-            write_signature(out, nodes, inputs, outputs)
-        }
 
-        Node::Struct(fields) => {
-            write!(out, "struct {{")?;
-            out.indented(|out| {
-                for &field in nodes.indirect(fields) {
+            Node::ConstDecl(names, typ, values) => {
+                write!(out, "const ")?;
+                write_const_spec(out, nodes, names, typ, values, None)
+            }
+            Node::ConstList(list) => {
+                writeln!(out, "const (")?;
+                out.indented(|out| {
+                    let mut previous = None;
+                    for &item in nodes.indirect(list) {
+                        let Node::ConstDecl(names, typ, values) = nodes.kinds[item] else {
+                        unreachable!()
+                    };
+                        write_const_spec(out, nodes, names, typ, values, previous)?;
+                        previous = Some(values);
+                        writeln!(out)?;
+                    }
+                    Ok(())
+                })?;
+                write!(out, ")")?;
+                Ok(())
+            }
+
+            Node::VarDecl(names, typ, values) => {
+                write!(out, "var ")?;
+                write_var_spec(out, nodes, names, typ, values)
+            }
+            Node::VarList(list) => {
+                writeln!(out, "const (")?;
+                out.indented(|out| {
+                    for &item in nodes.indirect(list) {
+                        let Node::VarDecl(names, typ, values) = nodes.kinds[item] else {
+                        unreachable!()
+                    };
+                        write_var_spec(out, nodes, names, typ, values)?;
+                        writeln!(out)?;
+                    }
+                    Ok(())
+                })?;
+                write!(out, ")")?;
+                Ok(())
+            }
+
+            Node::Interface(elements) => {
+                write!(out, "interface {{")?;
+                out.indented(|out| {
+                    for &element in nodes.indirect(elements) {
+                        writeln!(out)?;
+                        write_node(out, nodes, element)?;
+                    }
+                    Ok(())
+                })?;
+                if !elements.is_empty() {
                     writeln!(out)?;
-                    write_node(out, nodes, field)?;
+                }
+                write!(out, "}}")?;
+                Ok(())
+            }
+            Node::MethodElement(name, signature) => {
+                let inputs = nodes.indirect(signature.inputs());
+                let outputs = nodes.indirect(signature.outputs());
+                write!(out, "{name}")?;
+                write_signature(out, nodes, inputs, outputs)
+            }
+
+            Node::Struct(fields) => {
+                write!(out, "struct {{")?;
+                out.indented(|out| {
+                    for &field in nodes.indirect(fields) {
+                        writeln!(out)?;
+                        write_node(out, nodes, field)?;
+                    }
+                    Ok(())
+                })?;
+                if !fields.is_empty() {
+                    writeln!(out)?;
+                }
+                write!(out, "}}")?;
+                Ok(())
+            }
+            Node::Field(name, typ, tag) => {
+                write!(out, "{name} ")?;
+                write_node(out, nodes, typ.node)?;
+                if let Some(tag) = tag {
+                    write!(out, " ")?;
+                    write_node(out, nodes, tag.node)?;
                 }
                 Ok(())
-            })?;
-            if !fields.is_empty() {
-                writeln!(out)?;
             }
-            write!(out, "}}")?;
-            Ok(())
-        }
-        Node::Field(name, typ, tag) => {
-            write!(out, "{name} ")?;
-            write_node(out, nodes, typ.node)?;
-            if let Some(tag) = tag {
+            Node::EmbeddedField(_name, typ, tag) => {
+                write_node(out, nodes, typ.node)?;
+                if let Some(tag) = tag {
+                    write!(out, " ")?;
+                    write_node(out, nodes, tag.node)?;
+                }
+                Ok(())
+            }
+
+            Node::Channel(kind, typ) => {
+                match kind {
+                    ChannelKind::SendRecv => write!(out, "chan")?,
+                    ChannelKind::Send => write!(out, "chan<-")?,
+                    ChannelKind::Recv => write!(out, "<-chan")?,
+                }
                 write!(out, " ")?;
-                write_node(out, nodes, tag.node)?;
+                node = typ.node;
+                continue;
             }
-            Ok(())
-        }
-        Node::EmbeddedField(_name, typ, tag) => {
-            write_node(out, nodes, typ.node)?;
-            if let Some(tag) = tag {
+
+            Node::Call(target, arguments, spread) => {
+                write_node(out, nodes, target.node)?;
+
+                let arguments = nodes.indirect(arguments.nodes);
+                let last = arguments.last();
+                write!(out, "(")?;
+                write_list(out, arguments, |out, argument| {
+                    if Some(argument) == last && spread.is_some() {
+                        write!(out, "...")?;
+                    }
+                    write_node(out, nodes, *argument)
+                })?;
+                write!(out, ")")?;
+                Ok(())
+            }
+
+            Node::Rune(rune) => {
+                write!(out, "{:?}", rune)
+            }
+            Node::String(range) => {
+                let text = &nodes.string_buffer[range.indices()];
+                write!(out, "{:?}", text)
+            }
+            Node::IntegerSmall(value) => write!(out, "{}", value),
+            Node::FloatSmall(value) => write!(out, "{}", value.get()),
+            Node::ImaginarySmall(value) => write!(out, "{}i", value.get()),
+
+            Node::Assign(targets, values) => {
+                write_node_list(out, nodes, targets)?;
+                write!(out, " = ")?;
+                write_node_list(out, nodes, values.nodes)?;
+                Ok(())
+            }
+
+            Node::Return(None) => write!(out, "return"),
+            Node::Return(Some(value)) => {
+                write!(out, "return ")?;
+                write_node(out, nodes, value.node)
+            }
+            Node::ReturnMulti(list) => {
+                write!(out, "return ")?;
+                write_node_list(out, nodes, list.nodes)
+            }
+
+            Node::Unary(op, expr) => {
+                write!(out, "{op}")?;
+                node = expr.node;
+                continue;
+            }
+            Node::Binary(lhs, op, rhs) => {
+                let precedence = |expr: ExprId| match nodes.kinds[expr.node] {
+                    Node::Binary(_, op, _) => op.precedence(),
+                    _ => 123,
+                };
+
+                if precedence(lhs) <= op.precedence() {
+                    // (a + b) * rhs
+                    write!(out, "(")?;
+                    write_node(out, nodes, lhs.node)?;
+                    write!(out, ")")?;
+                } else {
+                    write_node(out, nodes, lhs.node)?;
+                }
+
+                write!(out, " {op} ")?;
+
+                if precedence(rhs) < op.precedence() {
+                    // lhs * (b + c)
+                    write!(out, "(")?;
+                    write_node(out, nodes, rhs.node)?;
+                    write!(out, ")")?;
+                } else {
+                    node = rhs.node;
+                    continue;
+                }
+
+                Ok(())
+            }
+
+            Node::Array(size, inner) => {
+                write!(out, "[")?;
+                match size {
+                    Some(size) => write_node(out, nodes, size.node)?,
+                    None => write!(out, "...")?,
+                }
+                write!(out, "]")?;
+                node = inner.node;
+                continue;
+            }
+            Node::Slice(inner) => {
+                write!(out, "[]")?;
+                node = inner.node;
+                continue;
+            }
+
+            Node::Map(key, value) => {
+                write!(out, "map[")?;
+                write_node(out, nodes, key.node)?;
+                write!(out, "]")?;
+                node = value.node;
+                continue;
+            }
+
+            Node::Composite(typ, composite) => {
+                write_node(out, nodes, typ.node)?;
+                write!(out, "{{")?;
+                match composite {
+                    CompositeRange::Value(values) => write_node_list(out, nodes, values.nodes)?,
+                    CompositeRange::KeyValue(range) => {
+                        let list = nodes.indirect(range.nodes);
+                        let pairs = list.iter().step_by(2).zip(list.iter().skip(1).step_by(2));
+                        write_list(out, pairs, |out, (key, value)| {
+                            write_node(out, nodes, *key)?;
+                            write!(out, ": ")?;
+                            write_node(out, nodes, *value)?;
+                            Ok(())
+                        })?;
+                    }
+                }
+                write!(out, "}}")?;
+                Ok(())
+            }
+
+            Node::Index(array, index) => {
+                write_node(out, nodes, array.node)?;
+                write!(out, "[")?;
+                write_node(out, nodes, index.node)?;
+                write!(out, "]")?;
+                Ok(())
+            }
+            Node::SliceIndex(array, start, end) => {
+                write_node(out, nodes, array.node)?;
+                write!(out, "[")?;
+                if let Some(start) = start {
+                    write_node(out, nodes, start.node)?;
+                }
+                write!(out, ":")?;
+                if let Some(end) = end {
+                    write_node(out, nodes, end.node)?;
+                }
+                write!(out, "]")?;
+                Ok(())
+            }
+            Node::SliceCapacity(array, start, end, cap) => {
+                write_node(out, nodes, array.node)?;
+                write!(out, "[")?;
+                if let Some(start) = start {
+                    write_node(out, nodes, start.node)?;
+                }
+                write!(out, ":")?;
+                write_node(out, nodes, end.node)?;
+                write!(out, ":")?;
+                write_node(out, nodes, cap.node)?;
+                write!(out, "]")?;
+                Ok(())
+            }
+
+            Node::If(init, condition, block, els) => {
+                write!(out, "if ")?;
+                if let Some(init) = init {
+                    write_node(out, nodes, init.node)?;
+                    write!(out, "; ")?;
+                }
+                write_node(out, nodes, condition.node)?;
                 write!(out, " ")?;
-                write_node(out, nodes, tag.node)?;
-            }
-            Ok(())
-        }
+                write_block(out, nodes, block)?;
 
-        Node::Channel(kind, typ) => {
-            match kind {
-                ChannelKind::SendRecv => write!(out, "chan")?,
-                ChannelKind::Send => write!(out, "chan<-")?,
-                ChannelKind::Recv => write!(out, "<-chan")?,
-            }
-            write!(out, " ")?;
-            write_node(out, nodes, typ.node)
-        }
+                if let Some(els) = els {
+                    write!(out, " else ")?;
+                    node = els.node;
+                    continue;
+                }
 
-        node => todo!("write node: {node:?}"),
+                Ok(())
+            }
+
+            Node::Block(block) => write_block(out, nodes, block),
+
+            Node::Switch(init, expr, cases) => {
+                write!(out, "switch ")?;
+                if let Some(init) = init {
+                    write_node(out, nodes, init.node)?;
+                    write!(out, "; ")?;
+                }
+                if let Some(expr) = expr {
+                    write_node(out, nodes, expr.node)?;
+                    write!(out, " ")?;
+                }
+
+                writeln!(out, "{{")?;
+                for &case in nodes.indirect(cases) {
+                    write_node(out, nodes, case)?;
+                    writeln!(out)?;
+                }
+                write!(out, "}}")?;
+
+                Ok(())
+            }
+            Node::TypeSwitch(binding, expr) => {
+                if let Some(binding) = binding {
+                    write!(out, "{} := ", binding)?;
+                }
+                write_node(out, nodes, expr.node)?;
+                write!(out, ".(type)")
+            }
+            Node::SwitchCase(exprs, block) => {
+                if let Some(exprs) = exprs {
+                    write!(out, "case ")?;
+                    write_node_list(out, nodes, exprs.nodes)?;
+                    write!(out, ":")?;
+                } else {
+                    write!(out, "default:")?;
+                }
+
+                write_case_statements(out, nodes, block)?;
+
+                Ok(())
+            }
+
+            Node::For(init, cond, post, block) => {
+                write!(out, "for ")?;
+
+                if init.is_none() && post.is_none() {
+                    if let Some(cond) = cond {
+                        write_node(out, nodes, cond.node)?;
+                        write!(out, " ")?;
+                    }
+                } else {
+                    if let Some(init) = init {
+                        write_node(out, nodes, init.node)?;
+                    }
+                    write!(out, ";")?;
+                    if let Some(cond) = cond {
+                        write!(out, " ")?;
+                        write_node(out, nodes, cond.node)?;
+                    }
+                    write!(out, ";")?;
+                    if let Some(post) = post {
+                        write!(out, " ")?;
+                        write_node(out, nodes, post.node)?;
+                        write!(out, " ")?;
+                    }
+                }
+
+                write_block(out, nodes, block)?;
+
+                Ok(())
+            }
+            Node::ForRange(first, second, assign_or_define, expr, block) => {
+                write!(out, "for ")?;
+                write_node(out, nodes, first.node)?;
+                if let Some(second) = second {
+                    write!(out, ", ")?;
+                    write_node(out, nodes, second.node)?;
+                }
+                match assign_or_define {
+                    AssignOrDefine::Assign => write!(out, " = ")?,
+                    AssignOrDefine::Define => write!(out, " := ")?,
+                }
+
+                write!(out, "range ")?;
+                write_node(out, nodes, expr.node)?;
+                write!(out, " ")?;
+                write_block(out, nodes, block)
+            }
+
+            Node::Increment(expr) => {
+                write_node(out, nodes, expr.node)?;
+                write!(out, "++")
+            }
+            Node::Decrement(expr) => {
+                write_node(out, nodes, expr.node)?;
+                write!(out, "--")
+            }
+
+            Node::Break(None) => write!(out, "break"),
+            Node::Break(Some(label)) => write!(out, "break {label}"),
+            Node::Continue(None) => write!(out, "continue"),
+            Node::Continue(Some(label)) => write!(out, "continue {label}"),
+            Node::Goto(label) => write!(out, "goto {label}"),
+            Node::Fallthrough => write!(out, "fallthrough"),
+
+            node => todo!("write node: {node:?}"),
+        };
     }
 }
 
@@ -349,4 +735,56 @@ impl std::fmt::Display for Identifier {
             None => write!(f, "_"),
         }
     }
+}
+
+fn write_type_spec(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    spec: TypeSpec,
+    alias: bool,
+) -> std::fmt::Result {
+    write!(out, "{} ", spec.name)?;
+    if alias {
+        write!(out, "= ")?;
+    }
+    write_node(out, nodes, spec.inner.node)
+}
+
+fn write_const_spec(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    names: NodeRange,
+    typ: Option<TypeId>,
+    values: ExprRange,
+    previous_values: Option<ExprRange>,
+) -> std::fmt::Result {
+    write_node_list(out, nodes, names)?;
+    if let Some(typ) = typ {
+        write!(out, " ")?;
+        write_node(out, nodes, typ.node)?;
+    }
+    if Some(values) != previous_values {
+        write!(out, " = ")?;
+        write_node_list(out, nodes, values.nodes)?;
+    }
+    Ok(())
+}
+
+fn write_var_spec(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    names: NodeRange,
+    typ: Option<TypeId>,
+    values: Option<ExprRange>,
+) -> std::fmt::Result {
+    write_node_list(out, nodes, names)?;
+    if let Some(typ) = typ {
+        write!(out, " ")?;
+        write_node(out, nodes, typ.node)?;
+    }
+    if let Some(values) = values {
+        write!(out, " = ")?;
+        write_node_list(out, nodes, values.nodes)?;
+    }
+    Ok(())
 }

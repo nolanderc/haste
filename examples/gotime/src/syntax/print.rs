@@ -99,7 +99,7 @@ impl File {
             writeln!(out, ")")?;
         } else if let Some(import) = self.imports.iter().next() {
             writeln!(out)?;
-            writeln!(out, "import {}", import)?;
+            write!(out, "import {}", import)?;
         }
 
         for decl in self.declarations.iter() {

@@ -558,6 +558,12 @@ impl std::fmt::Debug for FloatBits64 {
 }
 
 impl FloatBits64 {
+    pub fn new(value: f64) -> FloatBits64 {
+        Self {
+            bits: value.to_bits(),
+        }
+    }
+
     pub fn get(self) -> f64 {
         f64::from_bits(self.bits)
     }

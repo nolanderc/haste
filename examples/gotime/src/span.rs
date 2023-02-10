@@ -48,6 +48,12 @@ impl FileRange {
             end: self.end.max(other.end),
         }
     }
+
+    pub fn sub_range(self, range: std::ops::Range<usize>) -> FileRange {
+        let start = self.start.get() as usize + range.start;
+        let end = self.start.get() as usize + range.end;
+        Self::from(start..end)
+    }
 }
 
 impl From<std::ops::Range<usize>> for FileRange {

@@ -2248,10 +2248,8 @@ impl<'a> Parser<'a> {
         match parse_integer::<BASE>(text) {
             Ok(bits) => Ok(bits),
             Err(error) => {
-                let offset = token.file_range().start.get();
-                let start = error.range.start + offset;
-                let end = error.range.end + offset;
-                let span = Span::new(self.path, FileRange::from(start..end));
+                let range = token.file_range().sub_range(error.range);
+                let span = Span::new(self.path, range);
                 Err(self.emit(Diagnostic::error("invalid number literal").label(span, error.kind)))
             }
         }
@@ -2278,8 +2276,19 @@ impl<'a> Parser<'a> {
                     Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
                 }
             }
+        } else if BASE == 16 {
+            assert_eq!(BASE, 16);
+            match parse_hex_float(text) {
+                Ok(float) => Ok(float),
+                Err(error) => {
+                    let range = token.file_range().sub_range(error.range);
+                    let span = Span::new(self.path, range);
+                    Err(self
+                        .emit(Diagnostic::error("invalid number literal").label(span, error.kind)))
+                }
+            }
         } else {
-            todo!("parse hex float: {:?}", text)
+            panic!("invalid float base: {BASE}")
         }
     }
 
@@ -2598,32 +2607,34 @@ enum FloatBits {
     Small(FloatBits64),
 }
 
-struct IntError {
-    range: std::ops::Range<u32>,
-    kind: IntErrorKind,
+struct NumberError {
+    range: std::ops::Range<usize>,
+    kind: NumberErrorKind,
 }
 
-enum IntErrorKind {
+enum NumberErrorKind {
     InvalidDigit,
     Overflow,
     InvalidUnderscore,
     UnexpectedEnd,
+    MissingExponent,
 }
 
-impl std::fmt::Display for IntErrorKind {
+impl std::fmt::Display for NumberErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IntErrorKind::InvalidDigit => write!(f, "invalid digit"),
-            IntErrorKind::Overflow => write!(f, "too large to represent without overflow"),
-            IntErrorKind::InvalidUnderscore => {
+            NumberErrorKind::InvalidDigit => write!(f, "invalid digit"),
+            NumberErrorKind::Overflow => write!(f, "too large to represent without overflow"),
+            NumberErrorKind::InvalidUnderscore => {
                 write!(f, "`_` must only occur next to other digits")
             }
-            IntErrorKind::UnexpectedEnd => write!(f, "expected another digit after this"),
+            NumberErrorKind::UnexpectedEnd => write!(f, "expected another digit after this"),
+            NumberErrorKind::MissingExponent => write!(f, "expected an exponent"),
         }
     }
 }
 
-fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
+fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, NumberError> {
     let bytes = text.as_bytes();
 
     let mut value = 0u128;
@@ -2709,35 +2720,33 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
 
     if let Some(start) = invalid_digit {
         let length = text[start..].chars().next().unwrap().len_utf8();
-        let start = start as u32;
-        let end = start + length as u32;
-        return Err(IntError {
-            range: start..end,
-            kind: IntErrorKind::InvalidDigit,
+        return Err(NumberError {
+            range: start..start + length,
+            kind: NumberErrorKind::InvalidDigit,
         });
     }
 
     if let Some(start) = invalid_underscore {
-        return Err(IntError {
-            range: start as u32..start as u32 + 1,
-            kind: IntErrorKind::InvalidUnderscore,
+        return Err(NumberError {
+            range: start..start + 1,
+            kind: NumberErrorKind::InvalidUnderscore,
         });
     }
 
     if missing_digit {
         let last_start = text.chars().next_back().unwrap().len_utf8();
-        let end = text.len() as u32;
-        let start = end - last_start as u32;
-        return Err(IntError {
+        let end = text.len();
+        let start = end - last_start;
+        return Err(NumberError {
             range: start..end,
-            kind: IntErrorKind::UnexpectedEnd,
+            kind: NumberErrorKind::UnexpectedEnd,
         });
     }
 
     if overflow {
-        return Err(IntError {
-            range: 0..bytes.len() as u32,
-            kind: IntErrorKind::Overflow,
+        return Err(NumberError {
+            range: 0..bytes.len(),
+            kind: NumberErrorKind::Overflow,
         });
     }
 
@@ -2747,6 +2756,184 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, IntError> {
     };
 
     Ok(bits)
+}
+
+fn parse_hex_float(text: &str) -> Result<FloatBits, NumberError> {
+    let bytes = text.as_bytes();
+    assert!(bytes.starts_with(b"0x") || bytes.starts_with(b"0X"));
+
+    let mut mantissa: u64 = 0;
+    let mut exponent: i32 = 0;
+
+    let mut in_decimals = false;
+    let mut accepts_underscore = true;
+
+    let mut i = 2;
+    while i < bytes.len() {
+        if i >= bytes.len() {
+            return Err(NumberError {
+                range: 0..text.len(),
+                kind: NumberErrorKind::MissingExponent,
+            });
+        }
+
+        match bytes[i] {
+            b'_' if accepts_underscore => {
+                i += 1;
+                accepts_underscore = false;
+            }
+            b'_' => {
+                return Err(NumberError {
+                    range: i..i + 1,
+                    kind: NumberErrorKind::InvalidUnderscore,
+                })
+            }
+
+            b'.' if !in_decimals => {
+                i += 1;
+                in_decimals = true;
+            }
+
+            b'p' | b'P' => {
+                if !accepts_underscore {
+                    // the previous byte was an underscore
+                    return Err(NumberError {
+                        range: i - 1..i,
+                        kind: NumberErrorKind::InvalidUnderscore,
+                    });
+                }
+
+                let exp_value = parse_exponent(&bytes[i + 1..]).map_err(|mut error| {
+                    error.range.start += i;
+                    error.range.end += i;
+                    error
+                })?;
+                exponent = exponent.checked_add(exp_value).ok_or(NumberError {
+                    range: 0..text.len(),
+                    kind: NumberErrorKind::Overflow,
+                })?;
+                break;
+            }
+
+            _ => match hex_digit(bytes[i]) {
+                None => {
+                    return Err(NumberError {
+                        range: i..i + 1,
+                        kind: NumberErrorKind::InvalidDigit,
+                    });
+                }
+                Some(digit) => {
+                    accepts_underscore = true;
+                    i += 1;
+                    if let Some(new) = mantissa.checked_shl(4).map(|x| x + digit as u64) {
+                        mantissa = new;
+                    } else {
+                        // could not include the digits due to loss in precision, but we can still
+                        // increase the exponent to reflect the magnitude:
+                        if !in_decimals {
+                            exponent += 4;
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    dbg!(mantissa, exponent);
+
+    if mantissa == 0 {
+        return Ok(FloatBits::Small(FloatBits64::new(0.0)));
+    }
+
+    // place the most significant bit at the highest bit.
+    mantissa <<= mantissa.leading_zeros();
+    // discard the highest bit (it is implicitly 1)
+    mantissa <<= 1;
+
+    // the highest 52 bits are the mantissa
+    let f64_mantissa = mantissa >> (std::mem::size_of_val(&mantissa) * 8 - 52);
+
+    // it also has a 11-bit exponent:
+    if !matches!(exponent, -1022..=1023) {
+        return Err(NumberError {
+            range: 0..text.len(),
+            kind: NumberErrorKind::Overflow,
+        });
+    }
+    // the exponent is biased such that an exponent of `0` is encoded as `1023`
+    let f64_exponent = (exponent + 1023) as u64;
+
+    // we only parse positive values
+    let sign = 0;
+
+    let bits = (sign << 63) | (f64_exponent << 52) | f64_mantissa;
+    Ok(FloatBits::Small(FloatBits64 { bits }))
+}
+
+fn parse_exponent(bytes: &[u8]) -> Result<i32, NumberError> {
+    let mut i = 0;
+    let sign = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            -1
+        }
+        Some(b'+') => {
+            i += 1;
+            1
+        }
+        _ => 1,
+    };
+
+    let mut value: i32 = 0;
+    let mut accepts_underscore = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'_' if accepts_underscore => {
+                i += 1;
+                accepts_underscore = false;
+            }
+            b'_' => {
+                return Err(NumberError {
+                    range: i - 1..i,
+                    kind: NumberErrorKind::InvalidUnderscore,
+                })
+            }
+            byte => {
+                let digit = decimal_digit(byte).ok_or(NumberError {
+                    range: i..i + 1,
+                    kind: NumberErrorKind::InvalidDigit,
+                })?;
+                accepts_underscore = true;
+                i += 1;
+                value = value
+                    .checked_mul(10)
+                    .and_then(|x| x.checked_add(digit as i32))
+                    .ok_or(NumberError {
+                        range: i..i + 1,
+                        kind: NumberErrorKind::Overflow,
+                    })?;
+            }
+        }
+    }
+
+    Ok(value * sign)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decimal_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        _ => None,
+    }
 }
 
 enum MaybeTypeSwitch {

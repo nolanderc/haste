@@ -7,9 +7,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 pub use diagnostic::{Diagnostic, Result};
+use haste::DatabaseExt;
 
 use crate::common::Text;
 use crate::source::{source_text, SourcePath, SourcePathData};
+use crate::util::TextBox;
 
 mod common;
 mod diagnostic;
@@ -79,7 +81,12 @@ async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let ast = syntax::parse(db, text, source_path)?;
 
     let mut out = std::io::BufWriter::new(std::io::stderr().lock());
-    writeln!(out, "{}", ast.display_pretty(db)).unwrap();
+    writeln!(
+        out,
+        "{}",
+        TextBox::new(db.fmt(source_path), ast.display_pretty(db))
+    )
+    .unwrap();
 
     Ok(())
 }

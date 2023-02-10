@@ -78,8 +78,7 @@ async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<()> {
     let text = source_text(db, source_path).await.as_ref()?;
     let ast = syntax::parse(db, text, source_path)?;
 
-    // let mut out = std::io::BufWriter::new(std::io::stderr().lock());
-    let mut out = std::io::stderr().lock();
+    let mut out = std::io::BufWriter::new(std::io::stderr().lock());
     writeln!(out, "{}", ast.display_pretty(db)).unwrap();
 
     Ok(())

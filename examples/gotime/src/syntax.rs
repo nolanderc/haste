@@ -521,8 +521,9 @@ pub struct RecvBindings {
 pub struct Block {
     /// A sequence of statements to execute
     pub statements: StmtRange,
-    /// A sequence of labels defined in the block.
-    pub labels: NodeRange,
+    /// A list of all labels defined in the block (labels have block scope, which is why we declare
+    /// them here for fast access)
+    pub labels: StmtRange,
 }
 
 /// Certain syntax forms accepts both `:=` and `=`.

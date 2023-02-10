@@ -27,6 +27,14 @@ impl<'db, W> PrettyWriter<'db, W> {
         self.indent -= 4;
         output
     }
+
+    fn dedented<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.indent;
+        self.indent = previous.saturating_sub(4);
+        let output = f(self);
+        self.indent = previous;
+        output
+    }
 }
 
 impl<W: Write> PrettyWriter<'_, W> {
@@ -285,6 +293,13 @@ fn write_node(
     nodes: &NodeStorage,
     mut node: NodeId,
 ) -> std::fmt::Result {
+    macro_rules! recurse {
+        ($next_node:expr) => {{
+            node = $next_node;
+            continue;
+        }};
+    }
+
     loop {
         break match nodes.kinds[node] {
             Node::Name(None) => write!(out, "_"),
@@ -297,8 +312,7 @@ fn write_node(
 
             Node::Pointer(inner) => {
                 write!(out, "*")?;
-                node = inner.node;
-                continue;
+                recurse!(inner.node);
             }
 
             Node::FunctionType(signature) => {
@@ -307,6 +321,15 @@ fn write_node(
                 write!(out, "func")?;
                 write_signature(out, nodes, inputs, outputs)
             }
+            Node::Function(signature, block) => {
+                let inputs = nodes.indirect(signature.inputs());
+                let outputs = nodes.indirect(signature.outputs());
+                write!(out, "func")?;
+                write_signature(out, nodes, inputs, outputs)?;
+                write!(out, " ")?;
+                write_block(out, nodes, block)
+            }
+            Node::Parameter(param) => write_parameter(out, nodes, param),
 
             Node::TypeDef(spec) => {
                 write!(out, "type ")?;
@@ -437,8 +460,7 @@ fn write_node(
                     ChannelKind::Recv => write!(out, "<-chan")?,
                 }
                 write!(out, " ")?;
-                node = typ.node;
-                continue;
+                recurse!(typ.node);
             }
 
             Node::Call(target, arguments, spread) => {
@@ -474,6 +496,11 @@ fn write_node(
                 write_node_list(out, nodes, values.nodes)?;
                 Ok(())
             }
+            Node::AssignOp(target, op, value) => {
+                write_node(out, nodes, target.node)?;
+                write!(out, " {op}= ")?;
+                recurse!(value.node);
+            }
 
             Node::Return(None) => write!(out, "return"),
             Node::Return(Some(value)) => {
@@ -487,8 +514,7 @@ fn write_node(
 
             Node::Unary(op, expr) => {
                 write!(out, "{op}")?;
-                node = expr.node;
-                continue;
+                recurse!(expr.node);
             }
             Node::Binary(lhs, op, rhs) => {
                 let precedence = |expr: ExprId| match nodes.kinds[expr.node] {
@@ -513,8 +539,7 @@ fn write_node(
                     write_node(out, nodes, rhs.node)?;
                     write!(out, ")")?;
                 } else {
-                    node = rhs.node;
-                    continue;
+                    recurse!(rhs.node);
                 }
 
                 Ok(())
@@ -527,42 +552,25 @@ fn write_node(
                     None => write!(out, "...")?,
                 }
                 write!(out, "]")?;
-                node = inner.node;
-                continue;
+                recurse!(inner.node);
             }
             Node::Slice(inner) => {
                 write!(out, "[]")?;
-                node = inner.node;
-                continue;
+                recurse!(inner.node);
             }
 
             Node::Map(key, value) => {
                 write!(out, "map[")?;
                 write_node(out, nodes, key.node)?;
                 write!(out, "]")?;
-                node = value.node;
-                continue;
+                recurse!(value.node);
             }
 
             Node::Composite(typ, composite) => {
                 write_node(out, nodes, typ.node)?;
-                write!(out, "{{")?;
-                match composite {
-                    CompositeRange::Value(values) => write_node_list(out, nodes, values.nodes)?,
-                    CompositeRange::KeyValue(range) => {
-                        let list = nodes.indirect(range.nodes);
-                        let pairs = list.iter().step_by(2).zip(list.iter().skip(1).step_by(2));
-                        write_list(out, pairs, |out, (key, value)| {
-                            write_node(out, nodes, *key)?;
-                            write!(out, ": ")?;
-                            write_node(out, nodes, *value)?;
-                            Ok(())
-                        })?;
-                    }
-                }
-                write!(out, "}}")?;
-                Ok(())
+                write_composite_literal(out, nodes, composite)
             }
+            Node::CompositeLiteral(composite) => write_composite_literal(out, nodes, composite),
 
             Node::Index(array, index) => {
                 write_node(out, nodes, array.node)?;
@@ -610,8 +618,7 @@ fn write_node(
 
                 if let Some(els) = els {
                     write!(out, " else ")?;
-                    node = els.node;
-                    continue;
+                    recurse!(els.node);
                 }
 
                 Ok(())
@@ -660,6 +667,18 @@ fn write_node(
                 Ok(())
             }
 
+            Node::TypeAssertion(expr, typ) => {
+                write_node(out, nodes, expr.node)?;
+                write!(out, ".(")?;
+                if let Some(typ) = typ {
+                    write_node(out, nodes, typ.node)?;
+                } else {
+                    write!(out, "type")?;
+                }
+                write!(out, ")")?;
+                Ok(())
+            }
+
             Node::For(init, cond, post, block) => {
                 write!(out, "for ")?;
 
@@ -688,6 +707,12 @@ fn write_node(
                 write_block(out, nodes, block)?;
 
                 Ok(())
+            }
+            Node::ForRangePlain(expr, block) => {
+                write!(out, "for range ")?;
+                write_node(out, nodes, expr.node)?;
+                write!(out, " ")?;
+                write_block(out, nodes, block)
             }
             Node::ForRange(first, second, assign_or_define, expr, block) => {
                 write!(out, "for ")?;
@@ -723,9 +748,96 @@ fn write_node(
             Node::Goto(label) => write!(out, "goto {label}"),
             Node::Fallthrough => write!(out, "fallthrough"),
 
-            node => todo!("write node: {node:?}"),
+            Node::Label(name, stmt) => {
+                out.dedented(|out| writeln!(out, "{name}:"))?;
+                recurse!(stmt.node);
+            }
+
+            Node::Defer(expr) => {
+                write!(out, "defer ")?;
+                recurse!(expr.node);
+            }
+            Node::Go(expr) => {
+                write!(out, "go ")?;
+                recurse!(expr.node);
+            }
+
+            Node::Send(send) => {
+                write_node(out, nodes, send.channel.node)?;
+                write!(out, " <- ")?;
+                recurse!(send.value.node)
+            }
+
+            Node::Select(cases) => {
+                writeln!(out, "switch {{")?;
+                for &case in nodes.indirect(cases) {
+                    write_node(out, nodes, case)?;
+                    writeln!(out)?;
+                }
+                write!(out, "}}")?;
+
+                Ok(())
+            }
+            Node::SelectRecv(bindings, kind, channel, block) => {
+                write!(out, "case ")?;
+
+                match (bindings, kind) {
+                    (Some(bindings), Some(kind)) => {
+                        write_node(out, nodes, bindings.value.node)?;
+                        if let Some(success) = bindings.success {
+                            write!(out, ", ")?;
+                            write_node(out, nodes, success.node)?;
+                        }
+                        match kind {
+                            AssignOrDefine::Assign => write!(out, " = ")?,
+                            AssignOrDefine::Define => write!(out, " := ")?,
+                        }
+                    }
+                    (None, None) => {}
+                    _ => unreachable!(),
+                }
+
+                write_node(out, nodes, channel.node)?;
+                write!(out, ":")?;
+                write_case_statements(out, nodes, block)
+            }
+            Node::SelectSend(send, block) => {
+                write!(out, "case ")?;
+                write_node(out, nodes, send.channel.node)?;
+                write!(out, " <- ")?;
+                write_node(out, nodes, send.value.node)?;
+                write!(out, ":")?;
+                write_case_statements(out, nodes, block)
+            }
+            Node::SelectDefault(block) => {
+                write!(out, "default:")?;
+                write_case_statements(out, nodes, block)
+            }
         };
     }
+}
+
+fn write_composite_literal(
+    out: &mut PrettyWriter<impl Write>,
+    nodes: &NodeStorage,
+    composite: CompositeRange,
+) -> std::fmt::Result {
+    write!(out, "{{")?;
+    match composite {
+        CompositeRange::Value(values) => write_node_list(out, nodes, values.nodes)?,
+        CompositeRange::KeyValue(range) => {
+            let list = nodes.indirect(range.nodes);
+            let pairs = list.iter().step_by(2).zip(list.iter().skip(1).step_by(2));
+            write_list(out, pairs, |out, (key, value)| {
+                write_node(out, nodes, *key)?;
+                write!(out, ": ")?;
+                write_node(out, nodes, *value)?;
+                Ok(())
+            })?;
+        }
+    }
+    write!(out, "}}")?;
+    Ok(())
 }
 
 impl std::fmt::Display for Identifier {

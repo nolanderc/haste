@@ -235,7 +235,7 @@ type Result<T, E = ErrorToken> = std::result::Result<T, E>;
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
 
-type LabelList = SmallVec<[NodeId; 8]>;
+type LabelList = SmallVec<[StmtId; 8]>;
 
 impl<'a> Parser<'a> {
     /// Determines if the current expression is followed by a block.
@@ -1295,8 +1295,9 @@ impl<'a> Parser<'a> {
             self.eat(Token::Colon);
             let inner = self.statement(labels)?;
             let span = self.emit_join(label, inner);
-            labels.push(self.emit_node(Node::Label(label, inner), span));
-            Ok(Some(inner))
+            let node = self.emit_stmt(Node::Label(label, inner), span);
+            labels.push(node);
+            Ok(Some(node))
         } else if let Some(expr) = self.try_expression()? {
             if let Some(simple) = self.try_simple_statement(expr)? {
                 Ok(Some(simple))
@@ -1347,7 +1348,7 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_list(&mut self, allow_fallthough: bool) -> Result<Block> {
-        let mut labels = SmallVec::<[NodeId; 8]>::new();
+        let mut labels = LabelList::new();
         let statements = self.multi(|this| loop {
             if allow_fallthough {
                 if let Some(token) = this.try_expect(Token::Fallthrough) {
@@ -1369,13 +1370,14 @@ impl<'a> Parser<'a> {
         })?;
 
         let labels = self.multi(|this| {
-            this.data.node.indirect_stack.extend_from_slice(&labels);
+            let nodes = labels.into_iter().map(|label| label.node);
+            this.data.node.indirect_stack.extend(nodes);
             Ok(())
         })?;
 
         Ok(Block {
             statements: StmtRange::new(statements),
-            labels,
+            labels: StmtRange::new(labels),
         })
     }
 

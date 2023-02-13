@@ -1,9 +1,15 @@
-use std::{future::Future, hash::Hash, num::NonZeroU32, pin::Pin};
+mod slot;
+
+use std::{future::Future, hash::Hash, pin::Pin};
+
+use hashbrown::raw::RawTable;
 
 use crate::{
-    arena::AppendArena, non_max::NonMaxU32, shard_map::ShardMap, Database, Dependency,
-    ExecutionResult, Id, IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
+    arena::AppendArena, non_max::NonMaxU32, shard_map::ShardMap, Database, Dependency, Id,
+    IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
+
+use self::slot::{OutputSlot, QuerySlot};
 
 pub enum EvalResult<Eval, Pending> {
     Cached(Id),
@@ -34,63 +40,35 @@ pub trait QueryCache: crate::Container {
     ///
     /// # Safety
     ///
-    /// The `id` must be one previously returned from `execute` in the same revision.
+    /// An `id` is only valid if the corresponding query has finished executing in the same
+    /// revision.
     unsafe fn output(&self, id: Id) -> &<Self::Query as Query>::Output;
 
     /// Get the dependencies of a query.
     ///
     /// # Safety
     ///
-    /// The `id` must be one previously returned from `execute` in the same revision.
+    /// An `id` is only valid if the corresponding query has finished executing in the same
+    /// revision.
     unsafe fn dependencies(&self, id: Id) -> &[Dependency];
 }
 
 pub struct HashQueryCache<Q: Query> {
     path: IngredientPath,
-    entries: ShardMap<Q::Input, QueryProgress>,
-    outputs: OutputStorage<Q::Output>,
+    entries: ShardMap<Id>,
+    storage: QueryStorage<Q>,
 }
 
-struct QueryProgress {
-    signal: crate::util::Signal,
-}
-
-impl QueryProgress {
-    const fn new() -> Self {
-        Self {
-            signal: crate::util::Signal::new(),
-        }
-    }
-
-    fn id_from_non_zero(value: NonZeroU32) -> crate::Id {
-        crate::Id::new(NonMaxU32::new(value.get() - 1).unwrap())
-    }
-
-    fn get_or_wait(&self) -> Result<Id, impl Future<Output = Id>> {
-        self.signal
-            .get_or_wait()
-            .map(Self::id_from_non_zero)
-            .map_err(|signal| async move { Self::id_from_non_zero(signal.await) })
-    }
-
-    fn finish(&self, id: Id) -> Result<Id, Id> {
-        self.signal
-            .finish(NonZeroU32::new(id.raw.get() + 1).unwrap())
-            .map(Self::id_from_non_zero)
-            .map_err(Self::id_from_non_zero)
-    }
-}
-
-struct OutputStorage<T> {
-    /// Stores data about each completed query.
-    slots: AppendArena<OutputSlot<T>>,
+struct QueryStorage<Q: Query> {
+    /// Stores data about every query.
+    slots: AppendArena<QuerySlot<Q>>,
 
     /// Stores the dependencies for all the queries. These are referenced by ranges in the
     /// `OutputSlot`.
     dependencies: AppendArena<Dependency>,
 }
 
-impl<T> Default for OutputStorage<T> {
+impl<Q: Query> Default for QueryStorage<Q> {
     fn default() -> Self {
         Self {
             slots: Default::default(),
@@ -99,9 +77,14 @@ impl<T> Default for OutputStorage<T> {
     }
 }
 
-impl<T> OutputStorage<T> {
+impl<Q: Query> QueryStorage<Q> {
     /// Record the result of a new query
-    fn push(&self, output: T, dependencies: &[Dependency]) -> usize {
+    unsafe fn finish(
+        &self,
+        id: Id,
+        output: Q::Output,
+        dependencies: &[Dependency],
+    ) -> Option<&OutputSlot<Q::Output>> {
         let dependencies = {
             let range = self.dependencies.extend_from_slice(dependencies);
             let end = u32::try_from(range.end).unwrap();
@@ -109,7 +92,8 @@ impl<T> OutputStorage<T> {
             start..end
         };
 
-        self.slots.push(OutputSlot {
+        let slot = self.slots.get_unchecked(id.raw.get() as usize);
+        slot.finish(OutputSlot {
             output,
             dependencies,
         })
@@ -121,15 +105,10 @@ impl<T> OutputStorage<T> {
         self.dependencies
             .get_slice_unchecked(range.start as usize..range.end as usize)
     }
-}
 
-struct OutputSlot<T> {
-    /// The output from a query.
-    output: T,
-
-    /// Refers to a sequence of dependencies in `OutputStorage::dependencies`.
-    #[allow(unused)]
-    dependencies: std::ops::Range<u32>,
+    unsafe fn slot(&self, id: Id) -> &QuerySlot<Q> {
+        self.slots.get_unchecked(id.raw.get() as usize)
+    }
 }
 
 impl<Q: Query> crate::Container for HashQueryCache<Q> {
@@ -137,7 +116,7 @@ impl<Q: Query> crate::Container for HashQueryCache<Q> {
         Self {
             path,
             entries: Default::default(),
-            outputs: Default::default(),
+            storage: Default::default(),
         }
     }
 }
@@ -169,33 +148,27 @@ where
 
         {
             // check if the query has already executed previously, and return that result
-            let table = shard.raw().read().unwrap();
-            if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
-                match entry.value.get_or_wait() {
-                    Ok(id) => return EvalResult::Cached(id),
-                    Err(pending) => return EvalResult::Pending(pending),
-                }
+            let table = shard.read().unwrap();
+            if let Some(result) = self.try_get_or_wait(&table, hash, &input) {
+                return result;
             }
         }
 
-        {
+        let id = {
             // Else we have to insert the slot ourselves.
+            let mut table = shard.write().unwrap();
+
             // We also have to check for a race condition where another thread inserted its slot
             // while we were still waiting for the write lock.
-            let mut table = shard.raw().write().unwrap();
-            if let Some(entry) = table.get(hash, self.entries.eq_fn(&input)) {
-                match entry.value.get_or_wait() {
-                    Ok(id) => return EvalResult::Cached(id),
-                    Err(pending) => return EvalResult::Pending(pending),
-                }
+            if let Some(result) = self.try_get_or_wait(&table, hash, &input) {
+                return result;
             }
 
             // take ownership of the slot, by marking it as being in progress by us
-            let entry = crate::shard_map::Entry::new(input.clone(), QueryProgress::new());
-            table.insert_entry(hash, entry, self.entries.hash_fn());
-        }
+            self.insert(&mut table, hash, &input, |input| self.entries.hash(input))
+        };
 
-        EvalResult::Eval(self.execute_query(db, input, hash))
+        EvalResult::Eval(self.execute_query(db, id, input))
     }
 
     unsafe fn output(&self, id: Id) -> &<Self::Query as Query>::Output {
@@ -204,7 +177,7 @@ where
 
     unsafe fn dependencies(&self, id: Id) -> &[Dependency] {
         let slot = self.output(id);
-        self.outputs.dependencies(slot.dependencies.clone())
+        self.storage.dependencies(slot.dependencies.clone())
     }
 }
 
@@ -214,7 +187,57 @@ impl<Q: Query> HashQueryCache<Q> {
     /// The caller must ensure that the output slot associated with the given `id` has been
     /// initialized.
     unsafe fn output(&self, id: Id) -> &OutputSlot<Q::Output> {
-        self.outputs.slots.get_unchecked(id.raw.get() as usize)
+        let slot = self.storage.slots.get_unchecked(id.raw.get() as usize);
+        (*slot.output.get()).assume_init_ref()
+    }
+
+    fn try_get_or_wait<Eval>(
+        &self,
+        table: &RawTable<Id>,
+        hash: u64,
+        input: &<Q as Query>::Input,
+    ) -> Option<EvalResult<Eval, impl Future<Output = Id> + '_>>
+    where
+        Q::Input: Eq,
+    {
+        let eq_fn = |key: &Id| {
+            let slot = unsafe { self.storage.slot(*key) };
+            slot.input == *input
+        };
+
+        let id = *table.get(hash, eq_fn)?;
+        let slot = unsafe { self.storage.slot(id) };
+
+        match slot.try_wait() {
+            None => Some(EvalResult::Cached(id)),
+            Some(fut) => Some(EvalResult::Pending(async move {
+                fut.await;
+                id
+            })),
+        }
+    }
+
+    fn insert(
+        &self,
+        table: &mut RawTable<Id>,
+        hash: u64,
+        input: &<Q as Query>::Input,
+        hasher: impl Fn(&Q::Input) -> u64,
+    ) -> Id
+    where
+        Q::Input: Clone,
+    {
+        let index = self.storage.slots.push(QuerySlot::new(input.clone()));
+        let id = Id::new(NonMaxU32::new(index as u32).expect("exhausted IDs"));
+
+        let hash_fn = |key: &Id| -> u64 {
+            let slot = unsafe { self.storage.slot(*key) };
+            hasher(&slot.input)
+        };
+
+        table.insert(hash, id, hash_fn);
+
+        id
     }
 }
 
@@ -225,42 +248,22 @@ where
     fn execute_query<'a>(
         &'a self,
         db: &'a IngredientDatabase<Q>,
+        id: Id,
         input: Q::Input,
-        hash: u64,
-    ) -> HashQueryCacheTask<'a, Q>
-    where
-        Q::Input: Clone,
-    {
-        let result = db.runtime().execute_query::<Q>(db, input.clone());
+    ) -> HashQueryCacheTask<'a, Q> {
+        let result = db.runtime().execute_query::<Q>(db, input);
         HashQueryCacheTask {
             cache: self,
-            input,
-            input_hash: hash,
-            result,
-        }
-    }
-
-    fn insert(&self, input: &Q::Input, hash: u64, result: ExecutionResult<Q::Output>) -> Id {
-        let index = self.outputs.push(result.output, &result.dependencies);
-        let id = Id::try_from_usize(index).expect("exhausted query IDs");
-
-        // make the value available for other threads
-        let shard = self.entries.shard(hash).raw().read().unwrap();
-        let entry = shard.get(hash, self.entries.eq_fn(input)).unwrap();
-        match entry.value.finish(id) {
-            Ok(id) => id,
-            // the query was evaluated twice, so we have to reuse the previous result for
-            // consistency.
-            Err(id) => id,
+            id,
+            future: result,
         }
     }
 }
 
 pub struct HashQueryCacheTask<'a, Q: Query> {
     cache: &'a HashQueryCache<Q>,
-    input: Q::Input,
-    input_hash: u64,
-    result: QueryFuture<'a, Q>,
+    id: Id,
+    future: QueryFuture<'a, Q>,
 }
 
 impl<Q: Query> QueryTask for HashQueryCacheTask<'_, Q>
@@ -286,11 +289,15 @@ where
         let this = unsafe { self.get_unchecked_mut() };
 
         // SAFETY: `result` points to `self`, which is `Pin`
-        let result = unsafe { Pin::new_unchecked(&mut this.result) };
-        let output = std::task::ready!(result.poll(cx));
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        let result = std::task::ready!(future.poll(cx));
 
-        let id = this.cache.insert(&this.input, this.input_hash, output);
+        unsafe {
+            this.cache
+                .storage
+                .finish(this.id, result.output, &result.dependencies);
+        }
 
-        std::task::Poll::Ready(id)
+        std::task::Poll::Ready(this.id)
     }
 }

@@ -36,6 +36,19 @@ pub struct IngredientPath {
     container: u8,
 }
 
+impl IngredientPath {
+    pub(crate) fn encode_u16(self) -> u16 {
+        (self.storage as u16) << 8 | (self.container as u16)
+    }
+
+    pub(crate) fn decode_u16(x: u16) -> Self {
+        Self {
+            storage: (x >> 8) as u8,
+            container: x as u8,
+        }
+    }
+}
+
 /// Contains all storage that is needed for the database
 pub struct DatabaseStorage<DB: WithStorages> {
     storages: DB::StorageList,

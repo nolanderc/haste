@@ -259,9 +259,7 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => {
-                drop(db.runtime().spawn_query(eval));
-            }
+            EvalResult::Eval(eval) => drop(db.runtime().spawn_query(eval)),
         }
     }
 

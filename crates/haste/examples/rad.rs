@@ -1,4 +1,5 @@
 #![feature(type_alias_impl_trait)]
+#![feature(trivial_bounds)]
 
 use std::num::NonZeroU32;
 
@@ -14,7 +15,15 @@ pub struct Database {
 impl Db for Database {}
 
 #[haste::storage]
-pub struct Storage(Text, fib, Person, smallest_factor, factors, next_prime);
+pub struct Storage(
+    Text,
+    fib,
+    Person,
+    smallest_factor,
+    factors,
+    next_prime,
+    cyclic,
+);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,6 +85,16 @@ async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
     next_prime::spawn(db, n + 1).await
 }
 
+#[haste::query]
+#[clone]
+async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
+    eprintln!("cyclic({n})");
+    match n {
+        0..=3 => cyclic::spawn(db, n + 1).await,
+        _ => cyclic::spawn(db, 0).await,
+    }
+}
+
 fn main() {
     let mut db = Database::default();
 
@@ -83,22 +102,24 @@ fn main() {
 
     // a scope is a region of code within which we can safely spawn tasks
     haste::scope(&mut db, |scope, db| {
-        let max = 1_000_000;
+        // let max = 1_000_000;
+        //
+        // std::thread::scope(|threads| {
+        //     let signal = haste::util::DropSignal::new();
+        //
+        //     for _ in 0..8 {
+        //         let signal = signal.wait();
+        //         threads.spawn(|| scope.block_on(signal));
+        //     }
+        //
+        //     scope.block_on(async {
+        //         for i in 0..max {
+        //             next_prime(db, i).await;
+        //         }
+        //     });
+        // })
 
-        std::thread::scope(|threads| {
-            let signal = haste::util::DropSignal::new();
-
-            for _ in 0..8 {
-                let signal = signal.wait();
-                threads.spawn(|| scope.block_on(signal));
-            }
-
-            scope.block_on(async {
-                for i in 0..max {
-                    next_prime(db, i).await;
-                }
-            });
-        })
+        dbg!(scope.block_on(cyclic(db, 0)));
     });
 
     let duration = start.elapsed();

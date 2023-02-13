@@ -2839,8 +2839,6 @@ fn parse_hex_float(text: &str) -> Result<FloatBits, NumberError> {
         }
     }
 
-    dbg!(mantissa, exponent);
-
     if mantissa == 0 {
         return Ok(FloatBits::Small(FloatBits64::new(0.0)));
     }

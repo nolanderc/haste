@@ -1,7 +1,7 @@
 use crate::{
     arena::{Arena, RawArena},
     non_max::NonMaxU32,
-    shard_map::{Entry, ShardMap},
+    shard_map::ShardMap,
     IngredientPath,
 };
 
@@ -10,7 +10,7 @@ use std::hash::Hash;
 pub struct ArenaInterner<T> {
     path: IngredientPath,
     values: Arena<T>,
-    entries: ShardMap<NonMaxU32, ()>,
+    entries: ShardMap<NonMaxU32>,
 }
 
 impl<T: 'static> crate::Container for ArenaInterner<T> {
@@ -49,18 +49,18 @@ where
 }
 
 impl<T> ArenaInterner<T> {
-    fn eq_fn<'a>(&'a self, value: &'a T) -> impl Fn(&Entry<NonMaxU32, ()>) -> bool + 'a
+    fn eq_fn<'a>(&'a self, value: &'a T) -> impl Fn(&NonMaxU32) -> bool + 'a
     where
         T: Eq,
     {
-        move |entry| self.get(entry.key).unwrap() == value
+        move |entry| self.get(*entry).unwrap() == value
     }
 
-    fn hash_fn(&self) -> impl Fn(&Entry<NonMaxU32, ()>) -> u64 + '_
+    fn hash_fn(&self) -> impl Fn(&NonMaxU32) -> u64 + '_
     where
         T: Hash,
     {
-        move |entry| self.entries.hash(self.get(entry.key).unwrap())
+        move |entry| self.entries.hash(self.get(*entry).unwrap())
     }
 
     /// Get a value in the interner.
@@ -76,26 +76,25 @@ impl<T> ArenaInterner<T> {
         T: Hash + Eq,
     {
         let hash = self.entries.hash(&value);
-        let shard = self.entries.shard(hash).raw();
+        let shard = self.entries.shard(hash);
 
         {
             // check if the value already exists in the interner
             let table = shard.read().unwrap();
             if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-                return old.key;
+                return *old;
             }
         }
 
         let mut table = shard.write().unwrap();
         if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-            return old.key;
+            return *old;
         }
 
         // add the value into the interner, returing its key
         let index = self.values.push(value);
         let key = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
-        let entry = Entry { key, value: () };
-        table.insert_entry(hash, entry, self.hash_fn());
+        table.insert_entry(hash, key, self.hash_fn());
         key
     }
 }
@@ -104,7 +103,7 @@ pub struct StringInterner {
     path: IngredientPath,
     bytes: RawArena<u8>,
     ranges: Arena<StringRange>,
-    entries: ShardMap<NonMaxU32, ()>,
+    entries: ShardMap<NonMaxU32>,
 }
 
 unsafe impl Sync for StringInterner {}
@@ -263,27 +262,26 @@ impl StringInterner {
         );
 
         let hash = self.entries.hash(string);
-        let shard = self.entries.shard(hash).raw();
+        let shard = self.entries.shard(hash);
 
         {
             // check if the value already exists in the interner
             let table = shard.read().unwrap();
             if let Some(old) = table.get(hash, self.eq_fn(string)) {
-                return old.key;
+                return *old;
             }
         }
 
         let mut table = shard.write().unwrap();
         if let Some(old) = table.get(hash, self.eq_fn(string)) {
-            return old.key;
+            return *old;
         }
 
         // add the value into the interner, returing its key
         let range = self.allocate_range(string);
         let index = self.ranges.push(range);
         let key = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
-        let entry = Entry { key, value: () };
-        table.insert_entry(hash, entry, self.hash_fn());
+        table.insert_entry(hash, key, self.hash_fn());
         key
     }
 
@@ -306,12 +304,12 @@ impl StringInterner {
         }
     }
 
-    fn eq_fn<'a>(&'a self, value: &'a str) -> impl Fn(&Entry<NonMaxU32, ()>) -> bool + 'a {
-        move |entry| self.get(entry.key) == Some(value)
+    fn eq_fn<'a>(&'a self, value: &'a str) -> impl Fn(&NonMaxU32) -> bool + 'a {
+        move |entry| self.get(*entry) == Some(value)
     }
 
-    fn hash_fn(&self) -> impl Fn(&Entry<NonMaxU32, ()>) -> u64 + '_ {
-        move |entry| self.entries.hash(self.get(entry.key).unwrap())
+    fn hash_fn(&self) -> impl Fn(&NonMaxU32) -> u64 + '_ {
+        move |entry| self.entries.hash(self.get(*entry).unwrap())
     }
 }
 

@@ -88,9 +88,8 @@ async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
 #[haste::query]
 #[clone]
 async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
-    eprintln!("cyclic({n})");
     match n {
-        0..=3 | 7..=9 => cyclic::spawn(db, n + 1).await,
+        0..=3 | 5..=6 => cyclic::spawn(db, n + 1).await,
         _ => cyclic::spawn(db, 0).await,
     }
 }
@@ -119,7 +118,7 @@ fn main() {
         //     });
         // })
 
-        dbg!(scope.block_on(cyclic::spawn(db, 8)));
+        dbg!(scope.block_on(cyclic::spawn(db, 5)));
     });
 
     let duration = start.elapsed();

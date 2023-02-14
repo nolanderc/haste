@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use crate::{Database, IngredientPath};
 
-/// A graph containing of queries and the 
+/// A graph containing of queries and the
 #[derive(Default)]
 pub struct CycleGraph {
     vertices: HashMap<IngredientPath, Vertex>,
@@ -73,11 +73,12 @@ impl CycleGraph {
                 return None;
             }
 
-            curr = if self.vertices.contains_key(&vertex.last_in_chain) {
-                // jump ahead to the last known query in the chain
+            curr = if vertex.last_in_chain == vertex.blocked_on {
+                vertex.blocked_on
+            } else if self.vertices.contains_key(&vertex.last_in_chain) {
+                // the cached query is still valid, so continue from there
                 vertex.last_in_chain
             } else {
-                // otherwise just advance one step
                 vertex.blocked_on
             };
 
@@ -97,7 +98,8 @@ impl CycleGraph {
 
         // at this point we have found a cycle starting at `curr == source`
 
-        // collect *all* the queries that are a part of the cycle
+        // collect *all* queries that are a part of the cycle
+        // TODO: check if any query can recover from a cycle
         paths.clear();
         loop {
             paths.push(curr);

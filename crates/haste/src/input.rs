@@ -1,12 +1,12 @@
-use crate::{arena::Arena, Id, IngredientPath};
+use crate::{arena::Arena, Id, ContainerPath};
 
 pub struct InputStorage<T> {
-    path: IngredientPath,
+    path: ContainerPath,
     arena: Arena<T>,
 }
 
 impl<T: 'static> crate::Container for InputStorage<T> {
-    fn new(path: IngredientPath) -> Self {
+    fn new(path: ContainerPath) -> Self {
         Self {
             path,
             arena: Default::default(),
@@ -15,7 +15,7 @@ impl<T: 'static> crate::Container for InputStorage<T> {
 }
 
 impl<T: 'static> crate::DynContainer for InputStorage<T> {
-    fn path(&self) -> IngredientPath {
+    fn path(&self) -> ContainerPath {
         self.path
     }
 }

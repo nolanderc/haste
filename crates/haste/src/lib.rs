@@ -1,5 +1,6 @@
 #![feature(type_alias_impl_trait)]
 #![feature(trivial_bounds)]
+#![allow(clippy::uninlined_format_args)]
 
 mod arena;
 pub mod fmt;
@@ -59,7 +60,7 @@ pub unsafe trait Database: Sync {
     fn dyn_storage(&self, typ: TypeId) -> Option<&dyn DynStorage>;
 
     /// Gets the storage for the given ingredient.
-    fn dyn_storage_path(&self, path: IngredientPath) -> Option<&dyn DynStorage>;
+    fn dyn_storage_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
 }
 
 /// Implemented by databases which contain a specific type of storage.
@@ -97,6 +98,8 @@ pub trait Query: Ingredient {
     type Future<'db>: std::future::Future<Output = Self::Output> + Send;
 
     fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
+
+    fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 }
 
 pub trait Intern: Ingredient + TrackedReference
@@ -188,7 +191,7 @@ pub trait DatabaseExt: Database {
             };
 
             runtime.register_dependency(Dependency {
-                ingredient: cache.path(),
+                container: cache.path(),
                 resource: id,
                 extra: 0,
             });
@@ -216,7 +219,7 @@ pub trait DatabaseExt: Database {
 
         let result = match cache.get_or_evaluate(db, input) {
             EvalResult::Cached(id) => EvalResult::Cached(id),
-            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval)),
+            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval, db.as_dyn())),
             EvalResult::Pending(pending) => EvalResult::Pending(pending),
         };
 
@@ -228,7 +231,7 @@ pub trait DatabaseExt: Database {
             };
 
             runtime.register_dependency(Dependency {
-                ingredient: cache.path(),
+                container: cache.path(),
                 resource: id,
                 extra: 0,
             });
@@ -259,7 +262,7 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => drop(db.runtime().spawn_query(eval)),
+            EvalResult::Eval(eval) => drop(db.runtime().spawn_query(eval, db.as_dyn())),
         }
     }
 
@@ -304,7 +307,7 @@ pub trait DatabaseExt: Database {
         let id = handle.id();
         let value = container.get_untracked(id);
         runtime.register_dependency(Dependency {
-            ingredient: container.path(),
+            container: container.path(),
             resource: id,
             extra: 0,
         });

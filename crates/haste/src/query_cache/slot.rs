@@ -14,7 +14,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-use crate::{AtomicDependency, Query};
+use crate::Query;
 
 pub struct QuerySlot<Q: Query> {
     /// The input value associated with the query.
@@ -44,15 +44,12 @@ pub struct QueryState {
     output: AtomicU32,
 
     blocked: Mutex<Option<Box<BlockedState>>>,
-
-    /// If set, this query is currently blocked on another query.
-    pub blocked_on: AtomicDependency,
 }
 
 const FINISHED: u32 = 0x1;
 const WRITE_OUTPUT: u32 = 0x2;
 
-struct BlockedState {
+pub(crate) struct BlockedState {
     /// List of wakers blocked on the output from the query.
     wakers: SmallVec<[Waker; 8]>,
 }
@@ -96,12 +93,8 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     /// Block on the query until it finishes
-    pub fn try_wait(&self) -> Option<impl Future<Output = &OutputSlot<Q::Output>>> {
-        let fut = self.state.try_wait()?;
-        Some(async move {
-            fut.await;
-            unsafe { self.output_assume_init() }
-        })
+    pub fn try_wait(&self) -> Option<impl Future<Output = ()> + '_> {
+        self.state.try_wait()
     }
 }
 
@@ -110,7 +103,6 @@ impl QueryState {
         Self {
             output: AtomicU32::new(0),
             blocked: Mutex::new(None),
-            blocked_on: AtomicDependency::new(None),
         }
     }
 

@@ -55,6 +55,9 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     let mut tokens = TokenStream::new();
 
+    let query_name = ident.to_string();
+    let input_count = input_idents.len();
+
     tokens.extend(quote! {
         #[allow(non_camel_case_types)]
         #vis enum #ident {}
@@ -75,6 +78,14 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
             fn execute(db: &dyn #db_path, input: #input_type) -> Self::Future<'_> {
                 Self::#ident(db, #input_spread)
+            }
+
+            fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                if #input_count == 1 {
+                    write!(f, "{}({:?})", #query_name, input)
+                } else {
+                    write!(f, "{}{:?}", #query_name, input)
+                }
             }
         }
     });

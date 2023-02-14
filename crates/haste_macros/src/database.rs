@@ -39,7 +39,7 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     haste::StorageList::get(self.storage.list(), id)
                 }
 
-                fn dyn_storage_path(&self, path: haste::IngredientPath) -> Option<&dyn haste::DynStorage> {
+                fn dyn_storage_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynStorage> {
                     haste::StorageList::get_path(self.storage.list(), path)
                 }
             }

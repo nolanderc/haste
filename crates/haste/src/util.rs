@@ -1,4 +1,5 @@
 mod signal;
+pub mod fmt;
 
 pub use signal::{DropSignal, Signal, WaitSignal};
 

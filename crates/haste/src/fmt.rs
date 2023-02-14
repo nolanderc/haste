@@ -77,7 +77,7 @@ where
         self.raw.dyn_storage(typ)
     }
 
-    fn dyn_storage_path(&self, path: crate::IngredientPath) -> Option<&dyn crate::DynStorage> {
+    fn dyn_storage_path(&self, path: crate::ContainerPath) -> Option<&dyn crate::DynStorage> {
         self.raw.dyn_storage_path(path)
     }
 }

@@ -14,7 +14,7 @@ use std::{
 
 use crossbeam_deque::{Injector, Worker};
 
-use crate::util::CallOnDrop;
+use crate::{util::CallOnDrop, IngredientPath};
 
 pub struct Scheduler {
     injector: Injector<RawTask>,
@@ -183,10 +183,8 @@ impl Scheduler {
 }
 
 pub trait QueryTask: Future<Output = crate::Id> {
-    /// Emit a human-readable description of the query.
-    ///
-    /// TODO: make this also machine-readable
-    fn description(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+    /// Get a unique identifier for the query.
+    fn query(&self) -> IngredientPath;
 }
 
 #[repr(C)]

@@ -2,19 +2,19 @@ use crate::{
     arena::{Arena, RawArena},
     non_max::NonMaxU32,
     shard_map::ShardMap,
-    IngredientPath,
+    ContainerPath,
 };
 
 use std::hash::Hash;
 
 pub struct ArenaInterner<T> {
-    path: IngredientPath,
+    path: ContainerPath,
     values: Arena<T>,
     entries: ShardMap<NonMaxU32>,
 }
 
 impl<T: 'static> crate::Container for ArenaInterner<T> {
-    fn new(path: IngredientPath) -> Self {
+    fn new(path: ContainerPath) -> Self {
         Self {
             path,
             values: Arena::new(),
@@ -24,7 +24,7 @@ impl<T: 'static> crate::Container for ArenaInterner<T> {
 }
 
 impl<T: 'static> crate::DynContainer for ArenaInterner<T> {
-    fn path(&self) -> IngredientPath {
+    fn path(&self) -> ContainerPath {
         self.path
     }
 }
@@ -100,7 +100,7 @@ impl<T> ArenaInterner<T> {
 }
 
 pub struct StringInterner {
-    path: IngredientPath,
+    path: ContainerPath,
     bytes: RawArena<u8>,
     ranges: Arena<StringRange>,
     entries: ShardMap<NonMaxU32>,
@@ -196,7 +196,7 @@ impl InlineString {
 }
 
 impl crate::Container for StringInterner {
-    fn new(path: IngredientPath) -> Self {
+    fn new(path: ContainerPath) -> Self {
         Self {
             path,
             bytes: RawArena::new(),
@@ -207,7 +207,7 @@ impl crate::Container for StringInterner {
 }
 
 impl crate::DynContainer for StringInterner {
-    fn path(&self) -> IngredientPath {
+    fn path(&self) -> ContainerPath {
         self.path
     }
 }
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn interning() {
         let mut router = crate::StorageRouter::new();
-        let interner = ArenaInterner::new(router.next_ingredient());
+        let interner = ArenaInterner::new(router.next_container());
 
         let a = interner.intern("hello");
         let b = interner.intern("bye");

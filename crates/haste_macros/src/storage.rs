@@ -74,13 +74,20 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
             fn new(router: &mut haste::StorageRouter) -> Self {
                 Self {
                     #(
-                        #field_members: <#container_types as haste::Container>::new(router.next_ingredient()),
+                        #field_members: <#container_types as haste::Container>::new(router.next_container()),
                     )*
                 }
             }
         }
 
-        impl haste::DynStorage for #ident {}
+        impl haste::DynStorage for #ident {
+            fn dyn_container(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
+                match path.container {
+                    #( #field_members => Some(&self.#field_members), )*
+                    _ => None,
+                }
+            }
+        }
     });
 
     let mut tokens = strukt.to_token_stream();

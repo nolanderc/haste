@@ -1,3 +1,4 @@
+mod cycle_graph;
 mod task;
 
 use std::{
@@ -6,18 +7,23 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
-use crate::{non_max::NonMaxU32, IngredientDatabase, IngredientPath, Query};
+use futures_lite::FutureExt;
+
+use crate::{
+    non_max::NonMaxU32, ContainerPath, Database, IngredientDatabase, IngredientPath, Query,
+};
 
 pub use self::task::QueryTask;
-use self::task::Scheduler;
+use self::{cycle_graph::CycleGraph, task::Scheduler};
 
 pub struct Runtime {
     tokio: Option<tokio::runtime::Runtime>,
     scheduler: Arc<Scheduler>,
+    graph: Mutex<CycleGraph>,
 }
 
 impl Default for Runtime {
@@ -25,6 +31,7 @@ impl Default for Runtime {
         Self {
             tokio: None,
             scheduler: Arc::new(Scheduler::new()),
+            graph: Default::default(),
         }
     }
 }
@@ -34,12 +41,12 @@ pub struct ExecutionResult<O> {
     pub dependencies: Vec<Dependency>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Dependency {
-    pub ingredient: IngredientPath,
-    pub resource: crate::Id,
-    /// Extra information carried by the dependency
-    pub extra: u16,
+    pub(crate) container: ContainerPath,
+    pub(crate) resource: crate::Id,
+    /// Extra information carried by the dependency (such as the active field)
+    pub(crate) extra: u16,
 }
 
 const _: () = assert!(
@@ -47,22 +54,34 @@ const _: () = assert!(
     "the size of Dependencies should be kept small to be nice to the cache"
 );
 
+impl std::fmt::Debug for Dependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}.{}",
+            self.container.encode_u16(),
+            self.resource.raw,
+            self.extra
+        )
+    }
+}
+
 impl Dependency {
     /// A 64-bit value representing a missing dependency.
     pub(crate) const NONE: u64 = u64::MAX;
 
     /// Encode the dependency in 64-bits
     pub(crate) fn encode_u64(self) -> u64 {
-        let ingredient = self.ingredient.encode_u16() as u64;
+        let ingredient = self.container.encode_u16() as u64;
         let resource = self.resource.raw.get() as u64;
         let extra = self.extra as u64;
         (ingredient << 48) | (resource << 16) | extra
     }
 
-    /// Decode the dependency from
+    /// Decode the dependency from a 64-bit value
     pub(crate) fn decode_u64(x: u64) -> Option<Self> {
         Some(Self {
-            ingredient: IngredientPath::decode_u16((x >> 48) as u16),
+            container: ContainerPath::decode_u16((x >> 48) as u16),
             resource: crate::Id::new(NonMaxU32::new((x >> 16) as u32)?),
             extra: x as u16,
         })
@@ -95,14 +114,19 @@ impl AtomicDependency {
 }
 
 /// All data required to execute a task
+#[derive(Debug)]
 struct TaskData {
-    /// List of all task dependencies
+    /// An ingredient representing the query of this task
+    this: IngredientPath,
+
+    /// List of all direct dependencies of this task
     dependencies: Vec<Dependency>,
 }
 
 impl TaskData {
-    fn new() -> Self {
+    fn new(this: IngredientPath) -> Self {
         Self {
+            this,
             dependencies: Vec::new(),
         }
     }
@@ -118,6 +142,13 @@ impl ActiveData {
         Self {
             task: Cell::new(None),
         }
+    }
+
+    fn current_task(&self) -> Option<IngredientPath> {
+        let task = self.task.replace(None)?;
+        let current = task.this;
+        self.task.set(Some(task));
+        Some(current)
     }
 }
 
@@ -145,16 +176,20 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
             let this = self.get_unchecked_mut();
             let inner = Pin::new_unchecked(&mut this.inner);
 
+            if this.task.is_none() {
+                panic!("polled query after it has already completed");
+            }
+
             // set the current task as active when polling the query
             let old_task = active.task.replace(this.task.take());
-
             let poll_inner = inner.poll(ctx);
 
-            // we then restore the previous task (if any)
+            // restore the previous task
             this.task = active.task.replace(old_task);
 
             // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
+
             let dependencies = this.task.take().unwrap().dependencies;
 
             std::task::Poll::Ready(ExecutionResult {
@@ -170,10 +205,11 @@ impl Runtime {
         &self,
         db: &'db IngredientDatabase<Q>,
         input: Q::Input,
+        this: IngredientPath,
     ) -> QueryFuture<'db, Q> {
         QueryFuture {
             inner: Q::execute(db, input),
-            task: Some(TaskData::new()),
+            task: Some(TaskData::new(this)),
         }
     }
 
@@ -186,13 +222,37 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn spawn_query<'a, T>(&'a self, task: T) -> impl Future<Output = crate::Id>
+    /// Called when the execution of a query would block on another
+    pub(crate) fn would_block_on(&self, other: IngredientPath, db: &dyn Database) {
+        ACTIVE.with(|active| {
+            let Some(this) = active.current_task() else { return };
+            eprintln!("{:?} is blocked on {:?}", this, other);
+            if let Some(cycle) = self.graph.lock().unwrap().insert(this, other) {
+                panic!("encountered a dependency cycle: {:#}", cycle.fmt(db))
+            }
+        })
+    }
+
+    pub(crate) fn unblock(&self, other: IngredientPath, _db: &dyn Database) {
+        ACTIVE.with(|active| {
+            let Some(this) = active.current_task() else { return };
+            eprintln!("{:?} is no longer blocked on {:?}", this, other);
+            self.graph.lock().unwrap().remove(this, other);
+        })
+    }
+
+    pub(crate) fn spawn_query<'a, T>(
+        &'a self,
+        task: T,
+        db: &'a dyn Database,
+    ) -> impl Future<Output = crate::Id> + 'a
     where
         T: QueryTask + Send + 'a,
     {
-        unsafe {
-            let _tokio = self.executor();
+        let _tokio = self.executor();
+        let query_path = task.query();
 
+        let mut handle = unsafe {
             // extend the lifetime of the task to allow it to be stored in the runtime
             // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
             // Thus the lifetime of this task is ensured to outlive that.
@@ -200,8 +260,27 @@ impl Runtime {
                 Box<dyn QueryTask + Send + 'a>,
                 Box<dyn QueryTask + Send + 'static>,
             >(Box::new(task));
+
             self.scheduler.spawn(task)
-        }
+        };
+
+        let mut is_blocked = false;
+
+        std::future::poll_fn(move |cx| {
+            let result = handle.poll(cx);
+
+            if result.is_pending() && !is_blocked {
+                self.would_block_on(query_path, db);
+                is_blocked = true;
+            }
+
+            if result.is_ready() && is_blocked {
+                self.unblock(query_path, db);
+                is_blocked = false;
+            }
+
+            result
+        })
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output

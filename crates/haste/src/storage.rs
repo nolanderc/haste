@@ -1,4 +1,4 @@
-use crate::{Database, WithStorage};
+use crate::{non_max::NonMaxU32, Database, DynQueryCache, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage: DynStorage {
@@ -8,7 +8,9 @@ pub trait Storage: DynStorage {
     fn new(router: &mut StorageRouter) -> Self;
 }
 
-pub trait DynStorage: std::any::Any {}
+pub trait DynStorage: std::any::Any {
+    fn dyn_container(&self, path: ContainerPath) -> Option<&dyn DynContainer>;
+}
 
 impl dyn DynStorage {
     pub(crate) fn downcast<S: 'static>(&self) -> Option<&S> {
@@ -23,20 +25,36 @@ impl dyn DynStorage {
 
 /// Stores the data requried by a single ingredient
 pub trait Container: DynContainer {
-    fn new(path: IngredientPath) -> Self;
+    fn new(path: ContainerPath) -> Self;
 }
 
 pub trait DynContainer: 'static {
-    fn path(&self) -> IngredientPath;
+    fn path(&self) -> ContainerPath;
+
+    /// # Safety
+    ///
+    /// The value which is being formatted must be valid in the current revision
+    unsafe fn fmt(
+        &self,
+        path: IngredientPath,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "{:?}", path)
+    }
+
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
+        None
+    }
 }
 
+/// Identifies a single container in a database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IngredientPath {
-    storage: u8,
-    container: u8,
+pub struct ContainerPath {
+    pub storage: u8,
+    pub container: u8,
 }
 
-impl IngredientPath {
+impl ContainerPath {
     pub(crate) fn encode_u16(self) -> u16 {
         (self.storage as u16) << 8 | (self.container as u16)
     }
@@ -46,6 +64,34 @@ impl IngredientPath {
             storage: (x >> 8) as u8,
             container: x as u8,
         }
+    }
+}
+
+/// Identifies a single resource in a database
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IngredientPath {
+    pub container: ContainerPath,
+    pub resource: crate::Id,
+}
+
+impl IngredientPath {
+    pub(crate) fn encode_u64(self) -> u64 {
+        let container = self.container.encode_u16() as u64;
+        let resource = self.resource.raw.get() as u64;
+        (container << 32) | resource
+    }
+
+    pub(crate) fn decode_u64(x: u64) -> Option<Self> {
+        Some(Self {
+            container: ContainerPath::decode_u16((x >> 32) as u16),
+            resource: crate::Id::new(NonMaxU32::new(x as u32)?),
+        })
+    }
+}
+
+impl std::fmt::Debug for IngredientPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.container.encode_u16(), self.resource.raw,)
     }
 }
 
@@ -65,19 +111,19 @@ pub trait StorageList {
         Self: Sized;
 
     fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage>;
-    fn get_path(&self, path: IngredientPath) -> Option<&dyn DynStorage>;
+    fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
 }
 
 pub struct StorageRouter {
     max_storages: usize,
-    next_path: IngredientPath,
+    next_path: ContainerPath,
 }
 
 impl StorageRouter {
     pub(crate) fn new() -> Self {
         Self {
             max_storages: u8::MAX as usize,
-            next_path: IngredientPath {
+            next_path: ContainerPath {
                 storage: 0,
                 container: 0,
             },
@@ -91,7 +137,7 @@ impl StorageRouter {
         self.next_path.storage += 1;
     }
 
-    pub fn next_ingredient(&mut self) -> IngredientPath {
+    pub fn next_container(&mut self) -> ContainerPath {
         let id = self.next_path;
         self.next_path.container += 1;
         id
@@ -147,7 +193,7 @@ macro_rules! impl_tuple {
                 None
             }
 
-            fn get_path(&self, path: IngredientPath) -> Option<&dyn DynStorage> {
+            fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage> {
                 let ($($T,)*) = self;
 
                 let mut i = 0;

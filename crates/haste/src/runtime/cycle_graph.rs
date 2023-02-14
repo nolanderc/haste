@@ -13,12 +13,12 @@ pub struct CycleGraph {
 struct Vertex {
     /// The query this is blocked on
     blocked_on: IngredientPath,
-    /// Points to the last known query in the dependency chain. 
+    /// Points to the last known query in the dependency chain.
     /// This pointer is only valid for as long as the corresponding query is a valid `Vertex`.
     /// This is used as an optimization to reduce the number nodes that need to be visited when
-    /// detecting cycles. 
+    /// detecting cycles.
     last_in_chain: Option<IngredientPath>,
-    /// If we have found a cycle previously it is stored here.
+    /// If we have found a cycle for this query previously it is stored here.
     cycle: Option<Cycle>,
 }
 
@@ -33,7 +33,10 @@ impl CycleGraph {
                 }
 
                 panic!(
-                    "the query `{:?}` is blocked on two queries at once ({:?} and {:?})",
+                    concat!(
+                        "the query `{:?}` is blocked on two queries at once ({:?} and {:?})",
+                        "\nhelp: use `spawn` or `prefetch` to execute queries concurrently"
+                    ),
                     source, previous.blocked_on, target
                 );
             }

@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 
 use crate::{Database, IngredientPath};
 
+/// A graph containing of queries and the 
 #[derive(Default)]
 pub struct CycleGraph {
     vertices: HashMap<IngredientPath, Vertex>,
@@ -17,7 +18,7 @@ struct Vertex {
     /// This pointer is only valid for as long as the corresponding query is a valid `Vertex`.
     /// This is used as an optimization to reduce the number nodes that need to be visited when
     /// detecting cycles.
-    last_in_chain: Option<IngredientPath>,
+    last_in_chain: IngredientPath,
     /// If we have found a cycle for this query previously it is stored here.
     cycle: Option<Cycle>,
 }
@@ -43,7 +44,7 @@ impl CycleGraph {
             hash_map::Entry::Vacant(entry) => {
                 entry.insert(Vertex {
                     blocked_on: target,
-                    last_in_chain: None,
+                    last_in_chain: target,
                     cycle: None,
                 });
                 self.find_cycle(source)
@@ -72,12 +73,13 @@ impl CycleGraph {
                 return None;
             }
 
-            match vertex.last_in_chain {
-                // jump ahead to the last known query in the chain if possible:
-                Some(last) if self.vertices.contains_key(&last) => curr = last,
+            curr = if self.vertices.contains_key(&vertex.last_in_chain) {
+                // jump ahead to the last known query in the chain
+                vertex.last_in_chain
+            } else {
                 // otherwise just advance one step
-                _ => curr = vertex.blocked_on,
-            }
+                vertex.blocked_on
+            };
 
             if curr == source {
                 break;
@@ -88,7 +90,7 @@ impl CycleGraph {
             // not a cycle, but all visited queries are blocked on the same query, so add new
             // shortcuts to the last node
             for path in paths {
-                self.vertices.get_mut(&path).unwrap().last_in_chain = Some(curr);
+                self.vertices.get_mut(&path).unwrap().last_in_chain = curr;
             }
             return None;
         }

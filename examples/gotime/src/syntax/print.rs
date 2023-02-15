@@ -4,17 +4,15 @@ use super::*;
 
 use std::fmt::Write;
 
-pub struct PrettyWriter<'db, W> {
-    db: &'db dyn crate::Db,
+pub struct PrettyWriter<W> {
     writer: W,
     indent: usize,
     needs_indent: bool,
 }
 
-impl<'db, W> PrettyWriter<'db, W> {
-    pub fn new(db: &'db dyn crate::Db, writer: W) -> Self {
+impl<W> PrettyWriter<W> {
+    pub fn new(writer: W) -> Self {
         Self {
-            db,
             writer,
             indent: 0,
             needs_indent: true,
@@ -37,7 +35,7 @@ impl<'db, W> PrettyWriter<'db, W> {
     }
 }
 
-impl<W: Write> PrettyWriter<'_, W> {
+impl<W: Write> PrettyWriter<W> {
     fn write_indent(&mut self) -> std::fmt::Result {
         static SPACES: [u8; 256] = [b' '; 256];
         let mut count = self.indent;
@@ -51,7 +49,7 @@ impl<W: Write> PrettyWriter<'_, W> {
     }
 }
 
-impl<W> Write for PrettyWriter<'_, W>
+impl<W> Write for PrettyWriter<W>
 where
     W: Write,
 {
@@ -80,7 +78,7 @@ where
 impl File {
     pub fn display_pretty<'a>(&'a self, db: &'a dyn crate::Db) -> impl std::fmt::Display + 'a {
         db.fmt(crate::util::display_fn(move |f| {
-            let mut writer = PrettyWriter::new(db, f);
+            let mut writer = PrettyWriter::new(f);
             self.write_pretty(&mut writer)
         }))
     }

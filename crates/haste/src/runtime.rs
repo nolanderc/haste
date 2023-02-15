@@ -307,8 +307,8 @@ impl Runtime {
 static ACTIVE_RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
 
 impl Runtime {
-    /// Enter a new scope, allowing tasks to be spawned into it. If the return value is `true`, the
-    /// caller is responsible for exiting the scope.
+    /// Enter a new scope, allowing tasks to be spawned into it. If the return value is `true`,
+    /// the caller is responsible for exiting the scope.
     ///
     /// # Safety
     ///

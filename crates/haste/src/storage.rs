@@ -1,4 +1,4 @@
-use crate::{non_max::NonMaxU32, Database, DynQueryCache, WithStorage};
+use crate::{Database, DynQueryCache, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage: DynStorage {
@@ -65,21 +65,6 @@ impl ContainerPath {
 pub struct IngredientPath {
     pub container: ContainerPath,
     pub resource: crate::Id,
-}
-
-impl IngredientPath {
-    pub(crate) fn encode_u64(self) -> u64 {
-        let container = self.container.encode_u16() as u64;
-        let resource = self.resource.raw.get() as u64;
-        (container << 32) | resource
-    }
-
-    pub(crate) fn decode_u64(x: u64) -> Option<Self> {
-        Some(Self {
-            container: ContainerPath::decode_u16((x >> 32) as u16),
-            resource: crate::Id::new(NonMaxU32::new(x as u32)?),
-        })
-    }
 }
 
 impl std::fmt::Debug for IngredientPath {

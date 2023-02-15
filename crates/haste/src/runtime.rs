@@ -253,7 +253,8 @@ impl Runtime {
         T: QueryTask + Send + 'a,
     {
         let _tokio = self.executor();
-        let query_path = task.query();
+
+        let query_path = task.path();
 
         let mut handle = unsafe {
             // extend the lifetime of the task to allow it to be stored in the runtime
@@ -282,7 +283,7 @@ impl Runtime {
                 is_blocked = false;
             }
 
-            result
+            result.map(|()| query_path.resource)
         })
     }
 

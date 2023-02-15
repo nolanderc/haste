@@ -184,7 +184,7 @@ pub trait DatabaseExt: Database {
         let result = cache.get_or_evaluate(db, input);
 
         async move {
-            let id = match result {
+            let (id, output) = match result {
                 EvalResult::Cached(id) => id,
                 EvalResult::Eval(eval) => eval.await,
                 EvalResult::Pending(pending) => pending.await,
@@ -196,8 +196,7 @@ pub trait DatabaseExt: Database {
                 extra: 0,
             });
 
-            // SAFETY: we just executed this query, so the `id` will be valid.
-            cache.output(id)
+            output
         }
     }
 
@@ -219,14 +218,18 @@ pub trait DatabaseExt: Database {
 
         let result = match cache.get_or_evaluate(db, input) {
             EvalResult::Cached(id) => EvalResult::Cached(id),
-            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval, db.as_dyn())),
             EvalResult::Pending(pending) => EvalResult::Pending(pending),
+            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval, db.as_dyn())),
         };
 
         async move {
-            let id = match result {
+            let (id, output) = match result {
                 EvalResult::Cached(id) => id,
-                EvalResult::Eval(eval) => eval.await,
+                EvalResult::Eval(eval) => {
+                    let id = eval.await;
+                    let output = cache.output(id);
+                    (id, output)
+                }
                 EvalResult::Pending(pending) => pending.await,
             };
 
@@ -236,7 +239,7 @@ pub trait DatabaseExt: Database {
                 extra: 0,
             });
 
-            cache.output(id)
+            output
         }
     }
 

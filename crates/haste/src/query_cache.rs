@@ -15,11 +15,11 @@ use self::storage::{OutputSlot, QueryStorage};
 pub trait QueryCache: crate::Container + DynQueryCache {
     type Query: Query;
 
-    type EvalTask<'a>: QueryTask + Send + 'a
+    type EvalTask<'a>: QueryTask + Future<Output = QueryResult<'a, Self::Query>> + Send + 'a
     where
         Self: 'a;
 
-    type PendingFuture<'a>: Future<Output = Id>
+    type PendingFuture<'a>: Future<Output = QueryResult<'a, Self::Query>>
     where
         Self: 'a;
 
@@ -29,7 +29,7 @@ pub trait QueryCache: crate::Container + DynQueryCache {
         &'a self,
         db: &'a IngredientDatabase<Self::Query>,
         input: <Self::Query as Query>::Input,
-    ) -> EvalResult<Self::EvalTask<'a>, Self::PendingFuture<'a>>;
+    ) -> CacheEvalResult<'a, Self>;
 
     /// Get the output from the query.
     ///
@@ -50,11 +50,19 @@ pub trait QueryCache: crate::Container + DynQueryCache {
 
 pub trait DynQueryCache: DynContainer {}
 
-pub enum EvalResult<Eval, Pending> {
-    Cached(Id),
+pub type QueryResult<'a, Q> = (Id, &'a <Q as Query>::Output);
+
+pub enum EvalResult<Result, Eval, Pending> {
+    Cached(Result),
     Eval(Eval),
     Pending(Pending),
 }
+
+pub type CacheEvalResult<'a, Cache> = EvalResult<
+    QueryResult<'a, <Cache as QueryCache>::Query>,
+    <Cache as QueryCache>::EvalTask<'a>,
+    <Cache as QueryCache>::PendingFuture<'a>,
+>;
 
 pub struct HashQueryCache<Q: Query> {
     path: ContainerPath,
@@ -94,15 +102,15 @@ where
 {
     type Query = Q;
 
-    type EvalTask<'a> = impl QueryTask + Send + 'a where Q: 'a;
+    type EvalTask<'a> = impl QueryTask + Future<Output = QueryResult<'a, Q>> + Send + 'a where Q: 'a;
 
-    type PendingFuture<'a> = impl Future<Output = Id> + 'a where Q: 'a;
+    type PendingFuture<'a> = impl Future<Output = QueryResult<'a, Q>> + 'a where Q: 'a;
 
     fn get_or_evaluate<'a>(
         &'a self,
         db: &'a IngredientDatabase<Q>,
         input: Q::Input,
-    ) -> EvalResult<Self::EvalTask<'a>, Self::PendingFuture<'a>> {
+    ) -> CacheEvalResult<'a, Self> {
         // only hash the input once:
         let hash = self.entries.hash(&input);
         let shard = self.entries.shard(hash);
@@ -162,9 +170,9 @@ impl<Q: Query> HashQueryCache<Q> {
         hash: u64,
         input: &Q::Input,
         db: &'a IngredientDatabase<Q>,
-    ) -> Option<EvalResult<Eval, impl Future<Output = Id> + 'a>>
+    ) -> Option<EvalResult<QueryResult<'a, Q>, Eval, impl Future<Output = QueryResult<'a, Q>> + 'a>>
     where
-        Q::Input: Eq,
+        Q::Input: Clone + Hash + Eq,
     {
         let eq_fn = |key: &Id| {
             let slot = self.storage.slot(*key);
@@ -175,7 +183,7 @@ impl<Q: Query> HashQueryCache<Q> {
         let slot = self.storage.slot(id);
 
         match slot.wait_until_finished() {
-            Ok(output) => Some(EvalResult::Cached(id)),
+            Ok(slot) => Some(EvalResult::Cached((id, &slot.output))),
             Err(mut fut) => Some(EvalResult::Pending({
                 let query_path = IngredientPath {
                     container: self.path,
@@ -194,7 +202,7 @@ impl<Q: Query> HashQueryCache<Q> {
                         is_blocked = false;
                     }
 
-                    result.map(|output| id)
+                    result.map(|slot| (id, &slot.output))
                 })
             })),
         }
@@ -230,15 +238,41 @@ pub struct HashQueryCacheTask<'a, Q: Query> {
     future: QueryFuture<'a, Q>,
 }
 
+impl<'a, Q: Query> HashQueryCacheTask<'a, Q> {
+    fn poll_advanced(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<(Id, &'a Q::Output)> {
+        // SAFETY: we never move anything out of `self` that is not `Unpin`
+        let this = unsafe { self.get_unchecked_mut() };
+
+        // SAFETY: `result` points to `self`, which is `Pin`
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        let result = std::task::ready!(future.poll(cx));
+
+        let slot = unsafe {
+            this.cache
+                .storage
+                .finish(this.id, result.output, &result.dependencies)
+        };
+
+        std::task::Poll::Ready((this.id, &slot.output))
+    }
+}
+
 impl<Q: Query> QueryTask for HashQueryCacheTask<'_, Q>
 where
     Q::Input: Hash + Eq + Clone,
 {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()> {
+        self.poll_advanced(cx).map(|_| ())
+    }
+
     fn container(&self) -> &dyn DynQueryCache {
         self.cache
     }
 
-    fn query(&self) -> IngredientPath {
+    fn path(&self) -> IngredientPath {
         IngredientPath {
             container: self.cache.path,
             resource: self.id,
@@ -250,25 +284,12 @@ impl<'a, Q: Query> Future for HashQueryCacheTask<'a, Q>
 where
     Q::Input: Hash + Eq + Clone,
 {
-    type Output = Id;
+    type Output = (Id, &'a Q::Output);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: we never move anything out of `self` that is not `Unpin`
-        let this = unsafe { self.get_unchecked_mut() };
-
-        // SAFETY: `result` points to `self`, which is `Pin`
-        let future = unsafe { Pin::new_unchecked(&mut this.future) };
-        let result = std::task::ready!(future.poll(cx));
-
-        unsafe {
-            this.cache
-                .storage
-                .finish(this.id, result.output, &result.dependencies);
-        }
-
-        std::task::Poll::Ready(this.id)
+        self.poll_advanced(cx)
     }
 }

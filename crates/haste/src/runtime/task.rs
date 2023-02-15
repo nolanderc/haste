@@ -137,7 +137,7 @@ impl Scheduler {
     pub fn spawn(
         self: &Arc<Scheduler>,
         task: Box<dyn QueryTask + Send>,
-    ) -> impl Future<Output = crate::Id> {
+    ) -> impl Future<Output = ()> {
         let task = RawTask::new(task, Arc::downgrade(self));
         let shared = task.0.clone();
         self.schedule(task);
@@ -145,8 +145,7 @@ impl Scheduler {
         std::future::poll_fn(move |cx| {
             let mut output = shared.output.lock().unwrap();
             match &mut *output {
-                Output::Done(id) => return std::task::Poll::Ready(*id),
-
+                Output::Done => return std::task::Poll::Ready(()),
                 Output::None => *output = Output::Waker(cx.waker().clone()),
                 Output::Waker(old) => {
                     if !old.will_wake(cx.waker()) {
@@ -182,12 +181,15 @@ impl Scheduler {
     }
 }
 
-pub trait QueryTask: Future<Output = crate::Id> {
+pub trait QueryTask {
+    /// Poll the task for completion.
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()>;
+
     /// Get the container associated with the task
     fn container(&self) -> &dyn DynQueryCache;
 
     /// Get a unique identifier for the query.
-    fn query(&self) -> IngredientPath;
+    fn path(&self) -> IngredientPath;
 }
 
 #[repr(C)]
@@ -212,7 +214,7 @@ struct Shared {
 
 enum Output {
     None,
-    Done(crate::Id),
+    Done,
     Waker(Waker),
 }
 
@@ -254,29 +256,31 @@ impl Shared {
         let waker = std::task::Waker::from(self.clone());
         let mut context = std::task::Context::from_waker(&waker);
 
-        // SAFETY: we are the only thread that managed to set the `RUNNING` bit, so no other thread
-        // will alias the inner data.
+        // SAFETY: we are the only thread that managed to set the `RUNNING` bit, so no other
+        // thread will alias the inner data.
         let poll = unsafe { (*self.data.get()).as_mut().poll(&mut context) };
 
-        if let std::task::Poll::Ready(value) = poll {
-            self.state.raw.fetch_or(State::FINISHED, Release);
-            let previous =
-                std::mem::replace(&mut *self.output.lock().unwrap(), Output::Done(value));
-            if let Output::Waker(waker) = previous {
-                waker.wake()
+        match poll {
+            std::task::Poll::Ready(()) => {
+                self.state.raw.fetch_or(State::FINISHED, Release);
+                let previous = std::mem::replace(&mut *self.output.lock().unwrap(), Output::Done);
+                if let Output::Waker(waker) = previous {
+                    waker.wake()
+                }
+                return Some(std::task::Poll::Ready(()));
             }
-            return Some(std::task::Poll::Ready(()));
-        }
+            std::task::Poll::Pending => {
+                // Clear the running bit, and check if the task has been woken while we were running
+                let after = self.state.raw.fetch_and(!State::RUNNING, Release);
+                if State::is(before | after, State::WOKEN) {
+                    // the task was woken while we were still running it, so we have responsibility to
+                    // reschedule it
+                    self.schedule();
+                }
 
-        // Clear the running bit, and check if the task has been woken while we were running
-        let after = self.state.raw.fetch_and(!State::RUNNING, Release);
-        if State::is(before | after, State::WOKEN) {
-            // the task was woken while we were still running it, so we have responsibility to
-            // reschedule it
-            self.schedule();
+                Some(std::task::Poll::Pending)
+            }
         }
-
-        Some(std::task::Poll::Pending)
     }
 
     fn schedule(self: Arc<Shared>) {

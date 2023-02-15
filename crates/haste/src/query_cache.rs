@@ -85,11 +85,7 @@ impl<Q: Query> crate::DynContainer for HashQueryCache<Q> {
         self.path
     }
 
-    unsafe fn fmt(
-        &self,
-        path: IngredientPath,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         assert_eq!(path.container, self.path);
         let slot = self.storage.slot(path.resource);
         Q::fmt(slot.input(), f)
@@ -135,7 +131,9 @@ where
         // take ownership of the slot, by marking it as being in progress by us
         let id = self.storage.push_slot(input.clone());
         table.insert(hash, id, |key| {
-            self.entries.hash(self.storage.slot(*key).input())
+            // SAFETY: all IDs in the cache are valid
+            let slot = unsafe { self.storage.get_slot_unchecked(*key) };
+            self.entries.hash(slot.input())
         });
 
         drop(table);
@@ -144,11 +142,11 @@ where
     }
 
     fn output(&self, id: Id) -> &Q::Output {
-        &self.output(id).output
+        &self.output_slot(id).output
     }
 
     fn dependencies(&self, id: Id) -> &[Dependency] {
-        let slot = self.output(id);
+        let slot = self.output_slot(id);
         unsafe { self.storage.dependencies(slot.dependencies.clone()) }
     }
 }
@@ -156,11 +154,7 @@ where
 impl<Q: Query> DynQueryCache for HashQueryCache<Q> where Q::Input: Hash + Eq + Clone {}
 
 impl<Q: Query> HashQueryCache<Q> {
-    /// # Safety
-    ///
-    /// The caller must ensure that the output slot associated with the given `id` has been
-    /// initialized.
-    fn output(&self, id: Id) -> &OutputSlot<Q::Output> {
+    fn output_slot(&self, id: Id) -> &OutputSlot<Q::Output> {
         self.storage.slot(id).output()
     }
 
@@ -175,12 +169,13 @@ impl<Q: Query> HashQueryCache<Q> {
         Q::Input: Clone + Hash + Eq,
     {
         let eq_fn = |key: &Id| {
-            let slot = self.storage.slot(*key);
+            // SAFETY: all IDs in the cache are valid
+            let slot = unsafe { self.storage.get_slot_unchecked(*key) };
             slot.input() == input
         };
 
         let id = *table.get(hash, eq_fn)?;
-        let slot = self.storage.slot(id);
+        let slot = unsafe { self.storage.get_slot_unchecked(id) };
 
         match slot.wait_until_finished() {
             Ok(slot) => Some(EvalResult::Cached((id, &slot.output))),

@@ -31,14 +31,7 @@ pub trait Container: DynContainer {
 pub trait DynContainer: 'static {
     fn path(&self) -> ContainerPath;
 
-    /// # Safety
-    ///
-    /// The value which is being formatted must be valid in the current revision
-    unsafe fn fmt(
-        &self,
-        path: IngredientPath,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", path)
     }
 

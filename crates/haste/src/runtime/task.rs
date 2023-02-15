@@ -267,17 +267,17 @@ impl Shared {
                 if let Output::Waker(waker) = previous {
                     waker.wake()
                 }
-                return Some(std::task::Poll::Ready(()));
+                Some(std::task::Poll::Ready(()))
             }
             std::task::Poll::Pending => {
-                // Clear the running bit, and check if the task has been woken while we were running
+                // Clear the running bit, and check if the task has been woken while we were
+                // running
                 let after = self.state.raw.fetch_and(!State::RUNNING, Release);
                 if State::is(before | after, State::WOKEN) {
-                    // the task was woken while we were still running it, so we have responsibility to
-                    // reschedule it
+                    // the task was woken while we were still running it, so we are responsible
+                    // for rescheduling it
                     self.schedule();
                 }
-
                 Some(std::task::Poll::Pending)
             }
         }

@@ -226,10 +226,8 @@ impl Runtime {
     pub(crate) fn would_block_on(&self, other: IngredientPath, db: &dyn Database) {
         ACTIVE.with(|active| {
             let Some(this) = active.current_task() else { return };
-            unsafe {
-                use crate::util::fmt::query;
-                eprintln!("{} is blocked on {}", query(db, this), query(db, other));
-            }
+            use crate::util::fmt::query;
+            eprintln!("{} is blocked on {}", query(db, this), query(db, other));
             if let Some(cycle) = self.graph.lock().unwrap().insert(this, other) {
                 panic!("encountered a dependency cycle: {:#}", cycle.fmt(db))
             }

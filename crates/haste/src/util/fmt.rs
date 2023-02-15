@@ -25,10 +25,8 @@ where
     FromFn(f)
 }
 
-/// # Safety
-///
-/// The path must be valid in the given database.
-pub unsafe fn query(
+/// Format a query in the given database
+pub fn query(
     db: &dyn crate::Database,
     path: crate::IngredientPath,
 ) -> impl std::fmt::Display + std::fmt::Debug + '_ {
@@ -38,7 +36,7 @@ pub unsafe fn query(
 
     crate::util::fmt::from_fn(move |f| {
         if let Some(container) = container {
-            unsafe { container.fmt(path, f) }
+            container.fmt(path, f)
         } else {
             write!(f, "{:?}", path)
         }

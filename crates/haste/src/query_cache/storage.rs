@@ -62,6 +62,10 @@ impl<Q: Query> QueryStorage<Q> {
             .expect("attempted to get query slot which does not exist")
     }
 
+    pub unsafe fn get_slot_unchecked(&self, id: Id) -> &QuerySlot<Q> {
+        self.slots.get_unchecked(id.raw.get() as usize)
+    }
+
     pub fn push_slot(&self, input: Q::Input) -> Id {
         let index = self.slots.push_zeroed();
         unsafe {

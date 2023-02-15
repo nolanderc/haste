@@ -53,10 +53,25 @@ impl CycleGraph {
     }
 
     pub fn remove(&mut self, source: IngredientPath, target: IngredientPath) {
-        self.vertices
-            .remove(&source)
-            .filter(|vertex| vertex.blocked_on == target)
-            .expect("called `remove` on an edge that does not exist");
+        match self.vertices.entry(source) {
+            hash_map::Entry::Vacant(_) => {
+                panic!("called `remove` on an edge that does not exist")
+            }
+            hash_map::Entry::Occupied(entry) => {
+                let vertex = entry.get();
+
+                if vertex.cycle.is_some() {
+                    // don't remove cycles
+                    return;
+                }
+
+                if vertex.blocked_on != target {
+                    panic!("called `remove` on an edge that does not exist")
+                }
+
+                entry.remove();
+            }
+        }
     }
 
     fn find_cycle(&mut self, source: IngredientPath) -> Option<Cycle> {

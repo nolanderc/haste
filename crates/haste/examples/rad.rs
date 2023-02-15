@@ -101,7 +101,7 @@ fn main() {
 
     // a scope is a region of code within which we can safely spawn tasks
     haste::scope(&mut db, |scope, db| {
-        // let max = 1_000_000;
+        // let max = 10;
         //
         // std::thread::scope(|threads| {
         //     let signal = haste::util::DropSignal::new();

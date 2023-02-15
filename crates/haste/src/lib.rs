@@ -197,7 +197,7 @@ pub trait DatabaseExt: Database {
             });
 
             // SAFETY: we just executed this query, so the `id` will be valid.
-            unsafe { cache.output(id) }
+            cache.output(id)
         }
     }
 
@@ -236,8 +236,7 @@ pub trait DatabaseExt: Database {
                 extra: 0,
             });
 
-            // SAFETY: we just executed this query, so the `id` will be valid.
-            unsafe { cache.output(id) }
+            cache.output(id)
         }
     }
 

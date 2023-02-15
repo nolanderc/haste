@@ -14,6 +14,9 @@ pub struct RawArena<T> {
     capacity: usize,
 }
 
+unsafe impl<T: Send> Send for RawArena<T> {}
+unsafe impl<T: Send + Sync> Sync for RawArena<T> {}
+
 impl<T> Default for RawArena<T> {
     fn default() -> Self {
         Self::new()
@@ -203,38 +206,6 @@ impl<T> Default for Arena<T> {
     }
 }
 
-struct OnceCellState {
-    state: AtomicU8,
-}
-
-impl OnceCellState {
-    /// The slot is currently being initialized by some thread.
-    const BEING_WRITTEN: u8 = 0x1;
-
-    /// The slot is fully initialized.
-    const INITIALIZED: u8 = 0x2;
-
-    fn is(mask: u8, state: u8) -> bool {
-        (state & mask) != 0
-    }
-
-    pub fn start_write(&self) -> bool {
-        let old_state = self.state.fetch_or(Self::BEING_WRITTEN, Ordering::Relaxed);
-        !Self::is(Self::BEING_WRITTEN, old_state)
-    }
-
-    pub unsafe fn finish_write(&self) {
-        let finished = Self::BEING_WRITTEN | Self::INITIALIZED;
-        self.state.store(finished, Ordering::Release);
-    }
-
-    pub fn is_written(&self) -> bool {
-        Self::is(Self::INITIALIZED, self.state.load(Ordering::Acquire))
-    }
-}
-
-unsafe impl bytemuck::Zeroable for OnceCellState {}
-
 /// A region of memory that can only be initialized once.
 ///
 /// This implements `Zeroable`, which is the primary way to construct it.
@@ -287,6 +258,38 @@ impl<T> OnceCell<T> {
     }
 }
 
+struct OnceCellState {
+    state: AtomicU8,
+}
+
+impl OnceCellState {
+    /// The slot is currently being initialized by some thread.
+    const BEING_WRITTEN: u8 = 0x1;
+
+    /// The slot is fully initialized.
+    const INITIALIZED: u8 = 0x2;
+
+    fn is(mask: u8, state: u8) -> bool {
+        (state & mask) != 0
+    }
+
+    pub fn start_write(&self) -> bool {
+        let old_state = self.state.fetch_or(Self::BEING_WRITTEN, Ordering::Relaxed);
+        !Self::is(Self::BEING_WRITTEN, old_state)
+    }
+
+    pub unsafe fn finish_write(&self) {
+        let finished = Self::BEING_WRITTEN | Self::INITIALIZED;
+        self.state.store(finished, Ordering::Release);
+    }
+
+    pub fn is_written(&self) -> bool {
+        Self::is(Self::INITIALIZED, self.state.load(Ordering::Acquire))
+    }
+}
+
+unsafe impl bytemuck::Zeroable for OnceCellState {}
+
 /// An arena where values can be cheaply appended at the end, but reading requires the caller to
 /// guarantee that indices are valid.
 ///
@@ -314,6 +317,7 @@ impl<T> AppendArena<T> {
     }
 
     /// Push a value to the arena, returning its index
+    #[allow(unused)]
     pub fn push(&self, value: T) -> usize {
         let index = self.raw.push_zeroed();
 
@@ -367,6 +371,7 @@ impl<T> AppendArena<T> {
     ///
     /// The caller must ensure that the provided index is valid for this structure (ie. it was
     /// previously returned from a call to `push`).
+    #[allow(unused)]
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         (*self.raw.get_unchecked(index).get()).assume_init_ref()
     }

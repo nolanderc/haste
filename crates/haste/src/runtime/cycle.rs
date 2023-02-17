@@ -3,12 +3,15 @@ use std::{collections::hash_map, sync::Arc};
 use ahash::HashMap;
 use smallvec::SmallVec;
 
-use crate::{Database, IngredientPath};
+use crate::{ContainerPath, Database, IngredientPath};
 
-/// A graph containing of queries and the
 #[derive(Default)]
 pub struct CycleGraph {
+    /// For each currently blocked query: the query they are blocked on
     vertices: HashMap<IngredientPath, Vertex>,
+
+    /// For each query: its cycle recovery strategy
+    recovery: HashMap<ContainerPath, CycleStrategy>,
 }
 
 struct Vertex {
@@ -24,7 +27,12 @@ struct Vertex {
 }
 
 impl CycleGraph {
-    pub fn insert(&mut self, source: IngredientPath, target: IngredientPath) -> Option<Cycle> {
+    pub fn insert(
+        &mut self,
+        source: IngredientPath,
+        target: IngredientPath,
+        db: &dyn Database,
+    ) -> Option<Cycle> {
         match self.vertices.entry(source) {
             hash_map::Entry::Occupied(entry) => {
                 let previous = entry.get();
@@ -47,7 +55,7 @@ impl CycleGraph {
                     last_in_chain: target,
                     cycle: None,
                 });
-                self.find_cycle(source)
+                self.find_cycle(source, db)
             }
         }
     }
@@ -74,18 +82,71 @@ impl CycleGraph {
         }
     }
 
-    fn find_cycle(&mut self, source: IngredientPath) -> Option<Cycle> {
-        debug_assert!(self.vertices[&source].cycle.is_none());
+    fn find_cycle(&mut self, source: IngredientPath, db: &dyn Database) -> Option<Cycle> {
+        if !self.is_cyclic(source) {
+            return None;
+        }
 
-        let mut paths = SmallVec::<[IngredientPath; 8]>::new();
+        // list of all queries that are a part of the cycle
+        let mut participants = SmallVec::<[IngredientPath; 8]>::new();
+        // cycle participants who have cycle recovery set
+        let mut recovered = SmallVec::<[usize; 8]>::new();
+
         let mut curr = source;
 
+        for i in 0.. {
+            participants.push(curr);
+
+            let strategy = self.recovery(curr.container, db);
+            if strategy == CycleStrategy::Recover {
+                recovered.push(i);
+            }
+
+            curr = self.vertices[&curr].blocked_on;
+            if curr == source {
+                break;
+            }
+        }
+        let participants = Arc::<[_]>::from(participants.as_slice());
+
+        let make_cycle = |index: usize| {
+            self.vertices.get_mut(&participants[index]).unwrap().cycle = Some(Cycle {
+                start: index,
+                participants: participants.clone(),
+            });
+        };
+
+        if recovered.is_empty() {
+            // distribute the cycle to all participants
+            (0..participants.len()).for_each(make_cycle);
+        } else {
+            recovered.iter().copied().for_each(make_cycle);
+        }
+
+        self.vertices[&source].cycle.clone()
+    }
+
+    fn recovery(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
+        *self.recovery.entry(container).or_insert_with(|| {
+            db.dyn_container_path(container)
+                .and_then(|c| c.as_query_cache())
+                .map(|cache| cache.cycle_strategy())
+                .unwrap_or(CycleStrategy::Panic)
+        })
+    }
+
+    fn is_cyclic(&mut self, start: IngredientPath) -> bool {
+        debug_assert!(self.vertices[&start].cycle.is_none());
+
+        let mut participants = SmallVec::<[IngredientPath; 8]>::new();
+        let mut curr = start;
+
         while let Some(vertex) = self.vertices.get(&curr) {
-            paths.push(curr);
+            participants.push(curr);
 
             if vertex.cycle.is_some() {
                 // there is a cycle ahead, but this query is not directly a part of it
-                return None;
+                return false;
             }
 
             curr = if vertex.last_in_chain == vertex.blocked_on {
@@ -97,50 +158,31 @@ impl CycleGraph {
                 vertex.blocked_on
             };
 
-            if curr == source {
-                break;
+            if curr == start {
+                return true;
             }
         }
 
-        if source != curr {
-            // not a cycle, but all visited queries are blocked on the same query, so add new
-            // shortcuts to the last node
-            for path in paths {
-                self.vertices.get_mut(&path).unwrap().last_in_chain = curr;
-            }
-            return None;
+        // not a cycle, but all visited queries are blocked on the same query, so add new
+        // shortcuts to the last node
+        for path in participants {
+            self.vertices.get_mut(&path).unwrap().last_in_chain = curr;
         }
 
-        // at this point we have found a cycle starting at `curr == source`
-
-        // collect *all* queries that are a part of the cycle
-        // TODO: check if any query can recover from a cycle
-        paths.clear();
-        loop {
-            paths.push(curr);
-            curr = self.vertices[&curr].blocked_on;
-            if curr == source {
-                break;
-            }
-        }
-        let paths = Arc::<[_]>::from(paths.as_slice());
-
-        // distribute the cycle to all participants
-        for i in 0..paths.len() {
-            self.vertices.get_mut(&curr).unwrap().cycle = Some(Cycle {
-                start: i,
-                paths: paths.clone(),
-            });
-        }
-
-        Some(Cycle { start: 0, paths })
+        false
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CycleStrategy {
+    Panic,
+    Recover,
 }
 
 #[derive(Clone)]
 pub struct Cycle {
     start: usize,
-    paths: Arc<[IngredientPath]>,
+    participants: Arc<[IngredientPath]>,
 }
 
 impl std::fmt::Debug for Cycle {
@@ -151,11 +193,11 @@ impl std::fmt::Debug for Cycle {
 
 impl Cycle {
     pub fn iter(&self) -> impl Iterator<Item = IngredientPath> + '_ {
-        let (before, after) = self.paths.split_at(self.start);
+        let (before, after) = self.participants.split_at(self.start);
         after.iter().chain(before.iter()).copied()
     }
 
-    pub fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
+    pub(crate) fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
         crate::util::fmt::from_fn(|f| {
             let alternate = f.alternate();
             let mut list = f.debug_list();

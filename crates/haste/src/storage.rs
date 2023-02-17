@@ -9,7 +9,7 @@ pub trait Storage: DynStorage {
 }
 
 pub trait DynStorage: std::any::Any {
-    fn dyn_container(&self, path: ContainerPath) -> Option<&dyn DynContainer>;
+    fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer>;
 }
 
 impl dyn DynStorage {

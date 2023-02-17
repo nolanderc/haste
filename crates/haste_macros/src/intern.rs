@@ -36,7 +36,7 @@ fn derive_struct(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Re
             storage: true,
             ..Default::default()
         },
-    )?;
+    );
     let db_path = &args.db;
 
     let mut impls = TokenStream::new();
@@ -49,7 +49,7 @@ fn derive_struct(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Re
         storage_path: &args.storage,
     }));
 
-    let fields = crate::common::FieldInfo::extract(&mut data.fields)?;
+    let fields = crate::common::FieldInfo::extract(&mut data.fields);
     for field in fields {
         let getter = field.getter();
         let member = &field.member;
@@ -103,7 +103,7 @@ fn derive_enum(ingredient: syn::Ident, mut input: syn::DeriveInput) -> syn::Resu
             clone: true,
             ..Default::default()
         },
-    )?;
+    );
     let db_path = &args.db;
 
     let mut impls = TokenStream::new();

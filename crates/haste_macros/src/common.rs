@@ -28,7 +28,7 @@ impl<'a> FieldInfo<'a> {
         }
     }
 
-    pub fn extract(fields: &mut syn::Fields) -> syn::Result<Vec<FieldInfo>> {
+    pub fn extract(fields: &mut syn::Fields) -> Vec<FieldInfo> {
         let mut info = Vec::with_capacity(fields.len());
 
         for (index, field) in fields.iter_mut().enumerate() {
@@ -47,7 +47,7 @@ impl<'a> FieldInfo<'a> {
                 None => syn::Member::Unnamed(index.clone()),
             };
 
-            let arguments = FieldArguments::from_attrs(&mut field.attrs)?;
+            let arguments = FieldArguments::from_attrs(&mut field.attrs);
 
             info.push(FieldInfo {
                 arguments,
@@ -58,19 +58,17 @@ impl<'a> FieldInfo<'a> {
             });
         }
 
-        Ok(info)
+        info
     }
 }
 
 impl FieldArguments {
-    fn from_attrs(attrs: &mut Vec<syn::Attribute>) -> syn::Result<Self> {
+    fn from_attrs(attrs: &mut Vec<syn::Attribute>) -> Self {
         let mut args = Self::default();
         let mut parser = crate::meta::AttrParser::default();
 
         parser.expect_flag("clone", |enable| args.clone = enable);
-
-        parser.parse(attrs)?;
-
-        Ok(args)
+        parser.parse(attrs);
+        args
     }
 }

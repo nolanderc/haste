@@ -61,6 +61,11 @@ pub unsafe trait Database: Sync {
 
     /// Gets the storage for the given ingredient.
     fn dyn_storage_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
+
+    /// Gets the container for the given ingredient.
+    fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer> {
+        self.dyn_storage_path(path)?.dyn_container_path(path)
+    }
 }
 
 /// Implemented by databases which contain a specific type of storage.
@@ -96,10 +101,25 @@ pub trait Query: Ingredient {
     type Input: 'static + Send;
     type Output: 'static + Send + Sync;
     type Future<'db>: std::future::Future<Output = Self::Output> + Send;
+    type RecoverFuture<'db>: std::future::Future<Output = Self::Output> + Send;
+
+    fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
     fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
 
-    fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+    const CYCLE_STRATEGY: CycleStrategy;
+
+    fn recover_cycle(
+        db: &IngredientDatabase<Self>,
+        cycle: Cycle,
+        input: Self::Input,
+    ) -> Self::RecoverFuture<'_> {
+        _ = input;
+        panic!(
+            "encountered a dependency cycle: {:#}",
+            cycle.fmt(db.as_dyn())
+        )
+    }
 }
 
 pub trait Intern: Ingredient + TrackedReference
@@ -339,14 +359,17 @@ where
         runtime: db.runtime(),
     };
 
-    let output = f(scope, db);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(scope, db)));
 
     if entered {
         // we were the ones responsible for calling `enter`, so we must also `exit`
         db.runtime_mut().exit();
     }
 
-    output
+    match result {
+        Ok(output) => output,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 pub struct Scope<'a> {

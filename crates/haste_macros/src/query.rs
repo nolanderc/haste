@@ -31,9 +31,10 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             db: true,
             storage: true,
             clone: true,
+            cycle: true,
             ..Default::default()
         },
-    )?;
+    );
     let db_path = &args.db;
     let storage_path = &args.storage;
 
@@ -55,8 +56,21 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     let mut tokens = TokenStream::new();
 
-    let query_name = ident.to_string();
-    let input_count = input_idents.len();
+    let format_string = if input_idents.len() == 1 {
+        "{}({:?})"
+    } else {
+        "{}{:?}"
+    };
+
+    let cycle_strategy = match args.cycle {
+        None => quote! { haste::CycleStrategy::Panic },
+        Some(_) => quote! { haste::CycleStrategy::Recover },
+    };
+
+    let cycle_recovery = match args.cycle {
+        None => quote! { async move { unreachable!() } },
+        Some(recovery_fn) => quote! { #recovery_fn(db, cycle, #input_spread) },
+    };
 
     tokens.extend(quote! {
         #[allow(non_camel_case_types)]
@@ -75,17 +89,25 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             type Input = #input_type;
             type Output = #output_type;
             type Future<'db> = impl std::future::Future<Output = Self::Output> + 'db;
+            type RecoverFuture<'db> = impl std::future::Future<Output = Self::Output> + 'db;
+
+            fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let name = std::any::type_name::<Self>();
+                write!(f, #format_string, name, input)
+            }
 
             fn execute(db: &dyn #db_path, input: #input_type) -> Self::Future<'_> {
                 Self::#ident(db, #input_spread)
             }
 
-            fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                if #input_count == 1 {
-                    write!(f, "{}({:?})", #query_name, input)
-                } else {
-                    write!(f, "{}{:?}", #query_name, input)
-                }
+            const CYCLE_STRATEGY: haste::CycleStrategy = #cycle_strategy;
+
+            fn recover_cycle(
+                db: &dyn #db_path,
+                cycle: haste::Cycle,
+                input: #input_type,
+            ) -> Self::RecoverFuture<'_> {
+                #cycle_recovery
             }
         }
     });

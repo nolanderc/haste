@@ -252,6 +252,7 @@ impl Shared {
 
         // Clear the `WOKEN` bit, to allow wakers to reschedule this task
         let before = self.state.raw.swap(State::RUNNING, Acquire);
+        let woken_before = before & !initial;
 
         let waker = std::task::Waker::from(self.clone());
         let mut context = std::task::Context::from_waker(&waker);
@@ -273,7 +274,7 @@ impl Shared {
                 // Clear the running bit, and check if the task has been woken while we were
                 // running
                 let after = self.state.raw.fetch_and(!State::RUNNING, Release);
-                if State::is(before | after, State::WOKEN) {
+                if State::is(woken_before | after, State::WOKEN) {
                     // the task was woken while we were still running it, so we are responsible
                     // for rescheduling it
                     self.schedule();

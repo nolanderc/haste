@@ -1,4 +1,4 @@
-mod cycle_graph;
+mod cycle;
 mod task;
 
 use std::{
@@ -17,8 +17,9 @@ use crate::{
     non_max::NonMaxU32, ContainerPath, Database, IngredientDatabase, IngredientPath, Query,
 };
 
+pub use self::cycle::{Cycle, CycleStrategy};
 pub use self::task::QueryTask;
-use self::{cycle_graph::CycleGraph, task::Scheduler};
+use self::{cycle::CycleGraph, task::Scheduler};
 
 pub struct Runtime {
     tokio: Option<tokio::runtime::Runtime>,
@@ -223,14 +224,13 @@ impl Runtime {
     }
 
     /// Called when the execution of a query would block on another
-    pub(crate) fn would_block_on(&self, other: IngredientPath, db: &dyn Database) {
+    #[must_use]
+    pub(crate) fn would_block_on(&self, other: IngredientPath, db: &dyn Database) -> Option<Cycle> {
         ACTIVE.with(|active| {
-            let Some(this) = active.current_task() else { return };
+            let Some(this) = active.current_task() else { return None };
             use crate::util::fmt::query;
             eprintln!("{} is blocked on {}", query(db, this), query(db, other));
-            if let Some(cycle) = self.graph.lock().unwrap().insert(this, other) {
-                panic!("encountered a dependency cycle: {:#}", cycle.fmt(db))
-            }
+            self.graph.lock().unwrap().insert(this, other, db)
         })
     }
 
@@ -272,7 +272,9 @@ impl Runtime {
             let result = handle.poll(cx);
 
             if result.is_pending() && !is_blocked {
-                self.would_block_on(query_path, db);
+                if let Some(cycle) = self.would_block_on(query_path, db) {
+                    panic!("dependency cycle: {:#}", cycle.fmt(db))
+                }
                 is_blocked = true;
             }
 

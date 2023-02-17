@@ -20,7 +20,7 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
             db: true,
             ..Default::default()
         },
-    )?;
+    );
 
     if !strukt.generics.params.is_empty() {
         return Err(syn::Error::new(
@@ -81,7 +81,7 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
         }
 
         impl haste::DynStorage for #ident {
-            fn dyn_container(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
+            fn dyn_container_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
                 match path.container {
                     #( #field_members => Some(&self.#field_members), )*
                     _ => None,

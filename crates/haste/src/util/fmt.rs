@@ -32,7 +32,7 @@ pub fn query(
 ) -> impl std::fmt::Display + std::fmt::Debug + '_ {
     let container = db
         .dyn_storage_path(path.container)
-        .and_then(|storage| storage.dyn_container(path.container));
+        .and_then(|storage| storage.dyn_container_path(path.container));
 
     crate::util::fmt::from_fn(move |f| {
         if let Some(container) = container {

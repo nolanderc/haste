@@ -6,8 +6,8 @@ use futures_lite::FutureExt;
 use hashbrown::raw::RawTable;
 
 use crate::{
-    shard_map::ShardMap, ContainerPath, Database, Dependency, DynContainer, Id, IngredientDatabase,
-    IngredientPath, Query, QueryFuture, QueryTask,
+    shard_map::ShardMap, ContainerPath, CycleStrategy, Database, Dependency, DynContainer, Id,
+    IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
 
 use self::storage::{OutputSlot, QueryStorage};
@@ -38,7 +38,9 @@ pub trait QueryCache: crate::Container + DynQueryCache {
     /// An `id` is only valid if the corresponding query has finished executing in the same
     /// revision.
     fn output(&self, id: Id) -> &<Self::Query as Query>::Output;
+}
 
+pub trait DynQueryCache: DynContainer {
     /// Get the dependencies of a query.
     ///
     /// # Safety
@@ -46,9 +48,10 @@ pub trait QueryCache: crate::Container + DynQueryCache {
     /// An `id` is only valid if the corresponding query has finished executing in the same
     /// revision.
     fn dependencies(&self, id: Id) -> &[Dependency];
-}
 
-pub trait DynQueryCache: DynContainer {}
+    /// Get the cycle recovery stategy used by the query
+    fn cycle_strategy(&self) -> CycleStrategy;
+}
 
 pub type QueryResult<'a, Q> = (Id, &'a <Q as Query>::Output);
 
@@ -70,7 +73,10 @@ pub struct HashQueryCache<Q: Query> {
     storage: QueryStorage<Q>,
 }
 
-impl<Q: Query> crate::Container for HashQueryCache<Q> {
+impl<Q: Query> crate::Container for HashQueryCache<Q>
+where
+    Q::Input: Hash + Eq + Clone,
+{
     fn new(path: ContainerPath) -> Self {
         Self {
             path,
@@ -80,7 +86,10 @@ impl<Q: Query> crate::Container for HashQueryCache<Q> {
     }
 }
 
-impl<Q: Query> crate::DynContainer for HashQueryCache<Q> {
+impl<Q: Query> crate::DynContainer for HashQueryCache<Q>
+where
+    Q::Input: Hash + Eq + Clone,
+{
     fn path(&self) -> ContainerPath {
         self.path
     }
@@ -89,6 +98,10 @@ impl<Q: Query> crate::DynContainer for HashQueryCache<Q> {
         assert_eq!(path.container, self.path);
         let slot = self.storage.slot(path.resource);
         Q::fmt(slot.input(), f)
+    }
+
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
+        Some(self)
     }
 }
 
@@ -144,14 +157,21 @@ where
     fn output(&self, id: Id) -> &Q::Output {
         &self.output_slot(id).output
     }
+}
 
+impl<Q: Query> DynQueryCache for HashQueryCache<Q>
+where
+    Q::Input: Hash + Eq + Clone,
+{
     fn dependencies(&self, id: Id) -> &[Dependency] {
         let slot = self.output_slot(id);
         unsafe { self.storage.dependencies(slot.dependencies.clone()) }
     }
-}
 
-impl<Q: Query> DynQueryCache for HashQueryCache<Q> where Q::Input: Hash + Eq + Clone {}
+    fn cycle_strategy(&self) -> CycleStrategy {
+        Q::CYCLE_STRATEGY
+    }
+}
 
 impl<Q: Query> HashQueryCache<Q> {
     fn output_slot(&self, id: Id) -> &OutputSlot<Q::Output> {
@@ -189,7 +209,10 @@ impl<Q: Query> HashQueryCache<Q> {
                     let result = fut.poll(cx);
 
                     if result.is_pending() && !is_blocked {
-                        db.runtime().would_block_on(query_path, db.as_dyn());
+                        let db = db.as_dyn();
+                        if let Some(cycle) = db.runtime().would_block_on(query_path, db) {
+                            panic!("dependency cycle: {:#}", cycle.fmt(db))
+                        }
                         is_blocked = true;
                     }
                     if result.is_ready() && is_blocked {

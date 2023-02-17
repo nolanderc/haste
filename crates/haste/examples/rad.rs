@@ -87,11 +87,16 @@ async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
 
 #[haste::query]
 #[clone]
+#[cycle(cyclic_cycle)]
 async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
     match n {
         0..=3 | 5..=6 => cyclic::spawn(db, n + 1).await,
         _ => cyclic::spawn(db, 0).await,
     }
+}
+
+async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32 {
+    123
 }
 
 fn main() {

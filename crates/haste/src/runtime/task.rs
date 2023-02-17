@@ -1,6 +1,5 @@
 use std::{
     cell::UnsafeCell,
-    future::Future,
     pin::Pin,
     sync::{
         atomic::{
@@ -9,7 +8,6 @@ use std::{
         },
         Arc, Condvar, Mutex, MutexGuard, Weak,
     },
-    task::Waker,
 };
 
 use crossbeam_deque::{Injector, Worker};

@@ -240,7 +240,7 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn spawn_query<'a, T>(&'a self, task: T, db: &'a dyn Database)
+    pub(crate) fn spawn_query<'a, T>(&'a self, task: T)
     where
         T: QueryTask + Send + 'a,
     {

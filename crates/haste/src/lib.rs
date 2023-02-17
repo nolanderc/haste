@@ -240,8 +240,10 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(id) => EvalResult::Cached(id),
             EvalResult::Pending(pending) => EvalResult::Pending(pending),
             EvalResult::Eval(eval) => {
+                // spawn the query, but postpone checking polling it for completion until the
+                // returned future is awaited:
                 let id = eval.path().resource;
-                runtime.spawn_query(eval, db.as_dyn());
+                runtime.spawn_query(eval);
                 EvalResult::Eval(id)
             }
         };
@@ -287,7 +289,7 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => db.runtime().spawn_query(eval, db.as_dyn()),
+            EvalResult::Eval(eval) => db.runtime().spawn_query(eval),
         }
     }
 

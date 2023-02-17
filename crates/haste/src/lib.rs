@@ -190,7 +190,7 @@ where
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
 pub trait DatabaseExt: Database {
     /// Execute a query with some input, reusing previous results if possible.
-    fn execute_cached<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
+    fn execute<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
     where
         Q: Query,
         Q::Storage: 'db,
@@ -220,10 +220,7 @@ pub trait DatabaseExt: Database {
         }
     }
 
-    /// Signals to the runtime that we might eventually need the output of the given query.
-    ///
-    /// This is intended to be used as an optimization, and is the core primitive for scheduling
-    /// parallel work.
+    /// Spawn the query in the runtime, and possibly await its result in the background
     fn spawn<'db, Q>(&'db self, input: Q::Input) -> SpawnFuture<'db, Self, Q>
     where
         Q: Query,
@@ -236,26 +233,35 @@ pub trait DatabaseExt: Database {
         let storage = self.storage();
         let cache = storage.container();
 
-        let result = match cache.get_or_evaluate(db, input) {
-            EvalResult::Cached(id) => EvalResult::Cached(id),
-            EvalResult::Pending(pending) => EvalResult::Pending(pending),
+        enum SpawnResult<Cached, Pending> {
+            Cached(Cached),
+            Pending(Pending),
+            Spawned(Id),
+        }
+
+        let spawn_result = match cache.get_or_evaluate(db, input) {
+            EvalResult::Cached(id) => SpawnResult::Cached(id),
+            EvalResult::Pending(pending) => SpawnResult::Pending(pending),
             EvalResult::Eval(eval) => {
-                // spawn the query, but postpone checking polling it for completion until the
-                // returned future is awaited:
+                // spawn the query, but postpone checking it for completion until the returned
+                // future is polled. That way the spawned task has a chance of completing first.
                 let id = eval.path().resource;
                 runtime.spawn_query(eval);
-                EvalResult::Eval(id)
+                SpawnResult::Spawned(id)
             }
         };
 
         async move {
+            let result = match spawn_result {
+                SpawnResult::Cached(cached) => Ok(cached),
+                SpawnResult::Pending(pending) => Err(pending),
+                // the query was spawned in the runtime, so try getting its result again:
+                SpawnResult::Spawned(id) => cache.get(db, id),
+            };
+
             let (id, output) = match result {
-                EvalResult::Cached(id) => id,
-                EvalResult::Eval(id) => match cache.get(db, id) {
-                    Ok(cached) => cached,
-                    Err(pending) => pending.await,
-                },
-                EvalResult::Pending(pending) => pending.await,
+                Ok(id) => id,
+                Err(pending) => pending.await,
             };
 
             runtime.register_dependency(Dependency {

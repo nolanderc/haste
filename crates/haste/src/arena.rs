@@ -2,7 +2,10 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr::NonNull,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{
+        AtomicU8, AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release},
+    },
 };
 
 mod memory;
@@ -76,7 +79,7 @@ impl<T> RawArena<T> {
 
     /// Returns `true` if the `index` has been allocated
     pub fn is_allocated(&self, index: usize) -> bool {
-        index < self.committed.load(Ordering::Relaxed)
+        index < self.committed.load(Relaxed)
     }
 }
 
@@ -109,30 +112,47 @@ where
         }
     }
 
-    /// Get an index into the arena to a region of zero-initialized memory.
-    pub fn reserve_zeroed(&self, count: usize) -> usize {
-        let offset = self.reserved.fetch_add(count, Ordering::Relaxed);
-        let new_reserved = offset + count;
+    /// Get a reference to the value at the given index. If the value is not allocated, grows the
+    /// underlying buffer up until that index.
+    pub(crate) fn get_or_allocate(&self, index: usize) -> &T {
+        let committed = self.committed.load(Relaxed);
+        let old_reserved = self.reserved.fetch_max(index + 1, Relaxed);
 
-        if new_reserved > self.capacity {
-            panic!("out of memory");
+        if index >= committed {
+            let new_reserved = old_reserved.max(index + 1);
+            unsafe { self.grow(committed, new_reserved) };
         }
 
-        let old_committed = self.committed.load(Ordering::Relaxed);
-        if offset + count > old_committed {
-            let new = (2 * old_committed).clamp(new_reserved, self.capacity);
+        return unsafe { self.get_unchecked(index) };
+    }
 
-            // SAFETY: we know that `new` is in the range `[0, self.capacity]`. Thus `old_ptr` will
-            // also lie within the reserved memory range, and we can safely commit it.
-            unsafe {
-                let old_ptr = self.get_raw(old_committed).cast();
-                let committed_bytes = (new - old_committed) * std::mem::size_of::<T>();
-                memory::commit(old_ptr, committed_bytes);
-            }
-            self.committed.fetch_max(new, Ordering::Relaxed);
+    /// Get an index into the arena to a region of zero-initialized memory.
+    pub fn reserve_zeroed(&self, count: usize) -> usize {
+        let offset = self.reserved.fetch_add(count, Relaxed);
+        let new_reserved = offset + count;
+
+        let old_committed = self.committed.load(Relaxed);
+        if new_reserved > old_committed {
+            unsafe { self.grow(old_committed, new_reserved) };
         }
 
         offset
+    }
+
+    unsafe fn grow(&self, current_len: usize, required: usize) {
+        if required > self.capacity {
+            panic!("out of memory");
+        }
+
+        let new = current_len.saturating_mul(2).clamp(required, self.capacity);
+
+        // SAFETY: we know that `new` is in the range `[0, self.capacity]`. Thus `old_ptr` will
+        // also lie within the reserved memory range, and we can safely commit it.
+        let old_ptr = self.get_raw(current_len).cast();
+        let new_bytes = (new - current_len) * std::mem::size_of::<T>();
+        memory::commit(old_ptr, new_bytes);
+
+        self.committed.fetch_max(new, Relaxed);
     }
 
     /// Push a new zero-initialized value to the end of the allocated memory region.
@@ -274,17 +294,17 @@ impl OnceCellState {
     }
 
     pub fn start_write(&self) -> bool {
-        let old_state = self.state.fetch_or(Self::BEING_WRITTEN, Ordering::Relaxed);
+        let old_state = self.state.fetch_or(Self::BEING_WRITTEN, Relaxed);
         !Self::is(Self::BEING_WRITTEN, old_state)
     }
 
     pub unsafe fn finish_write(&self) {
         let finished = Self::BEING_WRITTEN | Self::INITIALIZED;
-        self.state.store(finished, Ordering::Release);
+        self.state.store(finished, Release);
     }
 
     pub fn is_written(&self) -> bool {
-        Self::is(Self::INITIALIZED, self.state.load(Ordering::Acquire))
+        Self::is(Self::INITIALIZED, self.state.load(Acquire))
     }
 }
 

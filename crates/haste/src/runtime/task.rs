@@ -12,7 +12,7 @@ use std::{
 
 use crossbeam_deque::{Injector, Worker};
 
-use crate::{util::CallOnDrop, DynQueryCache, IngredientPath};
+use crate::{util::CallOnDrop, IngredientPath};
 
 pub struct Scheduler {
     injector: Injector<RawTask>,
@@ -163,9 +163,6 @@ impl Scheduler {
 pub trait QueryTask {
     /// Poll the task for completion.
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()>;
-
-    /// Get the container associated with the task
-    fn container(&self) -> &dyn DynQueryCache;
 
     /// Get a unique identifier for the query.
     fn path(&self) -> IngredientPath;

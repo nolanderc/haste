@@ -7,21 +7,27 @@ use hashbrown::raw::RawTable;
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
 
-pub struct ShardMap<T, const SHARDS: usize = 32> {
+pub struct ShardMap<T, Hasher = BuildHasherDefault, const SHARDS: usize = 32> {
     shards: [Shard<T>; SHARDS],
-    hasher: BuildHasherDefault,
+    hasher: Hasher,
 }
 
 pub type Shard<T> = RwLock<RawTable<T>>;
 
-impl<T, const SHARDS: usize> Default for ShardMap<T, SHARDS> {
+impl<T, Hasher, const SHARDS: usize> Default for ShardMap<T, Hasher, SHARDS>
+where
+    Hasher: Default,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, const SHARDS: usize> ShardMap<T, SHARDS> {
-    pub fn new() -> Self {
+impl<T, Hasher, const SHARDS: usize> ShardMap<T, Hasher, SHARDS> {
+    pub fn new() -> Self
+    where
+        Hasher: Default,
+    {
         Self {
             shards: std::array::from_fn(|_| Shard::default()),
             hasher: Default::default(),
@@ -31,6 +37,7 @@ impl<T, const SHARDS: usize> ShardMap<T, SHARDS> {
     pub fn hash<U: ?Sized>(&self, value: &U) -> u64
     where
         U: Hash,
+        Hasher: BuildHasher,
     {
         hash_one(value, &self.hasher)
     }
@@ -48,7 +55,10 @@ impl<T, const SHARDS: usize> ShardMap<T, SHARDS> {
 }
 
 /// Use a hasher to hash a single value.
-fn hash_one<T: Hash + ?Sized>(key: &T, builder: &BuildHasherDefault) -> u64 {
+fn hash_one<T: Hash + ?Sized, Hasher>(key: &T, builder: &Hasher) -> u64
+where
+    Hasher: BuildHasher,
+{
     let mut state = builder.build_hasher();
     key.hash(&mut state);
     state.finish()

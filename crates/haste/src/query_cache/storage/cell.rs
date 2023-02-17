@@ -86,7 +86,7 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Iialize the cell with some value.
-    pub fn write_input(&self, value: I) -> &I {
+    pub fn write_input(&self, value: I) -> Result<&I, &I> {
         // take the lock, ensuring that we are the only thread writing to the value
         let lock = self.state.lock();
 
@@ -94,7 +94,7 @@ impl<I, O> QueryCell<I, O> {
             // the value has already been initialized
             // SAFETY: since we grabbed the lock, there's no need further need to synchronize
             // with the writer
-            return unsafe { self.input_assume_init() };
+            return unsafe { Err(self.input_assume_init()) };
         }
 
         // initialize the slot
@@ -104,7 +104,7 @@ impl<I, O> QueryCell<I, O> {
         // set the `INITIALIZED` bit, allowing other threads to read the value
         lock.set_initialized();
 
-        value
+        Ok(value)
     }
 
     /// # Safety

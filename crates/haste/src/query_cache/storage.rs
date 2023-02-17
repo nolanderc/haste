@@ -66,12 +66,19 @@ impl<Q: Query> QueryStorage<Q> {
         self.slots.get_unchecked(id.raw.get() as usize)
     }
 
-    pub fn push_slot(&self, input: Q::Input) -> Id {
+    pub fn allocate_slot(&self, input: Q::Input) -> (Id, &Q::Input) {
         let index = self.slots.push_zeroed();
-        unsafe {
-            self.slots.get_unchecked(index).cell.write_input(input);
-        }
-        Id::new(NonMaxU32::new(index as u32).expect("exhausted IDs"))
+        let slot = unsafe { self.slots.get_unchecked(index) };
+        let input = match slot.cell.write_input(input) {
+            Ok(input) | Err(input) => input,
+        };
+        let id = Id::new(NonMaxU32::new(index as u32).expect("exhausted IDs"));
+        (id, input)
+    }
+
+    pub fn init_slot(&self, id: Id, input: Q::Input) -> Result<&Q::Input, &Q::Input> {
+        let index = id.raw.get() as usize;
+        self.slots.get_or_allocate(index).cell.write_input(input)
     }
 }
 
@@ -96,6 +103,10 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell
             .get_input()
             .expect("attempted to read query input which has not been written")
+    }
+
+    pub unsafe fn input_unchecked(&self) -> &Q::Input {
+        self.cell.input_assume_init()
     }
 
     pub fn output(&self) -> &OutputSlot<Q::Output> {

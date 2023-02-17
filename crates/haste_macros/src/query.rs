@@ -127,7 +127,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     tokens.extend(quote_spanned! {ident.span()=>
         #[allow(unused)]
         #vis async fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
-            #clone (haste::DatabaseExt::execute_cached::<#ident>(#db_ident, (#(#input_idents),*)).await)
+            #clone (haste::DatabaseExt::execute::<#ident>(#db_ident, (#(#input_idents),*)).await)
         }
 
         impl #ident {

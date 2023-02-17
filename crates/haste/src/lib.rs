@@ -239,17 +239,20 @@ pub trait DatabaseExt: Database {
         let result = match cache.get_or_evaluate(db, input) {
             EvalResult::Cached(id) => EvalResult::Cached(id),
             EvalResult::Pending(pending) => EvalResult::Pending(pending),
-            EvalResult::Eval(eval) => EvalResult::Eval(runtime.spawn_query(eval, db.as_dyn())),
+            EvalResult::Eval(eval) => {
+                let id = eval.path().resource;
+                runtime.spawn_query(eval, db.as_dyn());
+                EvalResult::Eval(id)
+            }
         };
 
         async move {
             let (id, output) = match result {
                 EvalResult::Cached(id) => id,
-                EvalResult::Eval(eval) => {
-                    let id = eval.await;
-                    let output = cache.output(id);
-                    (id, output)
-                }
+                EvalResult::Eval(id) => match cache.get(db, id) {
+                    Ok(cached) => cached,
+                    Err(pending) => pending.await,
+                },
                 EvalResult::Pending(pending) => pending.await,
             };
 
@@ -284,7 +287,7 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => drop(db.runtime().spawn_query(eval, db.as_dyn())),
+            EvalResult::Eval(eval) => db.runtime().spawn_query(eval, db.as_dyn()),
         }
     }
 

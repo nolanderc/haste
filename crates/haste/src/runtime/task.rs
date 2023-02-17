@@ -134,28 +134,9 @@ impl Scheduler {
     }
 
     #[inline(never)]
-    pub fn spawn(
-        self: &Arc<Scheduler>,
-        task: Box<dyn QueryTask + Send>,
-    ) -> impl Future<Output = ()> {
+    pub fn spawn(self: &Arc<Scheduler>, task: Box<dyn QueryTask + Send>) {
         let task = RawTask::new(task, Arc::downgrade(self));
-        let shared = task.0.clone();
         self.schedule(task);
-
-        std::future::poll_fn(move |cx| {
-            let mut output = shared.output.lock().unwrap();
-            match &mut *output {
-                Output::Done => return std::task::Poll::Ready(()),
-                Output::None => *output = Output::Waker(cx.waker().clone()),
-                Output::Waker(old) => {
-                    if !old.will_wake(cx.waker()) {
-                        *old = cx.waker().clone();
-                    }
-                }
-            }
-
-            std::task::Poll::Pending
-        })
     }
 
     fn schedule(&self, task: RawTask) {
@@ -209,13 +190,6 @@ struct Shared {
     state: State,
     scheduler: Weak<Scheduler>,
     data: UnsafeCell<Pin<Box<dyn QueryTask + Send>>>,
-    output: Mutex<Output>,
-}
-
-enum Output {
-    None,
-    Done,
-    Waker(Waker),
 }
 
 unsafe impl Send for Shared {}
@@ -229,7 +203,6 @@ impl Shared {
             },
             scheduler,
             data: UnsafeCell::new(Pin::from(task)),
-            output: Mutex::new(Output::None),
         }
     }
 
@@ -263,11 +236,7 @@ impl Shared {
 
         match poll {
             std::task::Poll::Ready(()) => {
-                self.state.raw.fetch_or(State::FINISHED, Release);
-                let previous = std::mem::replace(&mut *self.output.lock().unwrap(), Output::Done);
-                if let Output::Waker(waker) = previous {
-                    waker.wake()
-                }
+                self.state.raw.swap(State::FINISHED, Release);
                 Some(std::task::Poll::Ready(()))
             }
             std::task::Poll::Pending => {

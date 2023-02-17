@@ -10,7 +10,7 @@ use crate::{
     IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
 
-use self::storage::{OutputSlot, QueryStorage};
+use self::storage::{OutputSlot, QuerySlot, QueryStorage};
 
 pub trait QueryCache: crate::Container + DynQueryCache {
     type Query: Query;
@@ -31,22 +31,31 @@ pub trait QueryCache: crate::Container + DynQueryCache {
         input: <Self::Query as Query>::Input,
     ) -> CacheEvalResult<'a, Self>;
 
-    /// Get the output from the query.
+    /// Get the result of a query.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// An `id` is only valid if the corresponding query has finished executing in the same
-    /// revision.
+    /// If the `id` is not valid.
+    fn get<'a>(
+        &'a self,
+        db: &'a IngredientDatabase<Self::Query>,
+        id: Id,
+    ) -> Result<QueryResult<'a, Self::Query>, Self::PendingFuture<'a>>;
+
+    /// Get the output from a query.
+    ///
+    /// # Panics
+    ///
+    /// If the `id` is not valid.
     fn output(&self, id: Id) -> &<Self::Query as Query>::Output;
 }
 
 pub trait DynQueryCache: DynContainer {
     /// Get the dependencies of a query.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// An `id` is only valid if the corresponding query has finished executing in the same
-    /// revision.
+    /// If the `id` is not valid.
     fn dependencies(&self, id: Id) -> &[Dependency];
 
     /// Get the cycle recovery stategy used by the query
@@ -127,8 +136,11 @@ where
         {
             // check if the query has already executed previously, and return that result
             let table = shard.read().unwrap();
-            if let Some(result) = self.try_get_or_wait(&table, hash, &input, db) {
-                return result;
+            if let Some((id, slot)) = self.try_find_slot(&table, hash, &input) {
+                return match self.try_get(id, slot, db) {
+                    Ok(cached) => EvalResult::Cached(cached),
+                    Err(pending) => EvalResult::Pending(pending),
+                };
             }
         }
 
@@ -137,8 +149,11 @@ where
 
         // We also have to check for a race condition where another thread inserted its slot
         // while we were still waiting for the write lock.
-        if let Some(result) = self.try_get_or_wait(&table, hash, &input, db) {
-            return result;
+        if let Some((id, slot)) = self.try_find_slot(&table, hash, &input) {
+            return match self.try_get(id, slot, db) {
+                Ok(cached) => EvalResult::Cached(cached),
+                Err(pending) => EvalResult::Pending(pending),
+            };
         }
 
         // take ownership of the slot, by marking it as being in progress by us
@@ -152,6 +167,15 @@ where
         drop(table);
 
         EvalResult::Eval(self.execute_query(db, id, input))
+    }
+
+    fn get<'a>(
+        &'a self,
+        db: &'a IngredientDatabase<Self::Query>,
+        id: Id,
+    ) -> Result<QueryResult<'a, Self::Query>, Self::PendingFuture<'a>> {
+        let slot = self.storage.slot(id);
+        self.try_get(id, slot, db)
     }
 
     fn output(&self, id: Id) -> &Q::Output {
@@ -178,13 +202,7 @@ impl<Q: Query> HashQueryCache<Q> {
         self.storage.slot(id).output()
     }
 
-    fn try_get_or_wait<'a, Eval>(
-        &'a self,
-        table: &RawTable<Id>,
-        hash: u64,
-        input: &Q::Input,
-        db: &'a IngredientDatabase<Q>,
-    ) -> Option<EvalResult<QueryResult<'a, Q>, Eval, impl Future<Output = QueryResult<'a, Q>> + 'a>>
+    fn try_find(&self, table: &RawTable<Id>, hash: u64, input: &Q::Input) -> Option<Id>
     where
         Q::Input: Clone + Hash + Eq,
     {
@@ -194,12 +212,35 @@ impl<Q: Query> HashQueryCache<Q> {
             slot.input() == input
         };
 
-        let id = *table.get(hash, eq_fn)?;
-        let slot = unsafe { self.storage.get_slot_unchecked(id) };
+        Some(*table.get(hash, eq_fn)?)
+    }
 
+    fn try_find_slot<'a>(
+        &'a self,
+        table: &RawTable<Id>,
+        hash: u64,
+        input: &Q::Input,
+    ) -> Option<(Id, &'a QuerySlot<Q>)>
+    where
+        Q::Input: Clone + Hash + Eq,
+    {
+        let id = self.try_find(table, hash, input)?;
+        let slot = unsafe { self.storage.get_slot_unchecked(id) };
+        Some((id, slot))
+    }
+
+    fn try_get<'a>(
+        &'a self,
+        id: Id,
+        slot: &'a QuerySlot<Q>,
+        db: &'a IngredientDatabase<Q>,
+    ) -> Result<QueryResult<'a, Q>, impl Future<Output = QueryResult<'a, Q>> + 'a>
+    where
+        Q::Input: Clone + Hash + Eq,
+    {
         match slot.wait_until_finished() {
-            Ok(slot) => Some(EvalResult::Cached((id, &slot.output))),
-            Err(mut fut) => Some(EvalResult::Pending({
+            Ok(slot) => Ok((id, &slot.output)),
+            Err(mut fut) => Err({
                 let query_path = IngredientPath {
                     container: self.path,
                     resource: id,
@@ -222,7 +263,7 @@ impl<Q: Query> HashQueryCache<Q> {
 
                     result.map(|slot| (id, &slot.output))
                 })
-            })),
+            }),
         }
     }
 }

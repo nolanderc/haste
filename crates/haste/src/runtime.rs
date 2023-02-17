@@ -11,8 +11,6 @@ use std::{
     },
 };
 
-use futures_lite::FutureExt;
-
 use crate::{
     non_max::NonMaxU32, ContainerPath, Database, IngredientDatabase, IngredientPath, Query,
 };
@@ -242,19 +240,13 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn spawn_query<'a, T>(
-        &'a self,
-        task: T,
-        db: &'a dyn Database,
-    ) -> impl Future<Output = crate::Id> + 'a
+    pub(crate) fn spawn_query<'a, T>(&'a self, task: T, db: &'a dyn Database)
     where
         T: QueryTask + Send + 'a,
     {
         let _tokio = self.executor();
 
-        let query_path = task.path();
-
-        let mut handle = unsafe {
+        unsafe {
             // extend the lifetime of the task to allow it to be stored in the runtime
             // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
             // Thus the lifetime of this task is ensured to outlive that.
@@ -263,28 +255,8 @@ impl Runtime {
                 Box<dyn QueryTask + Send + 'static>,
             >(Box::new(task));
 
-            self.scheduler.spawn(task)
-        };
-
-        let mut is_blocked = false;
-
-        std::future::poll_fn(move |cx| {
-            let result = handle.poll(cx);
-
-            if result.is_pending() && !is_blocked {
-                if let Some(cycle) = self.would_block_on(query_path, db) {
-                    panic!("dependency cycle: {:#}", cycle.fmt(db))
-                }
-                is_blocked = true;
-            }
-
-            if result.is_ready() && is_blocked {
-                self.unblock(query_path, db);
-                is_blocked = false;
-            }
-
-            result.map(|()| query_path.resource)
-        })
+            self.scheduler.spawn(task);
+        }
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output

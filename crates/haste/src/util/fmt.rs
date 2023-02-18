@@ -36,7 +36,7 @@ pub fn query(
 
     crate::util::fmt::from_fn(move |f| {
         if let Some(container) = container {
-            container.fmt(path, f)
+            container.fmt(path.resource, f)
         } else {
             write!(f, "{:?}", path)
         }

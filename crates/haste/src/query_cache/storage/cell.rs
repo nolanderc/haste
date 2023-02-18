@@ -13,6 +13,8 @@ use bytemuck::Zeroable;
 use futures_lite::FutureExt;
 use smallvec::SmallVec;
 
+use crate::Cycle;
+
 pub struct QueryCell<I, O> {
     /// The current state of the cell.
     state: State,
@@ -42,6 +44,7 @@ struct State {
     /// - if `0x4` is set, a thread has locked this cell, gaining exclusive access to the list of
     /// blocked tasks and the inner value.
     /// - if `0x8` is set, a thread is waiting on the lock (ie. it is contended).
+    /// - if `0x10` is set, there is a dependency cycle which is stored in the inner state.
     addr: AtomicUsize,
 }
 
@@ -62,16 +65,21 @@ const LOCKED: usize = 0x4;
 /// The cell lock is contended. Upon releasing the lock, another thread should be signaled.
 const CONTENDED: usize = 0x8;
 
-/// Mask of the bits of the tagged pointer which correspond to the address of the pointer
-const ADDR_MASK: usize = usize::MAX << 4;
+/// The cell lock is contended. Upon releasing the lock, another thread should be signaled.
+const CYCLIC: usize = 0x10;
 
-/// We specify an alignment of 16. This guarantees that the lowest 4 bits of any pointer to this
+/// Mask of the bits of the tagged pointer which correspond to the address of the pointer
+const ADDR_MASK: usize = usize::MAX << 5;
+
+/// We specify an alignment of 32. This guarantees that the lowest 5 bits of any pointer to this
 /// structure will be zeroes, allowing us to use it to encode a tagged pointer.
-#[repr(align(16))]
+#[repr(align(32))]
 #[derive(Default)]
 pub(crate) struct BlockedState {
     /// List of wakers blocked on the cell.
     wakers: SmallVec<[Waker; 8]>,
+    /// If there has been a dependency cycle it is stored here.
+    cycle: Option<Cycle>,
 }
 
 impl<I, T> Default for QueryCell<I, T> {
@@ -185,6 +193,28 @@ impl<I, O> QueryCell<I, O> {
                 }))
             }
         }
+    }
+
+    pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
+        let mut lock = self.state.lock();
+        if (lock.addr & CYCLIC) != 0 {
+            // encountered a new cycle while recovering from previous cycle
+            return Err(cycle);
+        }
+
+        lock.get_or_init().cycle = Some(cycle);
+        lock.unlock_and_set(CYCLIC);
+
+        Ok(())
+    }
+
+    pub fn take_cycle(&self) -> Option<Cycle> {
+        if (self.state.addr.load(Relaxed) & CYCLIC) == 0 {
+            return None;
+        }
+
+        let mut lock = self.state.lock();
+        lock.get_or_init().cycle.take()
     }
 }
 
@@ -358,13 +388,14 @@ impl StateLock<'_> {
         // - release the lock (ie. clear the `LOCKED` and `CONTENDED` bits)
         // - keep the old value of `FINISHED`
         // - keep the old value of the address
-        self.unlock_set_and_keep(INITIALIZED, FINISHED | ADDR_MASK);
+        self.unlock_set_and_keep(INITIALIZED, FINISHED | CYCLIC | ADDR_MASK);
     }
 
     /// Set the `FINISHED`-bit and take ownership of the inner pointer by clearing it to `null`.
     fn set_finished(self) -> Option<Box<BlockedState>> {
         // - set the `FINISHED` bit
         // - clear the address to `null`
+        // - clear the `CYCLIC` bit
         // - release the lock (ie. clear the `LOCKED` and `CONTENDED` bits)
         // - keep the old value of `INITIALIZED`
         let old = self.unlock_set_and_keep(FINISHED, INITIALIZED);
@@ -397,6 +428,13 @@ impl StateLock<'_> {
         }
 
         old
+    }
+
+    /// Releases the lock and `set`s the given bits, while `keep`ing the others.
+    /// Returns the previous state.
+    #[inline]
+    fn unlock_and_set(self, set: usize) -> usize {
+        self.unlock_set_and_keep(set, !(LOCKED | CONTENDED))
     }
 }
 

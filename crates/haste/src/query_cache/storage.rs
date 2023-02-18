@@ -5,7 +5,7 @@ use std::future::Future;
 use crate::{
     arena::{AppendArena, RawArena},
     non_max::NonMaxU32,
-    Dependency, Id, Query,
+    Cycle, Dependency, Id, Query,
 };
 
 use self::cell::QueryCell;
@@ -29,25 +29,21 @@ impl<Q: Query> Default for QueryStorage<Q> {
 }
 
 impl<Q: Query> QueryStorage<Q> {
-    /// Record the result of a new query
-    pub unsafe fn finish(
+    /// Record the result of a new query.
+    pub(crate) fn create_output(
         &self,
-        id: Id,
-        output: Q::Output,
-        dependencies: &[Dependency],
-    ) -> &OutputSlot<Q::Output> {
+        result: crate::ExecutionResult<Q::Output>,
+    ) -> OutputSlot<Q::Output> {
         let dependencies = {
-            let range = self.dependencies.extend_from_slice(dependencies);
+            let range = self.dependencies.extend_from_slice(&result.dependencies);
             let end = u32::try_from(range.end).unwrap();
             let start = range.start as u32;
             start..end
         };
-
-        let slot = self.slots.get_unchecked(id.raw.get() as usize);
-        slot.finish(OutputSlot {
-            output,
+        OutputSlot {
+            output: result.output,
             dependencies,
-        })
+        }
     }
 
     /// Get the dependencies of the given query.
@@ -124,5 +120,13 @@ impl<Q: Query> QuerySlot<Q> {
         &self,
     ) -> Result<&OutputSlot<Q::Output>, impl Future<Output = &OutputSlot<Q::Output>> + '_> {
         self.cell.wait_until_finished()
+    }
+
+    pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
+        self.cell.set_cycle(cycle)
+    }
+
+    pub fn take_cycle(&self) -> Option<Cycle> {
+        self.cell.take_cycle()
     }
 }

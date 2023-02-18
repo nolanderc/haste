@@ -6,7 +6,7 @@ use std::{future::Future, pin::Pin};
 use futures_lite::FutureExt;
 
 use crate::{
-    Container, ContainerPath, CycleStrategy, Database, Dependency, DynContainer, Id,
+    Container, ContainerPath, Cycle, CycleStrategy, Database, Dependency, DynContainer, Id,
     IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
 
@@ -48,6 +48,11 @@ pub trait DynQueryCache: DynContainer {
 
     /// Get the cycle recovery stategy used by the query
     fn cycle_strategy(&self) -> CycleStrategy;
+
+    /// Signals that the specific query is part of a cycle.
+    ///
+    /// Returns `Err` if the query is already recovering from a cycle.
+    fn set_cycle(&self, id: Id, cycle: Cycle) -> Result<(), Cycle>;
 }
 
 /// A query cache which uses the hash of the input as a key.
@@ -79,6 +84,15 @@ where
     fn path(&self) -> ContainerPath {
         self.path
     }
+
+    fn fmt(&self, id: Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let slot = self.storage.slot(id);
+        Q::fmt(slot.input(), f)
+    }
+
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
+        Some(self)
+    }
 }
 
 impl<Q: Query, Lookup> QueryCache for QueryCache2<Q, Lookup>
@@ -96,7 +110,7 @@ where
         match self.lookup.try_insert(input, &self.storage) {
             Err(id) => {
                 let slot = self.storage.slot(id);
-                return match try_get(self.path, id, slot, db) {
+                return match try_get(self.ingredient(id), slot, db) {
                     Ok(cached) => EvalResult::Cached(cached),
                     Err(pending) => EvalResult::Pending(pending),
                 };
@@ -111,7 +125,7 @@ where
         id: Id,
     ) -> Result<QueryResult<'a, Self::Query>, PendingFuture<'a, Q>> {
         let slot = self.storage.slot(id);
-        try_get(self.path, id, slot, db)
+        try_get(self.ingredient(id), slot, db)
     }
 }
 
@@ -127,6 +141,10 @@ where
     fn cycle_strategy(&self) -> CycleStrategy {
         Q::CYCLE_STRATEGY
     }
+
+    fn set_cycle(&self, id: Id, cycle: Cycle) -> Result<(), Cycle> {
+        self.storage.slot(id).set_cycle(cycle)
+    }
 }
 
 pub type QueryResult<'a, Q> = (Id, &'a <Q as Query>::Output);
@@ -140,35 +158,28 @@ pub enum EvalResult<'a, Q: Query> {
 pub type PendingFuture<'a, Q: Query> = impl Future<Output = QueryResult<'a, Q>> + 'a;
 
 fn try_get<'a, Q: Query>(
-    container: ContainerPath,
-    id: Id,
+    path: IngredientPath,
     slot: &'a QuerySlot<Q>,
     db: &'a IngredientDatabase<Q>,
 ) -> Result<QueryResult<'a, Q>, PendingFuture<'a, Q>> {
     match slot.wait_until_finished() {
-        Ok(slot) => Ok((id, &slot.output)),
+        Ok(slot) => Ok((path.resource, &slot.output)),
         Err(mut fut) => Err({
-            let query_path = IngredientPath {
-                container,
-                resource: id,
-            };
             let mut is_blocked = false;
             std::future::poll_fn(move |cx| {
                 let result = fut.poll(cx);
 
                 if result.is_pending() && !is_blocked {
-                    let db = db.as_dyn();
-                    if let Some(cycle) = db.runtime().would_block_on(query_path, db) {
-                        panic!("dependency cycle: {:#}", cycle.fmt(db))
-                    }
                     is_blocked = true;
+                    let db = db.as_dyn();
+                    db.runtime().would_block_on(path, cx.waker(), db);
                 }
                 if result.is_ready() && is_blocked {
-                    db.runtime().unblock(query_path, db.as_dyn());
                     is_blocked = false;
+                    db.runtime().unblock(path, db.as_dyn());
                 }
 
-                result.map(|slot| (id, &slot.output))
+                result.map(|slot| (path.resource, &slot.output))
             })
         }),
     }
@@ -181,15 +192,19 @@ impl<Q: Query, Lookup> QueryCache2<Q, Lookup> {
         id: Id,
         input: Q::Input,
     ) -> QueryCacheTask<'a, Q> {
-        let this = IngredientPath {
-            container: self.path,
-            resource: id,
-        };
+        let this = self.ingredient(id);
         let future = db.runtime().execute_query(db, input, this);
         QueryCacheTask {
             this,
             storage: &self.storage,
             future,
+        }
+    }
+
+    fn ingredient(&self, id: Id) -> IngredientPath {
+        IngredientPath {
+            container: self.path,
+            resource: id,
         }
     }
 }
@@ -204,22 +219,36 @@ impl<'a, Q: Query> QueryCacheTask<'a, Q> {
     fn poll_advanced(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<(Id, &'a Q::Output)> {
+    ) -> std::task::Poll<(Id, &'a Q::Output)>
+    where
+        Q::Input: Clone,
+    {
         // SAFETY: we never move anything out of `self` that is not `Unpin`
         let this = unsafe { self.get_unchecked_mut() };
+        let id = this.this.resource;
 
-        // SAFETY: `result` points to `self`, which is `Pin`
-        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        let slot = unsafe { this.storage.get_slot_unchecked(id) };
+
+        // SAFETY: `this` is an alias for `self` which is pinned.
+        let mut future = unsafe { Pin::new_unchecked(&mut this.future) };
+
+        if let Some(cycle) = slot.take_cycle() {
+            future.as_mut().recover(cycle, slot.input());
+        }
+
         let result = std::task::ready!(future.poll(cx));
 
-        let id = this.this.resource;
-        let slot = unsafe { this.storage.finish(id, result.output, &result.dependencies) };
+        let output = this.storage.create_output(result);
+        let output_slot = slot.finish(output);
 
-        std::task::Poll::Ready((id, &slot.output))
+        std::task::Poll::Ready((id, &output_slot.output))
     }
 }
 
-impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
+impl<Q: Query> QueryTask for QueryCacheTask<'_, Q>
+where
+    Q::Input: Clone,
+{
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()> {
         self.poll_advanced(cx).map(|_| ())
     }
@@ -229,7 +258,10 @@ impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
     }
 }
 
-impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
+impl<'a, Q: Query> Future for QueryCacheTask<'a, Q>
+where
+    Q::Input: Clone,
+{
     type Output = (Id, &'a Q::Output);
 
     fn poll(

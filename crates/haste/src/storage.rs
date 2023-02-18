@@ -31,7 +31,11 @@ pub trait Container: DynContainer {
 pub trait DynContainer: 'static {
     fn path(&self) -> ContainerPath;
 
-    fn fmt(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = IngredientPath {
+            container: self.path(),
+            resource: id,
+        };
         write!(f, "{:?}", path)
     }
 

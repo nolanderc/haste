@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    task::Waker,
 };
 
 use crate::{
@@ -157,10 +158,28 @@ thread_local! {
 }
 
 pub(crate) struct QueryFuture<'db, Q: Query> {
-    /// The future which drives the query progress.
-    inner: Q::Future<'db>,
+    db: &'db IngredientDatabase<Q>,
     /// Data associated with the executing task.
     task: Option<TaskData>,
+    /// The future which drives the query progress.
+    inner: QueryFutureInner<'db, Q>,
+}
+
+enum QueryFutureInner<'a, Q: Query> {
+    Eval(Q::Future<'a>),
+    Recover(Q::RecoverFuture<'a>),
+}
+
+impl<'db, Q: Query> QueryFuture<'db, Q> {
+    pub fn recover(self: Pin<&mut Self>, cycle: Cycle, input: &Q::Input)
+    where
+        Q::Input: Clone,
+    {
+        let recovery = Q::recover_cycle(self.db, cycle, input.clone());
+        unsafe {
+            self.get_unchecked_mut().inner = QueryFutureInner::Recover(recovery);
+        }
+    }
 }
 
 impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
@@ -168,12 +187,11 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        ctx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         ACTIVE.with(|active| unsafe {
             // project the inner fields
             let this = self.get_unchecked_mut();
-            let inner = Pin::new_unchecked(&mut this.inner);
 
             if this.task.is_none() {
                 panic!("polled query after it has already completed");
@@ -181,7 +199,12 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
 
             // set the current task as active when polling the query
             let old_task = active.task.replace(this.task.take());
-            let poll_inner = inner.poll(ctx);
+
+            // poll the query for completion
+            let poll_inner = match &mut this.inner {
+                QueryFutureInner::Eval(eval) => Pin::new_unchecked(eval).poll(cx),
+                QueryFutureInner::Recover(recover) => Pin::new_unchecked(recover).poll(cx),
+            };
 
             // restore the previous task
             this.task = active.task.replace(old_task);
@@ -207,7 +230,8 @@ impl Runtime {
         this: IngredientPath,
     ) -> QueryFuture<'db, Q> {
         QueryFuture {
-            inner: Q::execute(db, input),
+            db,
+            inner: QueryFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new(this)),
         }
     }
@@ -222,20 +246,16 @@ impl Runtime {
     }
 
     /// Called when the execution of a query would block on another
-    #[must_use]
-    pub(crate) fn would_block_on(&self, other: IngredientPath, db: &dyn Database) -> Option<Cycle> {
+    pub(crate) fn would_block_on(&self, other: IngredientPath, waker: &Waker, db: &dyn Database) {
         ACTIVE.with(|active| {
-            let Some(this) = active.current_task() else { return None };
-            use crate::util::fmt::query;
-            eprintln!("{} is blocked on {}", query(db, this), query(db, other));
-            self.graph.lock().unwrap().insert(this, other, db)
+            let Some(this) = active.current_task() else { return };
+            self.graph.lock().unwrap().insert(this, other, waker, db);
         })
     }
 
     pub(crate) fn unblock(&self, other: IngredientPath, _db: &dyn Database) {
         ACTIVE.with(|active| {
             let Some(this) = active.current_task() else { return };
-            eprintln!("{:?} is no longer blocked on {:?}", this, other);
             self.graph.lock().unwrap().remove(this, other);
         })
     }

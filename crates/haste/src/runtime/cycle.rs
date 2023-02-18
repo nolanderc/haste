@@ -1,4 +1,4 @@
-use std::{collections::hash_map, sync::Arc};
+use std::{collections::hash_map, sync::Arc, task::Waker};
 
 use ahash::HashMap;
 use smallvec::SmallVec;
@@ -22,8 +22,8 @@ struct Vertex {
     /// This is used as an optimization to reduce the number nodes that need to be visited when
     /// detecting cycles.
     last_in_chain: IngredientPath,
-    /// If we have found a cycle for this query previously it is stored here.
-    cycle: Option<Cycle>,
+
+    waker: Waker,
 }
 
 impl CycleGraph {
@@ -31,15 +31,12 @@ impl CycleGraph {
         &mut self,
         source: IngredientPath,
         target: IngredientPath,
+        waker: &Waker,
         db: &dyn Database,
-    ) -> Option<Cycle> {
+    ) {
         match self.vertices.entry(source) {
             hash_map::Entry::Occupied(entry) => {
                 let previous = entry.get();
-
-                if let Some(cycle) = &previous.cycle {
-                    return Some(cycle.clone());
-                }
 
                 panic!(
                     concat!(
@@ -53,9 +50,9 @@ impl CycleGraph {
                 entry.insert(Vertex {
                     blocked_on: target,
                     last_in_chain: target,
-                    cycle: None,
+                    waker: waker.clone(),
                 });
-                self.find_cycle(source, db)
+                self.detect_cycle(source, db);
             }
         }
     }
@@ -68,11 +65,6 @@ impl CycleGraph {
             hash_map::Entry::Occupied(entry) => {
                 let vertex = entry.get();
 
-                if vertex.cycle.is_some() {
-                    // don't remove cycles
-                    return;
-                }
-
                 if vertex.blocked_on != target {
                     panic!("called `remove` on an edge that does not exist")
                 }
@@ -82,9 +74,9 @@ impl CycleGraph {
         }
     }
 
-    fn find_cycle(&mut self, source: IngredientPath, db: &dyn Database) -> Option<Cycle> {
+    fn detect_cycle(&mut self, source: IngredientPath, db: &dyn Database) {
         if !self.is_cyclic(source) {
-            return None;
+            return;
         }
 
         // list of all queries that are a part of the cycle
@@ -110,10 +102,20 @@ impl CycleGraph {
         let participants = Arc::<[_]>::from(participants.as_slice());
 
         let make_cycle = |index: usize| {
-            self.vertices.get_mut(&participants[index]).unwrap().cycle = Some(Cycle {
+            let cycle = Cycle {
                 start: index,
                 participants: participants.clone(),
-            });
+            };
+            let path = participants[index];
+            let container = db.dyn_container_path(path.container).unwrap();
+            let cache = container.as_query_cache().unwrap();
+            if let Err(cycle) = cache.set_cycle(path.resource, cycle) {
+                panic!(
+                    "found dependency cycle while recovering from another cycle: {:#}",
+                    cycle.fmt(db)
+                );
+            }
+            self.vertices.remove(&path).unwrap().waker.wake();
         };
 
         if recovered.is_empty() {
@@ -122,8 +124,6 @@ impl CycleGraph {
         } else {
             recovered.iter().copied().for_each(make_cycle);
         }
-
-        self.vertices[&source].cycle.clone()
     }
 
     fn recovery(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
@@ -136,18 +136,11 @@ impl CycleGraph {
     }
 
     fn is_cyclic(&mut self, start: IngredientPath) -> bool {
-        debug_assert!(self.vertices[&start].cycle.is_none());
-
         let mut participants = SmallVec::<[IngredientPath; 8]>::new();
         let mut curr = start;
 
         while let Some(vertex) = self.vertices.get(&curr) {
             participants.push(curr);
-
-            if vertex.cycle.is_some() {
-                // there is a cycle ahead, but this query is not directly a part of it
-                return false;
-            }
 
             curr = if vertex.last_in_chain == vertex.blocked_on {
                 vertex.blocked_on

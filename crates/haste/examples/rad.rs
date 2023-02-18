@@ -95,7 +95,7 @@ async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
     }
 }
 
-async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32 {
+async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, n: u32) -> u32 {
     123
 }
 

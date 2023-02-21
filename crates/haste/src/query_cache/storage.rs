@@ -94,6 +94,8 @@ pub struct OutputSlot<T> {
     pub output: T,
 }
 
+pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q::Output>> + 'a;
+
 impl<Q: Query> QuerySlot<Q> {
     pub fn input(&self) -> &Q::Input {
         self.cell
@@ -116,9 +118,7 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_finished(
-        &self,
-    ) -> Result<&OutputSlot<Q::Output>, impl Future<Output = &OutputSlot<Q::Output>> + '_> {
+    pub fn wait_until_finished(&self) -> Result<&OutputSlot<Q::Output>, WaitFuture<'_, Q>> {
         self.cell.wait_until_finished()
     }
 

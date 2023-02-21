@@ -448,9 +448,13 @@ impl<I, T> Drop for QueryCell<I, T> {
     fn drop(&mut self) {
         let addr = *self.state.addr.get_mut();
 
+        if addr & INITIALIZED != 0 {
+            unsafe { self.input.get_mut().assume_init_drop() }
+        }
         if addr & FINISHED != 0 {
             unsafe { self.output.get_mut().assume_init_drop() }
         }
+
 
         let ptr = (addr & ADDR_MASK) as *mut BlockedState;
         if !ptr.is_null() {

@@ -24,7 +24,7 @@ where
 {
     fn try_insert<'a>(
         &self,
-        input: <Q as Query>::Input,
+        input: Q::Input,
         storage: &'a QueryStorage<Q>,
     ) -> Result<(Id, &'a Q::Input), Id> {
         let eq_fn = |key: &Id| {
@@ -77,9 +77,9 @@ where
 {
     fn try_insert<'a>(
         &self,
-        input: <Q as Query>::Input,
+        input: Q::Input,
         storage: &'a QueryStorage<Q>,
-    ) -> Result<(Id, &'a <Q as Query>::Input), Id> {
+    ) -> Result<(Id, &'a Q::Input), Id> {
         let id = input.id();
         match storage.init_slot(id, input) {
             Ok(input) => Ok((id, input)),

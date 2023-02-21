@@ -23,6 +23,7 @@ pub struct Storage(
     factors,
     next_prime,
     cyclic,
+    partner,
 );
 
 #[haste::intern(Text)]
@@ -43,7 +44,7 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-    fib::spawn(db, n - 1).await + fib::spawn(db, n - 2).await
+    fib(db, n - 1).await + fib(db, n - 2).await
 }
 
 #[haste::query]
@@ -82,7 +83,7 @@ async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
         return n + 1;
     }
 
-    next_prime::spawn(db, n + 1).await
+    next_prime(db, n + 1).await
 }
 
 #[haste::query]
@@ -90,13 +91,19 @@ async fn next_prime(db: &dyn crate::Db, n: u32) -> u32 {
 #[cycle(cyclic_cycle)]
 async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
     match n {
-        0..=3 | 5..=6 => cyclic::spawn(db, n + 1).await,
-        _ => cyclic::spawn(db, 0).await,
+        0..=3 => partner(db, n).await,
+        _ => cyclic(db, 0).await,
     }
 }
 
 async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32 {
     123
+}
+
+#[haste::query]
+#[clone]
+async fn partner(db: &dyn crate::Db, n: u32) -> u32 {
+    cyclic(db, n + 1).await + 1
 }
 
 fn main() {
@@ -123,7 +130,7 @@ fn main() {
         //     });
         // })
 
-        dbg!(scope.block_on(cyclic::spawn(db, 5)));
+        dbg!(scope.block_on(partner(db, 5)));
     });
 
     let duration = start.elapsed();

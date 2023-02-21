@@ -190,7 +190,7 @@ where
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
 pub trait DatabaseExt: Database {
     /// Execute a query with some input, reusing previous results if possible.
-    fn execute<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
+    fn execute_inline<'db, Q>(&'db self, input: Q::Input) -> ExecuteFuture<'db, Self, Q>
     where
         Q: Query,
         Q::Storage: 'db,

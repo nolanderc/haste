@@ -10,7 +10,7 @@ use crate::{
     IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
 };
 
-use self::storage::{QuerySlot, QueryStorage};
+use self::storage::{QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
 
@@ -155,8 +155,6 @@ pub enum EvalResult<'a, Q: Query> {
     Eval(QueryCacheTask<'a, Q>),
 }
 
-pub type PendingFuture<'a, Q: Query> = impl Future<Output = QueryResult<'a, Q>> + 'a;
-
 fn try_get<'a, Q: Query>(
     path: IngredientPath,
     slot: &'a QuerySlot<Q>,
@@ -164,24 +162,58 @@ fn try_get<'a, Q: Query>(
 ) -> Result<QueryResult<'a, Q>, PendingFuture<'a, Q>> {
     match slot.wait_until_finished() {
         Ok(slot) => Ok((path.resource, &slot.output)),
-        Err(mut fut) => Err({
-            let mut is_blocked = false;
-            std::future::poll_fn(move |cx| {
-                let result = fut.poll(cx);
-
-                if result.is_pending() && !is_blocked {
-                    is_blocked = true;
-                    let db = db.as_dyn();
-                    db.runtime().would_block_on(path, cx.waker(), db);
-                }
-                if result.is_ready() && is_blocked {
-                    is_blocked = false;
-                    db.runtime().unblock(path, db.as_dyn());
-                }
-
-                result.map(|slot| (path.resource, &slot.output))
-            })
+        Err(fut) => Err(PendingFuture {
+            db,
+            path,
+            fut,
+            blocks: None,
         }),
+    }
+}
+
+pub struct PendingFuture<'a, Q: Query> {
+    db: &'a IngredientDatabase<Q>,
+    path: IngredientPath,
+    blocks: Option<IngredientPath>,
+    fut: WaitFuture<'a, Q>,
+}
+
+impl<'a, Q: Query> Drop for PendingFuture<'a, Q> {
+    fn drop(&mut self) {
+        if let Some(parent) = self.blocks {
+            self.db.runtime().unblock(parent);
+        }
+    }
+}
+
+impl<'a, Q: Query> Future for PendingFuture<'a, Q> {
+    type Output = QueryResult<'a, Q>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        let result = self.fut.poll(cx);
+
+        match (&result, self.blocks) {
+            (Poll::Pending, None) => {
+                let db = self.db.as_dyn();
+                let runtime = self.db.runtime();
+                if let Some(parent) = runtime.current_query() {
+                    self.blocks = Some(parent);
+                    runtime.would_block_on(parent, self.path, cx.waker(), db);
+                }
+            }
+            (Poll::Ready(_), Some(parent)) => {
+                let runtime = self.db.runtime();
+                runtime.unblock(parent);
+                self.blocks = None;
+            }
+            _ => {}
+        }
+
+        result.map(|slot| (self.path.resource, &slot.output))
     }
 }
 

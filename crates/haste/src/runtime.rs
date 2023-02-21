@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    task::Waker,
+    task::{Poll, Waker},
 };
 
 use crate::{
@@ -163,6 +163,8 @@ pub(crate) struct QueryFuture<'db, Q: Query> {
     task: Option<TaskData>,
     /// The future which drives the query progress.
     inner: QueryFutureInner<'db, Q>,
+
+    blocks: Option<IngredientPath>,
 }
 
 enum QueryFutureInner<'a, Q: Query> {
@@ -177,7 +179,16 @@ impl<'db, Q: Query> QueryFuture<'db, Q> {
     {
         let recovery = Q::recover_cycle(self.db, cycle, input.clone());
         unsafe {
-            self.get_unchecked_mut().inner = QueryFutureInner::Recover(recovery);
+            let this = self.get_unchecked_mut();
+            this.inner = QueryFutureInner::Recover(recovery);
+        }
+    }
+}
+
+impl<'db, Q: Query> Drop for QueryFuture<'db, Q> {
+    fn drop(&mut self) {
+        if let Some(parent) = self.blocks {
+            self.db.runtime().unblock(parent);
         }
     }
 }
@@ -185,10 +196,7 @@ impl<'db, Q: Query> QueryFuture<'db, Q> {
 impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
     type Output = ExecutionResult<Q::Output>;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         ACTIVE.with(|active| unsafe {
             // project the inner fields
             let this = self.get_unchecked_mut();
@@ -207,14 +215,33 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
             };
 
             // restore the previous task
+            let parent = old_task.as_ref().map(|old| old.this);
             this.task = active.task.replace(old_task);
+
+            let me = this.task.as_ref().unwrap().this;
+
+            // if this query is polled from another query, block that parent on this task
+            if let Some(parent) = parent {
+                match (&poll_inner, this.blocks) {
+                    (Poll::Pending, None) => {
+                        let db = this.db.as_dyn();
+                        this.db.runtime().would_block_on(parent, me, cx.waker(), db);
+                        this.blocks = Some(parent);
+                    }
+                    (Poll::Ready(_), Some(parent)) => {
+                        this.db.runtime().unblock(parent);
+                        this.blocks = None;
+                    }
+                    _ => {}
+                }
+            }
 
             // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
 
             let dependencies = this.task.take().unwrap().dependencies;
 
-            std::task::Poll::Ready(ExecutionResult {
+            Poll::Ready(ExecutionResult {
                 output,
                 dependencies,
             })
@@ -233,6 +260,7 @@ impl Runtime {
             db,
             inner: QueryFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new(this)),
+            blocks: None,
         }
     }
 
@@ -245,19 +273,24 @@ impl Runtime {
         })
     }
 
-    /// Called when the execution of a query would block on another
-    pub(crate) fn would_block_on(&self, other: IngredientPath, waker: &Waker, db: &dyn Database) {
-        ACTIVE.with(|active| {
-            let Some(this) = active.current_task() else { return };
-            self.graph.lock().unwrap().insert(this, other, waker, db);
-        })
+    pub(crate) fn current_query(&self) -> Option<IngredientPath> {
+        ACTIVE.with(|active| active.current_task())
     }
 
-    pub(crate) fn unblock(&self, other: IngredientPath, _db: &dyn Database) {
-        ACTIVE.with(|active| {
-            let Some(this) = active.current_task() else { return };
-            self.graph.lock().unwrap().remove(this, other);
-        })
+    pub(crate) fn would_block_on(
+        &self,
+        parent: IngredientPath,
+        child: IngredientPath,
+        waker: &Waker,
+        db: &dyn Database,
+    ) {
+        eprintln!("insert {:?} -> {:?}", parent, child);
+        self.graph.lock().unwrap().insert(parent, child, waker, db);
+    }
+
+    pub(crate) fn unblock(&self, parent: IngredientPath) {
+        eprintln!("unblock {:?}", parent);
+        self.graph.lock().unwrap().remove(parent);
     }
 
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T)

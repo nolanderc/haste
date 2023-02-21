@@ -57,20 +57,9 @@ impl CycleGraph {
         }
     }
 
-    pub fn remove(&mut self, source: IngredientPath, target: IngredientPath) {
-        match self.vertices.entry(source) {
-            hash_map::Entry::Vacant(_) => {
-                panic!("called `remove` on an edge that does not exist")
-            }
-            hash_map::Entry::Occupied(entry) => {
-                let vertex = entry.get();
-
-                if vertex.blocked_on != target {
-                    panic!("called `remove` on an edge that does not exist")
-                }
-
-                entry.remove();
-            }
+    pub fn remove(&mut self, source: IngredientPath) {
+        if self.vertices.remove(&source).is_none() {
+            panic!("called `remove` on an edge that does not exist")
         }
     }
 
@@ -115,7 +104,7 @@ impl CycleGraph {
                     cycle.fmt(db)
                 );
             }
-            self.vertices.remove(&path).unwrap().waker.wake();
+            self.vertices[&path].waker.wake_by_ref();
         };
 
         if recovered.is_empty() {

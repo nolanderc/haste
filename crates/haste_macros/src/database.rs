@@ -22,35 +22,43 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
     {
         let storage_paths = storages.iter();
         impls.extend(quote! {
-            unsafe impl haste::Database for #ident {
+            impl haste::StaticDatabase for #ident {
+                type StorageList = (#(#storage_paths,)*);
+
+                fn storage(&self) -> &haste::DatabaseStorage<Self> {
+                    &self.storage
+                }
+
+                fn storage_mut(&mut self) -> &mut haste::DatabaseStorage<Self> {
+                    &mut self.storage
+                }
+            }
+
+            impl haste::Database for #ident {
                 fn as_dyn(&self) -> &dyn haste::Database {
                     self
                 }
 
                 fn runtime(&self) -> &haste::Runtime {
-                    &self.runtime
+                    self.storage.runtime()
                 }
 
-                fn runtime_mut(&mut self) -> &mut haste::Runtime {
-                    &mut self.runtime
+                fn storage_list(&self) -> &dyn haste::DynStorageList {
+                    self.storage.list()
                 }
 
                 fn dyn_storage(&self, id: std::any::TypeId) -> Option<&dyn haste::DynStorage> {
-                    haste::StorageList::get(self.storage.list(), id)
+                    haste::DynStorageList::get(self.storage.list(), id)
                 }
 
                 fn dyn_storage_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynStorage> {
-                    haste::StorageList::get_path(self.storage.list(), path)
+                    haste::DynStorageList::get_path(self.storage.list(), path)
                 }
 
                 fn dyn_container_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
-                    haste::StorageList::get_path(self.storage.list(), path)?
+                    haste::DynStorageList::get_path(self.storage.list(), path)?
                         .dyn_container_path(path)
                 }
-            }
-
-            impl haste::WithStorages for #ident {
-                type StorageList = (#(#storage_paths,)*);
             }
         });
     }
@@ -70,11 +78,6 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                 #[inline(always)]
                 fn storage(&self) -> &Storage {
                     &self.storage.list().#index
-                }
-
-                #[inline(always)]
-                fn storage_mut(&mut self) -> &mut Storage {
-                    &mut self.storage.list_mut().#index
                 }
             }
         });

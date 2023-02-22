@@ -1,4 +1,4 @@
-use crate::{Database, DynQueryCache, WithStorage};
+use crate::{Database, DynQueryCache, Runtime, StaticDatabase, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage: DynStorage {
@@ -78,20 +78,49 @@ impl std::fmt::Debug for IngredientPath {
 }
 
 /// Contains all storage that is needed for the database
-pub struct DatabaseStorage<DB: WithStorages> {
-    storages: DB::StorageList,
+pub struct DatabaseStorage<DB: StaticDatabase + ?Sized> {
+    pub(crate) runtime: Runtime,
+    pub(crate) list: DB::StorageList,
 }
 
-pub trait WithStorages {
-    /// A type containing all the storages used by a database.
-    type StorageList: StorageList;
+impl<DB: StaticDatabase + ?Sized> Default for DatabaseStorage<DB> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-pub trait StorageList {
+impl<DB: StaticDatabase + ?Sized> DatabaseStorage<DB> {
+    pub fn new() -> Self {
+        let mut router = StorageRouter::new();
+
+        Self {
+            runtime: Runtime::new(),
+            list: DB::StorageList::new(&mut router),
+        }
+    }
+
+    pub fn list(&self) -> &DB::StorageList {
+        &self.list
+    }
+
+    pub fn list_mut(&mut self) -> &mut DB::StorageList {
+        &mut self.list
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+}
+
+pub trait StorageList: DynStorageList {
     fn new(router: &mut StorageRouter) -> Self
     where
         Self: Sized;
 
+    fn get_mut<T: 'static>(&mut self) -> Option<&mut T>;
+}
+
+pub trait DynStorageList {
     fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage>;
     fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
 }
@@ -126,34 +155,10 @@ impl StorageRouter {
     }
 }
 
-impl<DB: WithStorages> Default for DatabaseStorage<DB> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<DB: WithStorages> DatabaseStorage<DB> {
-    pub fn new() -> Self {
-        let mut router = StorageRouter::new();
-
-        Self {
-            storages: DB::StorageList::new(&mut router),
-        }
-    }
-
-    pub fn list(&self) -> &DB::StorageList {
-        &self.storages
-    }
-
-    pub fn list_mut(&mut self) -> &mut DB::StorageList {
-        &mut self.storages
-    }
-}
-
 macro_rules! impl_tuple {
     ($($T:ident)*) => {
         #[allow(unused, clippy::unused_unit, non_snake_case)]
-        impl<$($T: Storage),*> StorageList for ($($T,)*) {
+        impl<$($T: Storage + 'static),*> StorageList for ($($T,)*) {
             fn new(router: &mut StorageRouter) -> Self {
                 $(
                     let $T: $T = $T::new(router);
@@ -163,6 +168,23 @@ macro_rules! impl_tuple {
                 ($($T,)*)
             }
 
+            #[inline]
+            fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+                let ($($T,)*) = self;
+
+                $(
+                    if std::any::TypeId::of::<$T>() == std::any::TypeId::of::<T>() {
+                        return unsafe { Some(std::mem::transmute::<&mut $T, &mut T>($T)) }
+                    }
+                )*
+
+                None
+            }
+        }
+
+        #[allow(unused, clippy::unused_unit, non_snake_case)]
+        impl<$($T: Storage),*> DynStorageList for ($($T,)*) {
+            #[inline]
             fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage> {
                 let ($($T,)*) = self;
 
@@ -174,6 +196,7 @@ macro_rules! impl_tuple {
 
                 None
             }
+
 
             fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage> {
                 let ($($T,)*) = self;

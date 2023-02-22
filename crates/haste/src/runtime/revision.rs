@@ -1,19 +1,27 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::non_max::NonMaxU32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Revision(NonMaxU32);
+
 pub struct RevisionHistory {
     history: MinHistory,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Revision(NonMaxU32);
 
 impl RevisionHistory {
     pub fn new() -> Self {
         Self {
             history: MinHistory::new(),
         }
+    }
+
+    pub fn current(&self) -> Option<Revision> {
+        Some(Revision(NonMaxU32::new(
+            (self.history.len() as u32).wrapping_sub(1),
+        )?))
     }
 
     /// When an input has been modified, this function is called with the previous revision in

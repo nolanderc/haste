@@ -4,8 +4,7 @@ use std::future::Future;
 
 use crate::{
     arena::{AppendArena, RawArena},
-    non_max::NonMaxU32,
-    Cycle, Dependency, Id, Query,
+    Cycle, Dependency, Id, Query, Revision,
 };
 
 use self::cell::QueryCell;
@@ -40,9 +39,14 @@ impl<Q: Query> QueryStorage<Q> {
             let start = range.start as u32;
             start..end
         };
+
+        // TODO: compute the correct revisions
         OutputSlot {
             output: result.output,
             dependencies,
+            verified_at: None,
+            changed_at: None,
+            max_input: None,
         }
     }
 
@@ -62,13 +66,19 @@ impl<Q: Query> QueryStorage<Q> {
         self.slots.get_unchecked(id.raw.get() as usize)
     }
 
+    pub(crate) fn slot_mut(&mut self, id: Id) -> &mut QuerySlot<Q> {
+        self.slots
+            .get_mut(id.raw.get() as usize)
+            .expect("attempted to get query slot which does not exist")
+    }
+
     pub fn allocate_slot(&self, input: Q::Input) -> (Id, &Q::Input) {
         let index = self.slots.push_zeroed();
         let slot = unsafe { self.slots.get_unchecked(index) };
         let input = match slot.cell.write_input(input) {
             Ok(input) | Err(input) => input,
         };
-        let id = Id::new(NonMaxU32::new(index as u32).expect("exhausted IDs"));
+        let id = Id::try_from_usize(index).expect("exhausted IDs");
         (id, input)
     }
 
@@ -92,6 +102,10 @@ pub struct OutputSlot<T> {
 
     /// The output from a query.
     pub output: T,
+
+    pub verified_at: Option<Revision>,
+    pub changed_at: Option<Revision>,
+    pub max_input: Option<Revision>,
 }
 
 pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q::Output>> + 'a;
@@ -107,9 +121,12 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.input_assume_init()
     }
 
+    pub fn get_output(&self) -> Option<&OutputSlot<Q::Output>> {
+        self.cell.get_output()
+    }
+
     pub fn output(&self) -> &OutputSlot<Q::Output> {
-        self.cell
-            .get_output()
+        self.get_output()
             .expect("attempted to read query output which has not been written")
     }
 
@@ -128,5 +145,12 @@ impl<Q: Query> QuerySlot<Q> {
 
     pub fn take_cycle(&self) -> Option<Cycle> {
         self.cell.take_cycle()
+    }
+
+    pub fn set_output(&mut self, output: OutputSlot<Q::Output>)
+    where
+        Q: crate::Input,
+    {
+        self.cell.set_output(output);
     }
 }

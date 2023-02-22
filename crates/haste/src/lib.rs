@@ -44,23 +44,22 @@ impl Id {
 
 /// A database contains storage for all the ingredients in the query system, and provides a handle
 /// to the runtime.
-///
-/// # Safety
-///
-/// This trait is `unsafe` to implement because it requires the guarantee that the same runtime
-/// will always be returned, and that the lifetime of the runtime is the lifetime of the database
-/// storage. That is: the inner runtime and storage will only ever be accessed together.
-pub unsafe trait Database: Sync {
+pub trait Database: Sync {
     fn as_dyn(&self) -> &dyn Database;
 
     fn runtime(&self) -> &Runtime;
-    fn runtime_mut(&mut self) -> &mut Runtime;
+
+    fn storage_list(&self) -> &dyn DynStorageList;
 
     /// Gets the storage of the given type.
-    fn dyn_storage(&self, typ: TypeId) -> Option<&dyn DynStorage>;
+    fn dyn_storage(&self, typ: TypeId) -> Option<&dyn DynStorage> {
+        self.storage_list().get(typ)
+    }
 
     /// Gets the storage for the given ingredient.
-    fn dyn_storage_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
+    fn dyn_storage_path(&self, path: ContainerPath) -> Option<&dyn DynStorage> {
+        self.storage_list().get_path(path)
+    }
 
     /// Gets the container for the given ingredient.
     fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer> {
@@ -68,11 +67,19 @@ pub unsafe trait Database: Sync {
     }
 }
 
+pub trait StaticDatabase: Database {
+    /// A type containing all the storages used by a database.
+    type StorageList: StorageList;
+
+    fn storage(&self) -> &DatabaseStorage<Self>;
+
+    fn storage_mut(&mut self) -> &mut DatabaseStorage<Self>;
+}
+
 /// Implemented by databases which contain a specific type of storage.
 pub trait WithStorage<S: Storage + ?Sized>: Database {
     fn cast_dyn(&self) -> &S::DynDatabase;
     fn storage(&self) -> &S;
-    fn storage_mut(&mut self) -> &mut S;
 }
 
 pub trait Ingredient: 'static {
@@ -84,17 +91,24 @@ pub trait Ingredient: 'static {
 }
 
 /// The database required by some database
-type IngredientDatabase<T> = <<T as Ingredient>::Storage as Storage>::DynDatabase;
+type DatabaseFor<T> = <<T as Ingredient>::Storage as Storage>::DynDatabase;
+
+/// Implemented by storages which has a contoiner for the given ingredient.
+pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
+    fn container(&self) -> &T::Container;
+    fn container_mut(&mut self) -> &mut T::Container;
+}
 
 pub trait TrackedReference {
     fn from_id(id: Id) -> Self;
     fn id(self) -> Id;
 }
 
-/// Implemented by storages which has a contoiner for the given ingredient.
-pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
-    fn container(&self) -> &T::Container;
-    fn container_mut(&mut self) -> &mut T::Container;
+pub trait Intern: Ingredient + TrackedReference
+where
+    Self::Container: ElementContainer,
+    <Self::Container as ElementContainer>::Value: Eq + std::hash::Hash,
+{
 }
 
 pub trait Query: Ingredient {
@@ -105,12 +119,12 @@ pub trait Query: Ingredient {
 
     fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
-    fn execute(db: &IngredientDatabase<Self>, input: Self::Input) -> Self::Future<'_>;
+    fn execute(db: &DatabaseFor<Self>, input: Self::Input) -> Self::Future<'_>;
 
     const CYCLE_STRATEGY: CycleStrategy;
 
     fn recover_cycle(
-        db: &IngredientDatabase<Self>,
+        db: &DatabaseFor<Self>,
         cycle: Cycle,
         input: Self::Input,
     ) -> Self::RecoverFuture<'_> {
@@ -122,18 +136,8 @@ pub trait Query: Ingredient {
     }
 }
 
-pub trait Intern: Ingredient + TrackedReference
-where
-    Self::Container: ElementContainer,
-    <Self::Container as ElementContainer>::Value: Eq + std::hash::Hash,
-{
-}
-
-pub trait Input: Ingredient + TrackedReference
-where
-    Self::Container: InputContainer,
-{
-}
+/// A query whose input depends on some side-effect (eg. file or network IO).
+pub trait Input: Query {}
 
 /// A container that stores values (elements) which are accessed by an ID.
 pub trait ElementContainer: Container {
@@ -299,6 +303,23 @@ pub trait DatabaseExt: Database {
         }
     }
 
+    /// Set the value of an input
+    fn set_input<'db, Q>(&'db mut self, input: Q::Input, output: Q::Output)
+    where
+        Q: Input,
+        Q::Storage: 'static,
+        Q::Container: QueryCache<Query = Q> + 'db,
+        Self: StaticDatabase + WithStorage<Q::Storage>,
+    {
+        let storage = self.storage_mut();
+        let cache = storage
+            .list
+            .get_mut::<Q::Storage>()
+            .unwrap()
+            .container_mut();
+        cache.set(&mut storage.runtime, input, output);
+    }
+
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T
     where
         T: Ingredient + TrackedReference,
@@ -362,9 +383,9 @@ impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
 pub fn scope<DB, F, T>(db: &mut DB, f: F) -> T
 where
     F: FnOnce(Scope<'_>, &DB) -> T,
-    DB: Database + ?Sized,
+    DB: StaticDatabase + Sized,
 {
-    let entered = unsafe { db.runtime_mut().enter() };
+    let entered = unsafe { db.storage_mut().runtime.enter() };
 
     let scope = Scope {
         runtime: db.runtime(),
@@ -374,7 +395,7 @@ where
 
     if entered {
         // we were the ones responsible for calling `enter`, so we must also `exit`
-        db.runtime_mut().exit();
+        db.storage_mut().runtime.exit();
     }
 
     match result {

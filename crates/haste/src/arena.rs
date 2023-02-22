@@ -215,6 +215,7 @@ impl<T> Arena<T> {
         self.raw.get(index)?.get()
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.raw.get_mut(index)?.get_mut()
     }
@@ -262,6 +263,7 @@ impl<T> OnceCell<T> {
         unsafe { Some(self.get_unchecked()) }
     }
 
+    #[allow(dead_code)]
     fn get_mut(&mut self) -> Option<&mut T> {
         if !self.state.is_written() {
             return None;
@@ -273,6 +275,7 @@ impl<T> OnceCell<T> {
         (*self.value.get()).assume_init_ref()
     }
 
+    #[allow(dead_code)]
     unsafe fn get_mut_unchecked(&mut self) -> &mut T {
         (*self.value.get()).assume_init_mut()
     }

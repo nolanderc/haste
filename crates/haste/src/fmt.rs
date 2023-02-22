@@ -57,7 +57,7 @@ pub struct FmtDatabase<'db, S> {
     storage: &'db S,
 }
 
-unsafe impl<'db, S> Database for FmtDatabase<'db, S>
+impl<'db, S> Database for FmtDatabase<'db, S>
 where
     S: Sync,
 {
@@ -69,16 +69,8 @@ where
         self.raw.runtime()
     }
 
-    fn runtime_mut(&mut self) -> &mut crate::Runtime {
-        unreachable!()
-    }
-
-    fn dyn_storage(&self, typ: TypeId) -> Option<&dyn crate::DynStorage> {
-        self.raw.dyn_storage(typ)
-    }
-
-    fn dyn_storage_path(&self, path: crate::ContainerPath) -> Option<&dyn crate::DynStorage> {
-        self.raw.dyn_storage_path(path)
+    fn storage_list(&self) -> &dyn crate::DynStorageList {
+        self.raw.storage_list()
     }
 }
 
@@ -92,10 +84,6 @@ where
 
     fn storage(&self) -> &S {
         self.storage
-    }
-
-    fn storage_mut(&mut self) -> &mut S {
-        unreachable!()
     }
 }
 

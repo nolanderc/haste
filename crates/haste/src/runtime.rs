@@ -1,6 +1,6 @@
 mod cycle;
+mod revision;
 mod task;
-mod revision_history;
 
 use std::{
     cell::Cell,
@@ -13,27 +13,33 @@ use std::{
     task::{Poll, Waker},
 };
 
-use crate::{
-    non_max::NonMaxU32, ContainerPath, Database, IngredientDatabase, IngredientPath, Query,
-};
+use crate::{non_max::NonMaxU32, ContainerPath, Database, DatabaseFor, IngredientPath, Query};
 
 pub use self::cycle::{Cycle, CycleStrategy};
+pub use self::revision::Revision;
 pub use self::task::QueryTask;
-use self::{cycle::CycleGraph, task::Scheduler};
+
+use self::{cycle::CycleGraph, revision::RevisionHistory, task::Scheduler};
 
 pub struct Runtime {
     tokio: Option<tokio::runtime::Runtime>,
     scheduler: Arc<Scheduler>,
     graph: Mutex<CycleGraph>,
+    revisions: RevisionHistory,
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
+impl Runtime {
+    pub(crate) fn new() -> Self {
         Self {
             tokio: None,
             scheduler: Arc::new(Scheduler::new()),
             graph: Default::default(),
+            revisions: RevisionHistory::new(),
         }
+    }
+
+    pub fn current_revision(&self) -> Option<Revision> {
+        self.revisions.current()
     }
 }
 
@@ -159,7 +165,7 @@ thread_local! {
 }
 
 pub(crate) struct QueryFuture<'db, Q: Query> {
-    db: &'db IngredientDatabase<Q>,
+    db: &'db DatabaseFor<Q>,
     /// Data associated with the executing task.
     task: Option<TaskData>,
     /// The future which drives the query progress.
@@ -253,7 +259,7 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
 impl Runtime {
     pub(crate) fn execute_query<'db, Q: Query>(
         &self,
-        db: &'db IngredientDatabase<Q>,
+        db: &'db DatabaseFor<Q>,
         input: Q::Input,
         this: IngredientPath,
     ) -> QueryFuture<'db, Q> {

@@ -1,19 +1,20 @@
 #![feature(type_alias_impl_trait)]
 #![feature(trivial_bounds)]
 
+use std::sync::Arc;
+
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
 #[haste::database(Storage)]
 #[derive(Default)]
 pub struct Database {
-    runtime: haste::Runtime,
     storage: haste::DatabaseStorage<Self>,
 }
 
 impl Db for Database {}
 
 #[haste::storage]
-pub struct Storage(Text, fib, Person, cyclic, cyclic_partner);
+pub struct Storage(Text, fib, Person, cyclic, file);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,7 +42,7 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
 #[cycle(cyclic_cycle)]
 async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
     match n {
-        0..=3 => cyclic_partner(db, n).await,
+        0..=3 => cyclic(db, n + 1).await,
         _ => cyclic(db, 0).await,
     }
 }
@@ -51,9 +52,8 @@ async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32
 }
 
 #[haste::query]
-#[clone]
-async fn cyclic_partner(db: &dyn crate::Db, n: u32) -> u32 {
-    cyclic(db, n + 1).await + 1
+async fn file(_db: &dyn crate::Db, path: Arc<std::path::Path>) -> std::io::Result<String> {
+    tokio::fs::read_to_string(&path).await
 }
 
 fn main() {
@@ -63,7 +63,7 @@ fn main() {
 
     // a scope is a region of code within which we can safely spawn tasks
     haste::scope(&mut db, |scope, db| {
-        dbg!(scope.block_on(cyclic_partner(db, 5)));
+        dbg!(scope.block_on(cyclic(db, 5)));
     });
 
     let duration = start.elapsed();

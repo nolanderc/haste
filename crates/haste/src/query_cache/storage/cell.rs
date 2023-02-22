@@ -93,7 +93,7 @@ impl<I, O> QueryCell<I, O> {
         Self::zeroed()
     }
 
-    /// Iialize the cell with some value.
+    /// Initialize the cell with some input value.
     pub fn write_input(&self, value: I) -> Result<&I, &I> {
         // take the lock, ensuring that we are the only thread writing to the value
         let lock = self.state.lock();
@@ -132,6 +132,17 @@ impl<I, O> QueryCell<I, O> {
 
     pub fn has_input(&self) -> bool {
         (self.state.addr.load(Acquire) & INITIALIZED) != 0
+    }
+
+    pub fn set_output(&mut self, value: O) {
+        let state = *self.state.addr.get_mut();
+        let output = self.output.get_mut();
+
+        if (state & FINISHED) != 0 {
+            unsafe { output.assume_init_drop() }
+        }
+
+        output.write(value);
     }
 
     pub fn write_output(&self, value: O) -> &O {
@@ -454,7 +465,6 @@ impl<I, T> Drop for QueryCell<I, T> {
         if addr & FINISHED != 0 {
             unsafe { self.output.get_mut().assume_init_drop() }
         }
-
 
         let ptr = (addr & ADDR_MASK) as *mut BlockedState;
         if !ptr.is_null() {

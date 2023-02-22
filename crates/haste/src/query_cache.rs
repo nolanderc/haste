@@ -6,11 +6,11 @@ use std::{future::Future, pin::Pin};
 use futures_lite::FutureExt;
 
 use crate::{
-    Container, ContainerPath, Cycle, CycleStrategy, Database, Dependency, DynContainer, Id,
-    IngredientDatabase, IngredientPath, Query, QueryFuture, QueryTask,
+    Container, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Dependency,
+    DynContainer, Id, IngredientPath, Query, QueryFuture, QueryTask, Runtime,
 };
 
-use self::storage::{QuerySlot, QueryStorage, WaitFuture};
+use self::storage::{OutputSlot, QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
 
@@ -21,7 +21,7 @@ pub trait QueryCache: DynQueryCache + Container {
     /// query.
     fn get_or_evaluate<'a>(
         &'a self,
-        db: &'a IngredientDatabase<Self::Query>,
+        db: &'a DatabaseFor<Self::Query>,
         input: <Self::Query as Query>::Input,
     ) -> EvalResult<'a, Self::Query>;
 
@@ -33,9 +33,17 @@ pub trait QueryCache: DynQueryCache + Container {
     /// If the `id` is not valid.
     fn get<'a>(
         &'a self,
-        db: &'a IngredientDatabase<Self::Query>,
+        db: &'a DatabaseFor<Self::Query>,
         id: Id,
     ) -> Result<QueryResult<'a, Self::Query>, PendingFuture<'a, Self::Query>>;
+
+    fn set(
+        &mut self,
+        runtime: &mut Runtime,
+        input: <Self::Query as Query>::Input,
+        output: <Self::Query as Query>::Output,
+    ) where
+        Self::Query: crate::Input;
 }
 
 pub trait DynQueryCache: DynContainer {
@@ -56,15 +64,15 @@ pub trait DynQueryCache: DynContainer {
 }
 
 /// A query cache which uses the hash of the input as a key.
-pub type HashQueryCache<Q> = QueryCache2<Q, HashStrategy>;
+pub type HashQueryCache<Q> = QueryCacheImpl<Q, HashStrategy>;
 
-pub struct QueryCache2<Q: Query, Lookup> {
+pub struct QueryCacheImpl<Q: Query, Lookup> {
     path: ContainerPath,
     lookup: Lookup,
     storage: QueryStorage<Q>,
 }
 
-impl<Q: Query, Lookup> crate::Container for QueryCache2<Q, Lookup>
+impl<Q: Query, Lookup> crate::Container for QueryCacheImpl<Q, Lookup>
 where
     Lookup: Default + 'static,
 {
@@ -77,7 +85,7 @@ where
     }
 }
 
-impl<Q: Query, Lookup> crate::DynContainer for QueryCache2<Q, Lookup>
+impl<Q: Query, Lookup> crate::DynContainer for QueryCacheImpl<Q, Lookup>
 where
     Lookup: 'static,
 {
@@ -95,18 +103,14 @@ where
     }
 }
 
-impl<Q: Query, Lookup> QueryCache for QueryCache2<Q, Lookup>
+impl<Q: Query, Lookup> QueryCache for QueryCacheImpl<Q, Lookup>
 where
     Lookup: LookupStrategy<Q> + Default + 'static,
     Q::Input: Clone,
 {
     type Query = Q;
 
-    fn get_or_evaluate<'a>(
-        &'a self,
-        db: &'a IngredientDatabase<Self::Query>,
-        input: <Self::Query as Query>::Input,
-    ) -> EvalResult<'a, Q> {
+    fn get_or_evaluate<'a>(&'a self, db: &'a DatabaseFor<Q>, input: Q::Input) -> EvalResult<'a, Q> {
         match self.lookup.try_insert(input, &self.storage) {
             Err(id) => {
                 let slot = self.storage.slot(id);
@@ -121,15 +125,34 @@ where
 
     fn get<'a>(
         &'a self,
-        db: &'a IngredientDatabase<Self::Query>,
+        db: &'a DatabaseFor<Q>,
         id: Id,
-    ) -> Result<QueryResult<'a, Self::Query>, PendingFuture<'a, Q>> {
+    ) -> Result<QueryResult<Q>, PendingFuture<'a, Q>> {
         let slot = self.storage.slot(id);
         try_get(self.ingredient(id), slot, db)
     }
+
+    fn set(&mut self, runtime: &mut Runtime, input: Q::Input, output: Q::Output)
+    where
+        Self::Query: crate::Input,
+    {
+        let id = match self.lookup.try_insert(input, &self.storage) {
+            Ok((id, _)) => id,
+            Err(id) => id,
+        };
+        let slot = self.storage.slot_mut(id);
+        let current = runtime.current_revision();
+        slot.set_output(OutputSlot {
+            dependencies: 0..0,
+            output,
+            verified_at: current,
+            changed_at: current,
+            max_input: current,
+        });
+    }
 }
 
-impl<Q: Query, Lookup> DynQueryCache for QueryCache2<Q, Lookup>
+impl<Q: Query, Lookup> DynQueryCache for QueryCacheImpl<Q, Lookup>
 where
     Lookup: 'static,
 {
@@ -158,7 +181,7 @@ pub enum EvalResult<'a, Q: Query> {
 fn try_get<'a, Q: Query>(
     path: IngredientPath,
     slot: &'a QuerySlot<Q>,
-    db: &'a IngredientDatabase<Q>,
+    db: &'a DatabaseFor<Q>,
 ) -> Result<QueryResult<'a, Q>, PendingFuture<'a, Q>> {
     match slot.wait_until_finished() {
         Ok(slot) => Ok((path.resource, &slot.output)),
@@ -172,7 +195,7 @@ fn try_get<'a, Q: Query>(
 }
 
 pub struct PendingFuture<'a, Q: Query> {
-    db: &'a IngredientDatabase<Q>,
+    db: &'a DatabaseFor<Q>,
     path: IngredientPath,
     blocks: Option<IngredientPath>,
     fut: WaitFuture<'a, Q>,
@@ -217,10 +240,10 @@ impl<'a, Q: Query> Future for PendingFuture<'a, Q> {
     }
 }
 
-impl<Q: Query, Lookup> QueryCache2<Q, Lookup> {
+impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
     fn execute_query<'a>(
         &'a self,
-        db: &'a IngredientDatabase<Q>,
+        db: &'a DatabaseFor<Q>,
         id: Id,
         input: Q::Input,
     ) -> QueryCacheTask<'a, Q> {

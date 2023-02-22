@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote, quote_spanned, ToTokens};
+use quote::{format_ident, quote, ToTokens};
 use syn::spanned::Spanned;
 
 use crate::meta::ArgumentOptions;
@@ -115,7 +115,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     let return_type = if args.clone {
         quote! { #output_type }
     } else {
-        quote_spanned! {output_type.span()=> &#output_type }
+        quote! { &#output_type }
     };
 
     let clone = if args.clone {
@@ -124,7 +124,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         quote! {}
     };
 
-    tokens.extend(quote_spanned! {ident.span()=>
+    tokens.extend(quote! {
         #[allow(unused)]
         #vis async fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
             #clone (haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*)).await)

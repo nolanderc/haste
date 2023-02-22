@@ -180,7 +180,7 @@ pub struct PendingFuture<'a, Q: Query> {
 
 impl<'a, Q: Query> Drop for PendingFuture<'a, Q> {
     fn drop(&mut self) {
-        if let Some(parent) = self.blocks {
+        if let Some(parent) = self.blocks.take() {
             self.db.runtime().unblock(parent);
         }
     }
@@ -201,8 +201,8 @@ impl<'a, Q: Query> Future for PendingFuture<'a, Q> {
                 let db = self.db.as_dyn();
                 let runtime = self.db.runtime();
                 if let Some(parent) = runtime.current_query() {
-                    self.blocks = Some(parent);
                     runtime.would_block_on(parent, self.path, cx.waker(), db);
+                    self.blocks = Some(parent);
                 }
             }
             (Poll::Ready(_), Some(parent)) => {

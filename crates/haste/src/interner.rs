@@ -78,17 +78,21 @@ impl<T> ArenaInterner<T> {
         let hash = self.entries.hash(&value);
         let shard = self.entries.shard(hash);
 
-        {
-            // check if the value already exists in the interner
-            let table = shard.read().unwrap();
+        // check if the value already exists in the interner
+        let table = shard.read().unwrap();
+        if let Some(old) = table.get(hash, self.eq_fn(&value)) {
+            return *old;
+        }
+
+        let len_before = table.len();
+        drop(table);
+        let mut table = shard.write().unwrap();
+        let len_after = table.len();
+
+        if len_before != len_after {
             if let Some(old) = table.get(hash, self.eq_fn(&value)) {
                 return *old;
             }
-        }
-
-        let mut table = shard.write().unwrap();
-        if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-            return *old;
         }
 
         // add the value into the interner, returing its key
@@ -264,17 +268,21 @@ impl StringInterner {
         let hash = self.entries.hash(string);
         let shard = self.entries.shard(hash);
 
-        {
-            // check if the value already exists in the interner
-            let table = shard.read().unwrap();
+        // check if the value already exists in the interner
+        let table = shard.read().unwrap();
+        if let Some(old) = table.get(hash, self.eq_fn(string)) {
+            return *old;
+        }
+
+        let len_before = table.len();
+        drop(table);
+        let mut table = shard.write().unwrap();
+        let len_after = table.len();
+
+        if len_before != len_after {
             if let Some(old) = table.get(hash, self.eq_fn(string)) {
                 return *old;
             }
-        }
-
-        let mut table = shard.write().unwrap();
-        if let Some(old) = table.get(hash, self.eq_fn(string)) {
-            return *old;
         }
 
         // add the value into the interner, returing its key

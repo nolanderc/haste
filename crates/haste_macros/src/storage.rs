@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{quote, ToTokens};
 use syn::spanned::Spanned;
 
 use crate::meta::ArgumentOptions;
@@ -45,7 +45,7 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
         };
 
         let ty = &field.ty;
-        let container_type = quote_spanned! {ty.span()=>
+        let container_type = quote! {
             <#ty as haste::Ingredient>::Container
         };
 

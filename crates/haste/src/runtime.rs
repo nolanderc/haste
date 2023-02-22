@@ -1,5 +1,6 @@
 mod cycle;
 mod task;
+mod revision_history;
 
 use std::{
     cell::Cell,
@@ -284,13 +285,15 @@ impl Runtime {
         waker: &Waker,
         db: &dyn Database,
     ) {
-        eprintln!("insert {:?} -> {:?}", parent, child);
+        eprintln!("{:?} is blocked on {:?}", parent, child);
         self.graph.lock().unwrap().insert(parent, child, waker, db);
     }
 
     pub(crate) fn unblock(&self, parent: IngredientPath) {
         eprintln!("unblock {:?}", parent);
-        self.graph.lock().unwrap().remove(parent);
+        if let Ok(mut graph) = self.graph.lock() {
+            graph.remove(parent);
+        }
     }
 
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T)

@@ -1,4 +1,4 @@
-use std::{collections::hash_map, sync::Arc, task::Waker};
+use std::{cell::Cell, sync::Arc, task::Waker};
 
 use ahash::HashMap;
 use smallvec::SmallVec;
@@ -11,17 +11,18 @@ pub struct CycleGraph {
     vertices: HashMap<IngredientPath, Vertex>,
 
     /// For each query: its cycle recovery strategy
-    recovery: HashMap<ContainerPath, CycleStrategy>,
+    recover_strategies: HashMap<ContainerPath, CycleStrategy>,
 }
 
 struct Vertex {
     /// The query this is blocked on
     blocked_on: IngredientPath,
-    /// Points to the last known query in the dependency chain.
-    /// This pointer is only valid for as long as the corresponding query is a valid `Vertex`.
-    /// This is used as an optimization to reduce the number nodes that need to be visited when
-    /// detecting cycles.
-    last_in_chain: IngredientPath,
+    /// Points to a query which is known to be further down the dependency chain. This pointer
+    /// is only valid for as long as the corresponding query is a valid `Vertex`. This is used
+    /// as an optimization to reduce the number nodes that need to be visited when detecting
+    /// cycles, similar to path shortening found in
+    /// [Disjoint-Sets](https://en.wikipedia.org/wiki/Disjoint-set_data_structure).
+    shortcut: Cell<IngredientPath>,
 
     waker: Waker,
 }
@@ -34,27 +35,23 @@ impl CycleGraph {
         waker: &Waker,
         db: &dyn Database,
     ) {
-        match self.vertices.entry(source) {
-            hash_map::Entry::Occupied(entry) => {
-                let previous = entry.get();
+        let vertex = Vertex {
+            blocked_on: target,
+            shortcut: Cell::new(target),
+            waker: waker.clone(),
+        };
 
-                panic!(
-                    concat!(
-                        "the query `{:?}` is blocked on two queries at once ({:?} and {:?})",
-                        "\nhelp: use `spawn` or `prefetch` to execute queries concurrently"
-                    ),
-                    source, previous.blocked_on, target
-                );
-            }
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(Vertex {
-                    blocked_on: target,
-                    last_in_chain: target,
-                    waker: waker.clone(),
-                });
-                self.detect_cycle(source, db);
-            }
+        if let Some(previous) = self.vertices.insert(source, vertex) {
+            panic!(
+                concat!(
+                    "the query `{:?}` is blocked on two queries at once ({:?} and {:?})",
+                    "\nhelp: use `spawn` or `prefetch` to evaluate queries concurrently"
+                ),
+                source, previous.blocked_on, target
+            );
         }
+
+        self.detect_cycle(source, db);
     }
 
     pub fn remove(&mut self, source: IngredientPath) {
@@ -75,10 +72,11 @@ impl CycleGraph {
 
         let mut curr = source;
 
+        // enumerate all cycle participants
         for i in 0.. {
             participants.push(curr);
 
-            let strategy = self.recovery(curr.container, db);
+            let strategy = self.lookup_strategy(curr.container, db);
             if strategy == CycleStrategy::Recover {
                 recovered.push(i);
             }
@@ -88,6 +86,7 @@ impl CycleGraph {
                 break;
             }
         }
+
         let participants = Arc::<[_]>::from(participants.as_slice());
 
         let make_cycle = |index: usize| {
@@ -115,43 +114,41 @@ impl CycleGraph {
         }
     }
 
-    fn recovery(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
-        *self.recovery.entry(container).or_insert_with(|| {
-            db.dyn_container_path(container)
-                .and_then(|c| c.as_query_cache())
-                .map(|cache| cache.cycle_strategy())
-                .unwrap_or(CycleStrategy::Panic)
-        })
-    }
-
-    fn is_cyclic(&mut self, start: IngredientPath) -> bool {
-        let mut participants = SmallVec::<[IngredientPath; 8]>::new();
+    fn is_cyclic(&self, start: IngredientPath) -> bool {
+        let mut prev: Option<&Vertex> = None;
         let mut curr = start;
 
         while let Some(vertex) = self.vertices.get(&curr) {
-            participants.push(curr);
-
-            curr = if vertex.last_in_chain == vertex.blocked_on {
+            let shortcut = vertex.shortcut.get();
+            curr = if shortcut == vertex.blocked_on {
                 vertex.blocked_on
-            } else if self.vertices.contains_key(&vertex.last_in_chain) {
+            } else if self.vertices.contains_key(&shortcut) {
                 // the cached query is still valid, so continue from there
-                vertex.last_in_chain
+                shortcut
             } else {
                 vertex.blocked_on
             };
+
+            if let Some(prev) = prev.replace(vertex) {
+                // path shortening inspired by disjoint-set datastructure
+                prev.shortcut.set(curr);
+            }
 
             if curr == start {
                 return true;
             }
         }
 
-        // not a cycle, but all visited queries are blocked on the same query, so add new
-        // shortcuts to the last node
-        for path in participants {
-            self.vertices.get_mut(&path).unwrap().last_in_chain = curr;
-        }
-
         false
+    }
+
+    fn lookup_strategy(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
+        *self.recover_strategies.entry(container).or_insert_with(|| {
+            db.dyn_container_path(container)
+                .and_then(|c| c.as_query_cache())
+                .map(|cache| cache.cycle_strategy())
+                .unwrap_or(CycleStrategy::Panic)
+        })
     }
 }
 

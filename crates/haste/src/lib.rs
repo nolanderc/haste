@@ -112,10 +112,10 @@ where
 }
 
 pub trait Query: Ingredient {
-    type Input: Clone + Send + 'static;
-    type Output: Send + Sync + 'static;
-    type Future<'db>: std::future::Future<Output = Self::Output> + Send;
-    type RecoverFuture<'db>: std::future::Future<Output = Self::Output> + Send;
+    type Input: Eq + Clone + Send + 'static;
+    type Output: Eq + Send + Sync + 'static;
+    type Future<'db>: Future<Output = Self::Output> + Send;
+    type RecoverFuture<'db>: Future<Output = Self::Output> + Send;
 
     fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
@@ -137,6 +137,8 @@ pub trait Query: Ingredient {
 }
 
 /// A query whose input depends on some side-effect (eg. file or network IO).
+///
+/// Can also be set using `DatabaseExt::set_input`
 pub trait Input: Query {}
 
 /// A container that stores values (elements) which are accessed by an ID.
@@ -205,22 +207,21 @@ pub trait DatabaseExt: Database {
         let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
-        let result = cache.get_or_evaluate(db, input);
+        let future = cache.get_or_evaluate(db, input);
 
         async move {
-            let (id, output) = match result {
-                EvalResult::Cached(id) => id,
+            let output = match future {
                 EvalResult::Eval(eval) => eval.await,
                 EvalResult::Pending(pending) => pending.await,
             };
 
             runtime.register_dependency(Dependency {
                 container: cache.path(),
-                resource: id,
+                resource: output.id,
                 extra: 0,
             });
 
-            output
+            &output.slot.output
         }
     }
 
@@ -237,14 +238,12 @@ pub trait DatabaseExt: Database {
         let storage = self.storage();
         let cache = storage.container();
 
-        enum SpawnResult<Cached, Pending> {
-            Cached(Cached),
+        enum SpawnResult<Pending> {
             Pending(Pending),
             Spawned(Id),
         }
 
         let spawn_result = match cache.get_or_evaluate(db, input) {
-            EvalResult::Cached(id) => SpawnResult::Cached(id),
             EvalResult::Pending(pending) => SpawnResult::Pending(pending),
             EvalResult::Eval(eval) => {
                 // spawn the query, but postpone checking it for completion until the returned
@@ -256,25 +255,21 @@ pub trait DatabaseExt: Database {
         };
 
         async move {
-            let result = match spawn_result {
-                SpawnResult::Cached(cached) => Ok(cached),
-                SpawnResult::Pending(pending) => Err(pending),
+            let pending = match spawn_result {
+                SpawnResult::Pending(pending) => pending,
                 // the query was spawned in the runtime, so try getting its result again:
                 SpawnResult::Spawned(id) => cache.get(db, id),
             };
 
-            let (id, output) = match result {
-                Ok(id) => id,
-                Err(pending) => pending.await,
-            };
+            let result = pending.await;
 
             runtime.register_dependency(Dependency {
                 container: cache.path(),
-                resource: id,
+                resource: result.id,
                 extra: 0,
             });
 
-            output
+            &result.slot.output
         }
     }
 
@@ -295,8 +290,8 @@ pub trait DatabaseExt: Database {
         let result = cache.get_or_evaluate(db, input);
 
         match result {
-            // the query is already computed/pending, so we are done here
-            EvalResult::Cached(_) | EvalResult::Pending(_) => {}
+            // the query is pending, so we are done here
+            EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
             EvalResult::Eval(eval) => db.runtime().spawn_query(eval),

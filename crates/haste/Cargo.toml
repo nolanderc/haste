@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 ahash = "0.8.2"
-bytemuck = { version = "1.12.3", features = ["derive", "zeroable_maybe_uninit"] }
+bytemuck = { version = "1.13.0", features = ["derive", "zeroable_maybe_uninit", "zeroable_atomics"] }
 hashbrown = { version = "0.13.1", features = ["raw"] }
 libc = "0.2.138"
 crossbeam-deque = "0.8.2"

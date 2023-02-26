@@ -4,7 +4,7 @@ use std::future::Future;
 
 use crate::{
     arena::{AppendArena, RawArena},
-    Cycle, Dependency, Id, Query, Revision,
+    Cycle, Dependency, Id, Query, Revision, Runtime,
 };
 
 use self::cell::QueryCell;
@@ -31,10 +31,11 @@ impl<Q: Query> QueryStorage<Q> {
     /// Record the result of a new query.
     pub(crate) fn create_output(
         &self,
-        result: crate::ExecutionResult<Q::Output>,
-    ) -> OutputSlot<Q::Output> {
+        output: Q::Output,
+        dependencies: &[Dependency],
+    ) -> OutputSlot<Q> {
         let dependencies = {
-            let range = self.dependencies.extend_from_slice(&result.dependencies);
+            let range = self.dependencies.extend_from_slice(dependencies);
             let end = u32::try_from(range.end).unwrap();
             let start = range.start as u32;
             start..end
@@ -42,11 +43,8 @@ impl<Q: Query> QueryStorage<Q> {
 
         // TODO: compute the correct revisions
         OutputSlot {
-            output: result.output,
+            output,
             dependencies,
-            verified_at: None,
-            changed_at: None,
-            max_input: None,
         }
     }
 
@@ -90,25 +88,21 @@ impl<Q: Query> QueryStorage<Q> {
 
 pub struct QuerySlot<Q: Query> {
     /// The result from executing the query.
-    cell: QueryCell<Q::Input, OutputSlot<Q::Output>>,
+    cell: QueryCell<Q::Input, OutputSlot<Q>>,
 }
 
 unsafe impl<Q: Query> Sync for QuerySlot<Q> {}
 unsafe impl<Q: Query> bytemuck::Zeroable for QuerySlot<Q> {}
 
-pub struct OutputSlot<T> {
+pub struct OutputSlot<Q: Query> {
     /// Refers to a list of dependencies collected while executing this query.
     pub dependencies: std::ops::Range<u32>,
 
     /// The output from a query.
-    pub output: T,
-
-    pub verified_at: Option<Revision>,
-    pub changed_at: Option<Revision>,
-    pub max_input: Option<Revision>,
+    pub output: Q::Output,
 }
 
-pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q::Output>> + 'a;
+pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>> + 'a;
 
 impl<Q: Query> QuerySlot<Q> {
     pub fn input(&self) -> &Q::Input {
@@ -121,22 +115,42 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.input_assume_init()
     }
 
-    pub fn get_output(&self) -> Option<&OutputSlot<Q::Output>> {
+    /// # Safety
+    ///
+    /// The output must be valid in the current revision, or the caller has exclusive access.
+    pub unsafe fn get_output(&self) -> Option<&OutputSlot<Q>> {
         self.cell.get_output()
     }
 
-    pub fn output(&self) -> &OutputSlot<Q::Output> {
-        self.get_output()
-            .expect("attempted to read query output which has not been written")
+    pub fn get_output_mut(&mut self) -> Option<&mut OutputSlot<Q>> {
+        self.cell.get_output_mut()
     }
 
-    pub fn finish(&self, output: OutputSlot<Q::Output>) -> &OutputSlot<Q::Output> {
-        self.cell.write_output(output)
+    /// Write a new output for the given revision, making it accessible to other threads
+    ///
+    /// # Safety
+    ///
+    /// The output value must *not* have been written and no other thread must read/write to the output.
+    pub unsafe fn finish(&self, output: OutputSlot<Q>, revision: Revision) -> &OutputSlot<Q> {
+        self.cell.write_output(output, revision)
+    }
+
+    /// Verify the slot for the given revision, making it accessible to other threads
+    ///
+    /// # Safety
+    ///
+    /// The output value must have been written and no other thread may write to the output.
+    pub unsafe fn backdate(&self, current: Revision) {
+        self.cell.backdate(current);
+    }
+
+    pub fn reserve(&self, runtime: &Runtime) -> bool {
+        self.cell.reserve(runtime)
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_finished(&self) -> Result<&OutputSlot<Q::Output>, WaitFuture<'_, Q>> {
-        self.cell.wait_until_finished()
+    pub fn wait_until_finished(&self, runtime: &Runtime) -> WaitFuture<'_, Q> {
+        self.cell.wait_until_finished(runtime.current_revision())
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -147,10 +161,16 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.take_cycle()
     }
 
-    pub fn set_output(&mut self, output: OutputSlot<Q::Output>)
+    pub fn set_output(&mut self, output: Q::Output, runtime: &mut Runtime)
     where
         Q: crate::Input,
     {
-        self.cell.set_output(output);
+        self.cell.set_output(
+            OutputSlot {
+                output,
+                dependencies: 0..0,
+            },
+            runtime,
+        );
     }
 }

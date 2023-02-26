@@ -7,6 +7,7 @@ pub struct Arguments {
     pub storage: syn::Path,
     pub clone: bool,
     pub cycle: Option<syn::Path>,
+    pub input: bool,
 }
 
 impl Default for Arguments {
@@ -16,6 +17,7 @@ impl Default for Arguments {
             storage: syn::parse_quote!(crate::Storage),
             clone: false,
             cycle: None,
+            input: false,
         }
     }
 }
@@ -27,6 +29,7 @@ pub struct ArgumentOptions {
     pub storage: bool,
     pub clone: bool,
     pub cycle: bool,
+    pub input: bool,
 }
 
 pub fn extract_attrs(
@@ -47,6 +50,9 @@ pub fn extract_attrs(
     }
     if options.cycle {
         parser.expect_path("cycle", |path| args.cycle = Some(path));
+    }
+    if options.input {
+        parser.expect_flag("input", |enabled| args.input = enabled);
     }
 
     parser.parse(attrs);

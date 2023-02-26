@@ -13,7 +13,7 @@ use bytemuck::Zeroable;
 use futures_lite::FutureExt;
 use smallvec::SmallVec;
 
-use crate::Cycle;
+use crate::{AtomicRevision, Cycle, Revision, Runtime};
 
 pub struct QueryCell<I, O> {
     /// The current state of the cell.
@@ -33,19 +33,24 @@ impl<I, T> Unpin for QueryCell<I, T> {}
 
 unsafe impl<I, T> Zeroable for QueryCell<I, T> {}
 
+#[derive(bytemuck::Zeroable)]
 struct State {
     /// A tagged pointer equivalent to `Option<Box<BlockedState>>`.
     /// Contains a list of all tasks which are blocked on this value.
     ///
-    /// Additionally, the lowest 3 bits of the address represent the following:
+    /// Additionally, the lowest 5 bits of the address represent the following:
     ///
-    /// - if `0x1` is set, the input value has been initialized.
-    /// - if `0x2` is set, the output value has been written.
+    /// - if `0x1` is set, an input value has been written.
+    /// - if `0x2` is set, an output value has been written.
     /// - if `0x4` is set, a thread has locked this cell, gaining exclusive access to the list of
     /// blocked tasks and the inner value.
     /// - if `0x8` is set, a thread is waiting on the lock (ie. it is contended).
     /// - if `0x10` is set, there is a dependency cycle which is stored in the inner state.
+    /// - if `0x20` is set, the task is being executed
     addr: AtomicUsize,
+
+    verified_at: AtomicRevision,
+    changed_at: AtomicRevision,
 }
 
 struct StateLock<'a> {
@@ -53,11 +58,11 @@ struct StateLock<'a> {
     addr: usize,
 }
 
-/// The input value has been initialized.
-const INITIALIZED: usize = 0x1;
+/// The input value has been written.
+const HAS_INPUT: usize = 0x1;
 
 /// The output value in the cell has been written.
-const FINISHED: usize = 0x2;
+const HAS_OUTPUT: usize = 0x2;
 
 /// The cell structure is locked.
 const LOCKED: usize = 0x4;
@@ -65,19 +70,22 @@ const LOCKED: usize = 0x4;
 /// The cell lock is contended. Upon releasing the lock, another thread should be signaled.
 const CONTENDED: usize = 0x8;
 
-/// The cell lock is contended. Upon releasing the lock, another thread should be signaled.
+/// While executing the query, a cycle was encountered (stored in `BlockedState`).
 const CYCLIC: usize = 0x10;
 
-/// Mask of the bits of the tagged pointer which correspond to the address of the pointer
-const ADDR_MASK: usize = usize::MAX << 5;
+/// A task has reserved the query for execution.
+const PENDING: usize = 0x20;
 
-/// We specify an alignment of 32. This guarantees that the lowest 5 bits of any pointer to this
-/// structure will be zeroes, allowing us to use it to encode a tagged pointer.
-#[repr(align(32))]
+/// Mask of the bits of the tagged pointer which correspond to the address of the pointer
+const ADDR_MASK: usize = usize::MAX << 6;
+
+/// We specify an alignment of 64 (` == 1 << 6`). This guarantees that the lowest 6 bits of any
+/// pointer to this structure will be zeroes, allowing us to use it to encode a tagged pointer.
+#[repr(align(64))]
 #[derive(Default)]
 pub(crate) struct BlockedState {
     /// List of wakers blocked on the cell.
-    wakers: SmallVec<[Waker; 8]>,
+    wakers: SmallVec<[Waker; 6]>,
     /// If there has been a dependency cycle it is stored here.
     cycle: Option<Cycle>,
 }
@@ -98,7 +106,7 @@ impl<I, O> QueryCell<I, O> {
         // take the lock, ensuring that we are the only thread writing to the value
         let lock = self.state.lock();
 
-        if (lock.addr & INITIALIZED) != 0 {
+        if (lock.addr & HAS_INPUT) != 0 {
             // the value has already been initialized
             // SAFETY: since we grabbed the lock, there's no need further need to synchronize
             // with the writer
@@ -106,10 +114,10 @@ impl<I, O> QueryCell<I, O> {
         }
 
         // initialize the slot
-        // SAFETY: the `INITIALIZED` bit was not set, so we are the first (and only) to write
+        // SAFETY: the `HAS_INPUT` bit was not set, so we are the first (and only) to write
         let value = unsafe { (*self.input.get()).write(value) };
 
-        // set the `INITIALIZED` bit, allowing other threads to read the value
+        // set the `HAS_INPUT` bit, allowing other threads to read the value
         lock.set_initialized();
 
         Ok(value)
@@ -131,37 +139,51 @@ impl<I, O> QueryCell<I, O> {
     }
 
     pub fn has_input(&self) -> bool {
-        (self.state.addr.load(Acquire) & INITIALIZED) != 0
+        (self.state.addr.load(Acquire) & HAS_INPUT) != 0
     }
 
-    pub fn set_output(&mut self, value: O) {
-        let state = *self.state.addr.get_mut();
+    pub fn set_output(&mut self, value: O, runtime: &mut Runtime) {
+        let state = self.state.addr.get_mut();
         let output = self.output.get_mut();
 
-        if (state & FINISHED) != 0 {
+        let had_input = (*state & HAS_OUTPUT) != 0;
+        if had_input {
             unsafe { output.assume_init_drop() }
         }
 
         output.write(value);
+
+        *state |= HAS_OUTPUT;
+
+        let last_change = self.state.changed_at.get();
+        let current = runtime.update_input(had_input.then_some(last_change));
+
+        self.state.verified_at.set(current);
+        self.state.changed_at.set(current);
     }
 
-    pub fn write_output(&self, value: O) -> &O {
+    pub fn write_output(&self, value: O, revision: Revision) -> &O {
         // take the lock, ensuring that we are the only thread writing to the value
         let lock = self.state.lock();
 
-        if (lock.addr & FINISHED) != 0 {
+        if (lock.addr & HAS_OUTPUT) != 0 {
             // the value has already been written
-            // SAFETY: since we grabbed the lock, there's no need further need to synchronize
-            // with the writer
-            return unsafe { self.output_assume_init() };
+            if revision == self.state.verified_at.load(Relaxed) {
+                // SAFETY: since we grabbed the lock, there's no need further need to synchronize
+                // with the writer
+                return unsafe { self.output_assume_init() };
+            }
         }
 
         // initialize the slot
-        // SAFETY: the `FINISHED` bit was not set, so we are the first (and only) to write
+        // SAFETY: the `HAS_OUTPUT` bit was not set, so we are the first (and only) to write
         let value = unsafe { (*self.output.get()).write(value) };
 
-        // set the `FINISHED` bit, allowing tasks to read the value
-        let blocked = lock.set_finished();
+        // we changed the slot's value in the current revision:
+        self.state.changed_at.store(revision, Relaxed);
+
+        // set the `HAS_OUTPUT` bit, allowing tasks to read the value
+        let blocked = lock.set_finished(revision);
 
         // wake any tasks waiting on this result
         if let Some(blocked) = blocked {
@@ -173,37 +195,91 @@ impl<I, O> QueryCell<I, O> {
         value
     }
 
+    /// Assuming there is an existing output in the cell, marks it as valid in the given revision,
+    /// waking any blocking tasks.
+    ///
+    /// # Safety
+    ///
+    /// The output value must have been written previously and there must be no mutable access to
+    /// the output value.
+    pub(crate) unsafe fn backdate(&self, revision: Revision) {
+        debug_assert_ne!(self.state.addr.load(Relaxed) & HAS_OUTPUT, 0);
+
+        // mark the slot as valid in the current revision
+        if let Some(blocked) = self.state.lock().set_finished(revision) {
+            for waker in blocked.wakers {
+                waker.wake();
+            }
+        }
+    }
+
     /// # Safety
     ///
     /// The caller must ensure that the output value has been written.
-    pub unsafe fn output_assume_init(&self) -> &O {
+    unsafe fn output_assume_init(&self) -> &O {
         (*self.output.get()).assume_init_ref()
     }
 
-    pub fn get_output(&self) -> Option<&O> {
-        if self.has_output() {
+    /// # Safety
+    ///
+    /// The output must be valid in the current revision, or the caller has exclusive access.
+    pub unsafe fn get_output(&self) -> Option<&O> {
+        if (self.state.addr.load(Acquire) & HAS_OUTPUT) != 0 {
             unsafe { Some(self.output_assume_init()) }
         } else {
             None
         }
     }
 
-    pub fn has_output(&self) -> bool {
-        (self.state.addr.load(Acquire) & FINISHED) != 0
+    pub fn get_output_mut(&mut self) -> Option<&mut O> {
+        if (*self.state.addr.get_mut() & HAS_OUTPUT) != 0 {
+            unsafe { Some(self.output.get_mut().assume_init_mut()) }
+        } else {
+            None
+        }
     }
 
-    /// Either returns `Ok(())` meaning the output value is ready, or `Err(F)`, where `F` is a
-    /// future which resolves when the output has been written.
-    pub fn wait_until_finished(&self) -> Result<&O, impl Future<Output = &O> + '_> {
-        match self.state.wait() {
-            Ok(()) => Ok(unsafe { self.output_assume_init() }),
-            Err(mut fut) => {
-                // we cannot use an `async` block here, since they don't implement `Unpin`
-                Err(std::future::poll_fn(move |cx| {
-                    fut.poll(cx).map(|()| unsafe { self.output_assume_init() })
-                }))
-            }
+    /// Reserve the query for execution.
+    ///
+    /// # Returns
+    ///
+    /// `true` if successful, or `false` if the query has been reserved previously.
+    pub fn reserve(&self, runtime: &Runtime) -> bool {
+        let current = runtime.current_revision();
+
+        if self.state.verified_at.load(Relaxed) == current {
+            // the query is already up-to-date
+            return false;
         }
+
+        let lock = self.state.lock();
+
+        let last_verified = self.state.verified_at.load(Relaxed);
+
+        // the query was completed while we waited on the lock
+        if last_verified == current {
+            return false;
+        }
+
+        if (lock.addr & PENDING) != 0 {
+            // another thread has reserved the query
+            return false;
+        }
+
+        lock.unlock_and_set(PENDING);
+
+        true
+    }
+
+    /// Waits until the output value has been set
+    pub fn wait_until_finished(&self, revision: Revision) -> impl Future<Output = &O> + '_ {
+        let mut pending = self.state.wait(revision);
+        // we cannot use an `async` block here, since they don't implement `Unpin`
+        std::future::poll_fn(move |cx| {
+            pending
+                .poll(cx)
+                .map(|()| unsafe { self.output_assume_init() })
+        })
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -231,20 +307,14 @@ impl<I, O> QueryCell<I, O> {
 
 impl State {
     /// Returns a future which completes once the value has been written.
-    fn wait(&self) -> Result<(), impl Future<Output = ()> + Unpin + '_> {
-        // fast path if the value is already written
-        if (self.addr.load(Acquire) & FINISHED) != 0 {
-            return Ok(());
-        }
-
+    fn wait(&self, revision: Revision) -> impl Future<Output = ()> + Unpin + '_ {
         // If we have registered the current task, this is the index in the list of wakers this
         // task's waker occupies.
         let mut registered = None;
 
-        Err(std::future::poll_fn(move |ctx| {
-            if (self.addr.load(Relaxed) & FINISHED) != 0 {
-                // SAFETY: we need to synchronize with the write of the value
-                self.addr.load(Acquire);
+        std::future::poll_fn(move |ctx| {
+            if self.verified_at.load(Acquire) == revision {
+                // SAFETY: we used `Acquire` ordering, so we synchronized with the write
                 return std::task::Poll::Ready(());
             }
 
@@ -252,8 +322,8 @@ impl State {
             let mut lock = self.lock();
 
             // Maybe the value was written while we were waiting for the lock?
-            if (lock.addr & FINISHED) != 0 {
-                // SAFETY: by taking the lock we have already synchronized with the write
+            if self.verified_at.load(Relaxed) == revision {
+                // SAFETY: since we grabbed the lock, we are synchronized with the write
                 return std::task::Poll::Ready(());
             }
 
@@ -279,7 +349,7 @@ impl State {
             }
 
             std::task::Poll::Pending
-        }))
+        })
     }
 
     fn lock(&self) -> StateLock<'_> {
@@ -395,21 +465,23 @@ impl StateLock<'_> {
     }
 
     fn set_initialized(self) {
-        // - set the `INITIALIZED` bit
+        // - set the `HAS_INPUT` bit
         // - release the lock (ie. clear the `LOCKED` and `CONTENDED` bits)
-        // - keep the old value of `FINISHED`
-        // - keep the old value of the address
-        self.unlock_set_and_keep(INITIALIZED, FINISHED | CYCLIC | ADDR_MASK);
+        self.unlock_and_set(HAS_INPUT);
     }
 
-    /// Set the `FINISHED`-bit and take ownership of the inner pointer by clearing it to `null`.
-    fn set_finished(self) -> Option<Box<BlockedState>> {
-        // - set the `FINISHED` bit
+    /// Set the `HAS_OUTPUT`-bit, mark the value as valid in the given revision, and take ownership
+    /// of the inner pointer by clearing it to `null`.
+    fn set_finished(self, revision: Revision) -> Option<Box<BlockedState>> {
+        // SAFETY: we only set `verified_at` while holding the lock.
+        self.state.verified_at.store(revision, Release);
+
+        // - set the `HAS_OUTPUT` bit
         // - clear the address to `null`
         // - clear the `CYCLIC` bit
+        // - clear the `PENDING` bit
         // - release the lock (ie. clear the `LOCKED` and `CONTENDED` bits)
-        // - keep the old value of `INITIALIZED`
-        let old = self.unlock_set_and_keep(FINISHED, INITIALIZED);
+        let old = self.unlock_set_and_clear(HAS_OUTPUT, PENDING | CYCLIC | ADDR_MASK);
 
         let ptr = (old & ADDR_MASK) as *mut BlockedState;
         if ptr.is_null() {
@@ -419,19 +491,28 @@ impl StateLock<'_> {
         unsafe { Some(Box::from_raw(ptr)) }
     }
 
-    /// Releases the lock and `set`s the given bits, while `keep`ing the others.
+    /// Releases the lock and `set`s the given bits.
     /// Returns the previous state.
     #[inline]
-    fn unlock_set_and_keep(self, set: usize, keep: usize) -> usize {
-        debug_assert!(((set | keep) & (LOCKED | CONTENDED)) == 0);
+    fn unlock_and_set(self, set: usize) -> usize {
+        self.unlock_set_and_clear(set, 0)
+    }
 
+    /// Releases the lock and `set`s the given bits, while `clear`ing the others.
+    /// Returns the previous state.
+    #[inline]
+    fn unlock_set_and_clear(self, set: usize, clear: usize) -> usize {
         let state = self.state;
         let old_addr = self.addr;
+        let new_addr = set | (old_addr & !clear);
+
+        debug_assert_eq!(new_addr & (LOCKED | CONTENDED), 0);
 
         // SAFETY: we are going to release the lock below, but if we drop here we are going to
         // unlock twice, which could cause race conditions.
         std::mem::forget(self);
-        let old = state.addr.swap(set | (keep & old_addr), Release);
+
+        let old = state.addr.swap(new_addr, Release);
 
         if (old & CONTENDED) != 0 {
             // there was a thread waiting on the lock
@@ -439,13 +520,6 @@ impl StateLock<'_> {
         }
 
         old
-    }
-
-    /// Releases the lock and `set`s the given bits, while `keep`ing the others.
-    /// Returns the previous state.
-    #[inline]
-    fn unlock_and_set(self, set: usize) -> usize {
-        self.unlock_set_and_keep(set, !(LOCKED | CONTENDED))
     }
 }
 
@@ -459,10 +533,10 @@ impl<I, T> Drop for QueryCell<I, T> {
     fn drop(&mut self) {
         let addr = *self.state.addr.get_mut();
 
-        if addr & INITIALIZED != 0 {
+        if addr & HAS_INPUT != 0 {
             unsafe { self.input.get_mut().assume_init_drop() }
         }
-        if addr & FINISHED != 0 {
+        if addr & HAS_OUTPUT != 0 {
             unsafe { self.output.get_mut().assume_init_drop() }
         }
 

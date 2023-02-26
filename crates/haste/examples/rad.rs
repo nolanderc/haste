@@ -1,7 +1,10 @@
 #![feature(type_alias_impl_trait)]
 #![feature(trivial_bounds)]
+#![allow(clippy::uninlined_format_args)]
 
 use std::sync::Arc;
+
+use haste::DatabaseExt;
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
@@ -14,7 +17,7 @@ pub struct Database {
 impl Db for Database {}
 
 #[haste::storage]
-pub struct Storage(Text, fib, Person, cyclic, file);
+pub struct Storage(Text, fib, Person, cyclic, file, digit_sum);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,8 +55,15 @@ async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32
 }
 
 #[haste::query]
-async fn file(_db: &dyn crate::Db, path: Arc<std::path::Path>) -> std::io::Result<String> {
-    tokio::fs::read_to_string(&path).await
+#[input]
+async fn file(_db: &dyn crate::Db, path: Arc<str>) -> String {
+    panic!("file not found: {:?}", path)
+}
+
+#[haste::query]
+async fn digit_sum(db: &dyn crate::Db, path: Arc<str>) -> u32 {
+    let source = file(db, path).await;
+    source.bytes().map(|byte| (byte - b'0') as u32).sum()
 }
 
 fn main() {
@@ -61,9 +71,20 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    // a scope is a region of code within which we can safely spawn tasks
+    db.set_input::<file>("foo".into(), "123".into());
     haste::scope(&mut db, |scope, db| {
-        dbg!(scope.block_on(cyclic(db, 5)));
+        scope.block_on(async {
+            dbg!(file(db, "foo".into()).await);
+            dbg!(digit_sum(db, "foo".into()).await);
+        })
+    });
+
+    db.set_input::<file>("foo".into(), "124".into());
+    haste::scope(&mut db, |scope, db| {
+        scope.block_on(async {
+            dbg!(file(db, "foo".into()).await);
+            dbg!(digit_sum(db, "foo".into()).await);
+        })
     });
 
     let duration = start.elapsed();

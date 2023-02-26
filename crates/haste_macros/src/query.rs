@@ -32,6 +32,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             storage: true,
             clone: true,
             cycle: true,
+            input: true,
             ..Default::default()
         },
     );
@@ -111,6 +112,12 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             }
         }
     });
+
+    if args.input {
+        tokens.extend(quote! {
+            impl haste::Input for #ident {}
+        });
+    }
 
     let return_type = if args.clone {
         quote! { #output_type }

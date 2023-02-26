@@ -1,11 +1,41 @@
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-use crate::non_max::NonMaxU32;
+use std::sync::atomic::{
+    AtomicU32, AtomicU64,
+    Ordering::{self, Relaxed},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Revision(NonMaxU32);
+pub struct Revision(u32);
+
+#[derive(Debug, bytemuck::Zeroable)]
+pub struct AtomicRevision(AtomicU32);
+
+impl AtomicRevision {
+    pub fn new(revision: Revision) -> Self {
+        Self(AtomicU32::new(revision.0))
+    }
+
+    pub fn load(&self, order: Ordering) -> Revision {
+        Revision(self.0.load(order))
+    }
+
+    pub fn store(&self, rev: Revision, order: Ordering) {
+        self.0.store(rev.0, order)
+    }
+
+    pub fn swap(&self, rev: Revision, order: Ordering) -> Revision {
+        Revision(self.0.swap(rev.0, order))
+    }
+
+    pub(crate) fn set(&mut self, rev: Revision) {
+        *self.0.get_mut() = rev.0;
+    }
+
+    pub(crate) fn get(&mut self) -> Revision {
+        Revision(*self.0.get_mut())
+    }
+}
 
 pub struct RevisionHistory {
     history: MinHistory,
@@ -13,15 +43,13 @@ pub struct RevisionHistory {
 
 impl RevisionHistory {
     pub fn new() -> Self {
-        Self {
-            history: MinHistory::new(),
-        }
+        let mut history = MinHistory::new();
+        history.push(0);
+        Self { history }
     }
 
-    pub fn current(&self) -> Option<Revision> {
-        Some(Revision(NonMaxU32::new(
-            (self.history.len() as u32).wrapping_sub(1),
-        )?))
+    pub fn current(&self) -> Revision {
+        Revision(self.history.len() as u32 - 1)
     }
 
     /// When an input has been modified, this function is called with the previous revision in
@@ -29,10 +57,9 @@ impl RevisionHistory {
     /// input.
     ///
     /// Time complexity: `O(log n)`
-    pub fn push_update(&mut self, old: Option<Revision>) -> Revision {
-        let new = Revision(NonMaxU32::new(self.history.len() as u32).unwrap());
-        let old = old.unwrap_or(new);
-        self.history.push(old.0.get());
+    pub fn push_update(&mut self, last_changed: Option<Revision>) -> Revision {
+        let new = Revision(self.history.len() as u32);
+        self.history.push(last_changed.unwrap_or(new).0);
         new
     }
 
@@ -41,8 +68,7 @@ impl RevisionHistory {
     ///
     /// Time complexity: `O(log n)`
     pub fn earliest_change_since(&self, rev: Revision) -> Revision {
-        let min = self.history.min_since(rev.0.get() as usize);
-        Revision(NonMaxU32::new(min).unwrap())
+        Revision(self.history.min_since(rev.0 as usize))
     }
 }
 
@@ -213,12 +239,12 @@ mod tests {
     #[test]
     fn revision_history_query() {
         let mut history = MinHistory::new();
-        let a = history.push(1);
-        let b = history.push(2);
-        let c = history.push(3);
-        assert_eq!(history.min_since(a), 1);
-        assert_eq!(history.min_since(b), 2);
-        assert_eq!(history.min_since(c), 3);
+        history.push(1);
+        history.push(2);
+        history.push(3);
+        assert_eq!(history.min_since(0), 1);
+        assert_eq!(history.min_since(1), 2);
+        assert_eq!(history.min_since(2), 3);
     }
 
     #[test]

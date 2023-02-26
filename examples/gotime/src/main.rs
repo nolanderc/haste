@@ -30,7 +30,6 @@ struct Arguments {
 #[haste::database(Storage)]
 #[derive(Default)]
 pub struct Database {
-    runtime: haste::Runtime,
     storage: haste::DatabaseStorage<Self>,
 }
 

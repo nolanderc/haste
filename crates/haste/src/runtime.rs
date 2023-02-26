@@ -16,13 +16,12 @@ use std::{
 use crate::{non_max::NonMaxU32, ContainerPath, Database, DatabaseFor, IngredientPath, Query};
 
 pub use self::cycle::{Cycle, CycleStrategy};
-pub use self::revision::Revision;
+pub use self::revision::{Revision, AtomicRevision};
 pub use self::task::QueryTask;
 
 use self::{cycle::CycleGraph, revision::RevisionHistory, task::Scheduler};
 
 pub struct Runtime {
-    tokio: Option<tokio::runtime::Runtime>,
     scheduler: Arc<Scheduler>,
     graph: Mutex<CycleGraph>,
     revisions: RevisionHistory,
@@ -31,15 +30,18 @@ pub struct Runtime {
 impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
-            tokio: None,
             scheduler: Arc::new(Scheduler::new()),
             graph: Default::default(),
             revisions: RevisionHistory::new(),
         }
     }
 
-    pub fn current_revision(&self) -> Option<Revision> {
+    pub fn current_revision(&self) -> Revision {
         self.revisions.current()
+    }
+
+    pub fn update_input(&mut self, changed_at: Option<Revision>) -> Revision {
+        self.revisions.push_update(changed_at)
     }
 }
 
@@ -180,10 +182,11 @@ enum QueryFutureInner<'a, Q: Query> {
 }
 
 impl<'db, Q: Query> QueryFuture<'db, Q> {
-    pub fn recover(self: Pin<&mut Self>, cycle: Cycle, input: &Q::Input)
-    where
-        Q::Input: Clone,
-    {
+    pub fn database(&self) -> &'db DatabaseFor<Q> {
+        self.db
+    }
+
+    pub fn recover(self: Pin<&mut Self>, cycle: Cycle, input: &Q::Input) {
         let recovery = Q::recover_cycle(self.db, cycle, input.clone());
         unsafe {
             let this = self.get_unchecked_mut();
@@ -306,8 +309,6 @@ impl Runtime {
     where
         T: QueryTask + Send + 'a,
     {
-        let _tokio = self.executor();
-
         unsafe {
             // extend the lifetime of the task to allow it to be stored in the runtime
             // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
@@ -325,13 +326,8 @@ impl Runtime {
     where
         F: Future,
     {
-        let executor = self.executor();
-        let forever = async { self.run().await };
-        executor.block_on(futures_lite::future::or(f, forever))
-    }
-
-    pub(crate) async fn run(&self) -> ! {
-        self.scheduler.run().await
+        let forever = async { self.scheduler.run().await };
+        pollster::block_on(futures_lite::future::or(f, forever))
     }
 }
 
@@ -355,7 +351,6 @@ impl Runtime {
 
         match ACTIVE_RUNTIME.compare_exchange(std::ptr::null_mut(), self, Relaxed, Relaxed) {
             Ok(_) => {
-                self.tokio = Some(tokio::runtime::Runtime::new().unwrap());
                 self.scheduler.start();
                 true
             }
@@ -373,16 +368,7 @@ impl Runtime {
         assert!(active == self, "can only exit the currently active runtime");
 
         self.scheduler.shutdown();
-        drop(self.tokio.take());
 
         ACTIVE_RUNTIME.store(std::ptr::null_mut(), Ordering::Relaxed);
-    }
-
-    /// Get the current executor
-    fn executor(&self) -> &tokio::runtime::Runtime {
-        match &self.tokio {
-            None => panic!("call `haste::scope` to enter a scope before spawning new tasks"),
-            Some(executor) => executor,
-        }
     }
 }

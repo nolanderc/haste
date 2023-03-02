@@ -34,6 +34,11 @@ where
     fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.get(id.raw).unwrap().fmt(f)
     }
+
+    fn last_changed(&self, _dep: crate::Dependency) -> Option<crate::Revision> {
+        // Interned values are constant, so can never change
+        None
+    }
 }
 
 impl<T> crate::ElementContainer for ArenaInterner<T>
@@ -224,6 +229,11 @@ impl<DB: ?Sized> crate::Container<DB> for StringInterner {
 
     fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.get(id.raw).unwrap())
+    }
+
+    fn last_changed(&self, _dep: crate::Dependency) -> Option<crate::Revision> {
+        // Interned values are constant, so can never change
+        None
     }
 }
 

@@ -79,7 +79,7 @@ fn main() {
         })
     });
 
-    db.set_input::<file>("foo".into(), "321".into());
+    db.set_input::<file>("foo".into(), "123".into());
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
             dbg!(file(db, "foo".into()).await);

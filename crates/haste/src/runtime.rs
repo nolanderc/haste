@@ -96,7 +96,10 @@ impl Dependency {
         })
     }
 
-    pub fn ingredient(&self) -> IngredientPath {
+    pub fn container(self) -> ContainerPath {
+        self.container
+    }
+    pub fn ingredient(self) -> IngredientPath {
         IngredientPath {
             container: self.container,
             resource: self.resource,

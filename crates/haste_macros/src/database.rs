@@ -76,11 +76,15 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                 }
 
                 fn last_changed(&self, dep: haste::Dependency) -> Option<haste::Revision> {
-                    todo!("last_changed({:?})", dep)
+                    haste::StaticDatabase::container(self, dep.container()).last_changed(dep)
                 }
 
                 /// Format an ingredient
-                fn fmt_index(&self, path: haste::IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fn fmt_index(
+                    &self, 
+                    path: haste::IngredientPath, 
+                    f: &mut std::fmt::Formatter<'_>
+                ) -> std::fmt::Result {
                     haste::StaticDatabase::container(self, path.container)
                         .fmt(path.resource, f)
                 }

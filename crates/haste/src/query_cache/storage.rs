@@ -177,4 +177,8 @@ impl<Q: Query> QuerySlot<Q> {
     pub fn last_verified(&self) -> Option<Revision> {
         self.cell.last_verified()
     }
+
+    pub fn last_changed(&self) -> Option<Revision> {
+        self.cell.last_changed()
+    }
 }

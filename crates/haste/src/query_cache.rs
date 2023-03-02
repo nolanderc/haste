@@ -6,7 +6,7 @@ use std::{future::Future, pin::Pin, task::Poll};
 use futures_lite::FutureExt;
 
 use crate::{
-    ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Container, ExecFuture, Id,
+    Container, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, ExecFuture, Id,
     IngredientPath, MakeContainer, Query, QueryTask, Revision, Runtime, WithStorage,
 };
 
@@ -111,6 +111,11 @@ where
     fn as_query_cache(&self) -> Option<&dyn DynQueryCache<DB>> {
         Some(self)
     }
+
+    fn last_changed(&self, dep: crate::Dependency) -> Option<Revision> {
+        let id = dep.resource;
+        self.storage.slot(id).last_changed()
+    }
 }
 
 impl<Q: Query, Lookup> QueryCache for QueryCacheImpl<Q, Lookup>
@@ -144,6 +149,15 @@ where
     {
         let (id, _) = self.lookup.get_or_insert(input, &self.storage);
         let slot = self.storage.slot_mut(id);
+
+        if let Some(previous) = slot.get_output_mut() {
+            if previous.output == output {
+                // no change: the value can be backdated
+                unsafe { slot.backdate(runtime.current_revision()) };
+                return;
+            }
+        }
+
         slot.set_output(output, runtime);
     }
 }
@@ -258,6 +272,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
     }
 }
 
+/// TODO: release the slot reservation if dropped before completion
 pub struct QueryCacheTask<'a, Q: Query> {
     state: TaskState<'a, Q>,
 }
@@ -291,11 +306,13 @@ unsafe fn verify<'a, Q: Query>(
         for &dependency in dependencies {
             if Some(last_verified) < db.last_changed(dependency) {
                 // the dependency has changed since last time
+                eprintln!("dependency changed");
                 return None;
             }
         }
 
         // all dependencies were up-to-date
+        eprintln!("no change");
         let current = db.runtime().current_revision();
         unsafe { slot.backdate(current) };
         Some(previous)

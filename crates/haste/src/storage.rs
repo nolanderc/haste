@@ -1,4 +1,4 @@
-use crate::{Database, DynQueryCache, Runtime, StaticDatabase, WithStorage};
+use crate::{Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage {
@@ -18,6 +18,8 @@ pub trait Container<DB: ?Sized>: 'static + Sync {
     fn as_query_cache(&self) -> Option<&dyn DynQueryCache<DB>> {
         None
     }
+
+    fn last_changed(&self, dep: Dependency) -> Option<Revision>;
 }
 
 pub trait MakeContainer {

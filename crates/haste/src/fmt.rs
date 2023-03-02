@@ -1,5 +1,4 @@
 use std::{
-    any::TypeId,
     cell::Cell,
     fmt::{Debug, Display},
     ptr::NonNull,
@@ -69,12 +68,28 @@ where
         self.raw.runtime()
     }
 
-    fn storage_list(&self) -> &dyn crate::DynStorageList {
-        self.raw.storage_list()
-    }
-
     fn last_changed(&self, dep: crate::Dependency) -> Option<crate::Revision> {
         self.raw.last_changed(dep)
+    }
+
+    fn cycle_strategy(&self, path: crate::ContainerPath) -> crate::CycleStrategy {
+        self.raw.cycle_strategy(path)
+    }
+
+    fn set_cycle(&self, path: crate::IngredientPath, cycle: crate::Cycle) {
+        self.raw.set_cycle(path, cycle)
+    }
+
+    fn fmt_index(
+        &self,
+        path: crate::IngredientPath,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        self.raw.fmt_index(path, f)
+    }
+
+    fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        self.raw.get_storage_any(id)
     }
 }
 
@@ -92,17 +107,17 @@ where
 }
 
 pub fn with_storage<S>(
-    f: impl FnOnce(Option<&FmtDatabase<'_, S>>) -> std::fmt::Result,
+    f: impl FnOnce(Option<&dyn WithStorage<S>>) -> std::fmt::Result,
 ) -> std::fmt::Result
 where
-    S: crate::Storage,
+    S: crate::Storage + Sync + 'static,
 {
     FMT_DATABASE.with(|db| {
-        let db = db.get().and_then(|ptr| {
-            let db = unsafe { ptr.as_ref() };
-            let storage = db.dyn_storage(TypeId::of::<S>())?.downcast::<S>()?;
-            Some(FmtDatabase { raw: db, storage })
+        let db = db.get().and_then(|raw| {
+            let raw = unsafe { raw.as_ref() };
+            let storage = raw.get_storage::<S>()?;
+            Some(FmtDatabase { raw, storage })
         });
-        f(db.as_ref())
+        f(db.as_ref().map(|db| db as &_))
     })
 }

@@ -1,4 +1,4 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::{parse::Parser, spanned::Spanned};
 
@@ -20,7 +20,12 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
     let mut impls = TokenStream::new();
 
     {
-        let storage_paths = storages.iter();
+        let storage_paths = storages.iter().collect::<Vec<_>>();
+        let storage_indices = (0..storages.len()).map(|index| syn::Index {
+            index: index as u32,
+            span: Span::call_site(),
+        });
+
         impls.extend(quote! {
             impl haste::StaticDatabase for #ident {
                 type StorageList = (#(#storage_paths,)*);
@@ -31,6 +36,10 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
 
                 fn storage_mut(&mut self) -> &mut haste::DatabaseStorage<Self> {
                     &mut self.storage
+                }
+
+                fn container(&self, path: haste::ContainerPath) -> &dyn haste::Container<Self> {
+                    self.storage.get_path(self, path)
                 }
             }
 
@@ -43,25 +52,48 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     self.storage.runtime()
                 }
 
-                fn storage_list(&self) -> &dyn haste::DynStorageList {
-                    self.storage.list()
+                /// Determine how an ingredient handles dependency cycles.
+                fn cycle_strategy(&self, path: haste::ContainerPath) -> haste::CycleStrategy {
+                    haste::StaticDatabase::container(self, path)
+                        .as_query_cache().unwrap()
+                        .cycle_strategy()
                 }
 
-                fn dyn_storage(&self, id: std::any::TypeId) -> Option<&dyn haste::DynStorage> {
-                    haste::DynStorageList::get(self.storage.list(), id)
-                }
+                /// The ingredient is part of a cycle.
+                fn set_cycle(&self, path: haste::IngredientPath, cycle: haste::Cycle) {
+                    let result = self
+                        .storage
+                        .get_path(self, path.container)
+                        .as_query_cache().unwrap()
+                        .set_cycle(path.resource, cycle);
 
-                fn dyn_storage_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynStorage> {
-                    haste::DynStorageList::get_path(self.storage.list(), path)
-                }
-
-                fn dyn_container_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
-                    haste::DynStorageList::get_path(self.storage.list(), path)?
-                        .dyn_container_path(path)
+                    if let Err(cycle) = result {
+                        panic!(
+                            "encountered cycle while recovering from another cycle: {}", 
+                            cycle.fmt(self),
+                        );
+                    }
                 }
 
                 fn last_changed(&self, dep: haste::Dependency) -> Option<haste::Revision> {
                     todo!("last_changed({:?})", dep)
+                }
+
+                /// Format an ingredient
+                fn fmt_index(&self, path: haste::IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    haste::StaticDatabase::container(self, path.container)
+                        .fmt(path.resource, f)
+                }
+
+                fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+                    let list = self.storage.list();
+                    #(
+                        if id == std::any::TypeId::of::<#storage_paths>() {
+                            return Some(&list.#storage_indices);
+                        }
+                    )*
+
+                    None
                 }
             }
         });

@@ -90,19 +90,12 @@ impl CycleGraph {
         let participants = Arc::<[_]>::from(participants.as_slice());
 
         let make_cycle = |index: usize| {
+            let path = participants[index];
             let cycle = Cycle {
                 start: index,
                 participants: participants.clone(),
             };
-            let path = participants[index];
-            let container = db.dyn_container_path(path.container).unwrap();
-            let cache = container.as_query_cache().unwrap();
-            if let Err(cycle) = cache.set_cycle(path.resource, cycle) {
-                panic!(
-                    "found dependency cycle while recovering from another cycle: {:#}",
-                    cycle.fmt(db)
-                );
-            }
+            db.set_cycle(path, cycle);
             self.vertices[&path].waker.wake_by_ref();
         };
 
@@ -143,12 +136,10 @@ impl CycleGraph {
     }
 
     fn lookup_strategy(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
-        *self.recover_strategies.entry(container).or_insert_with(|| {
-            db.dyn_container_path(container)
-                .and_then(|c| c.as_query_cache())
-                .map(|cache| cache.cycle_strategy())
-                .unwrap_or(CycleStrategy::Panic)
-        })
+        *self
+            .recover_strategies
+            .entry(container)
+            .or_insert_with(|| db.cycle_strategy(container))
     }
 }
 
@@ -176,7 +167,7 @@ impl Cycle {
         after.iter().chain(before.iter()).copied()
     }
 
-    pub(crate) fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
+    pub fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
         crate::util::fmt::from_fn(|f| {
             let alternate = f.alternate();
             let mut list = f.debug_list();

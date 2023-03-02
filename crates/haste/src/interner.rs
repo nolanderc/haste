@@ -13,7 +13,7 @@ pub struct ArenaInterner<T> {
     entries: ShardMap<NonMaxU32>,
 }
 
-impl<T: Send + Sync + 'static> crate::Container for ArenaInterner<T> {
+impl<T: Send + Sync + 'static> crate::MakeContainer for ArenaInterner<T> {
     fn new(path: ContainerPath) -> Self {
         Self {
             path,
@@ -23,9 +23,16 @@ impl<T: Send + Sync + 'static> crate::Container for ArenaInterner<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> crate::DynContainer for ArenaInterner<T> {
+impl<DB: ?Sized, T> crate::Container<DB> for ArenaInterner<T>
+where
+    T: std::fmt::Debug + Send + Sync + 'static,
+{
     fn path(&self) -> ContainerPath {
         self.path
+    }
+
+    fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get(id.raw).unwrap().fmt(f)
     }
 }
 
@@ -199,7 +206,7 @@ impl InlineString {
     }
 }
 
-impl crate::Container for StringInterner {
+impl crate::MakeContainer for StringInterner {
     fn new(path: ContainerPath) -> Self {
         Self {
             path,
@@ -210,9 +217,13 @@ impl crate::Container for StringInterner {
     }
 }
 
-impl crate::DynContainer for StringInterner {
+impl<DB: ?Sized> crate::Container<DB> for StringInterner {
     fn path(&self) -> ContainerPath {
         self.path
+    }
+
+    fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.get(id.raw).unwrap())
     }
 }
 
@@ -318,31 +329,5 @@ impl StringInterner {
 
     fn hash_fn(&self) -> impl Fn(&NonMaxU32) -> u64 + '_ {
         move |entry| self.entries.hash(self.get(*entry).unwrap())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::Container;
-
-    use super::*;
-
-    #[test]
-    fn interning() {
-        let mut router = crate::StorageRouter::new();
-        let interner = ArenaInterner::new(router.next_container());
-
-        let a = interner.intern("hello");
-        let b = interner.intern("bye");
-        let c = interner.intern("hello");
-
-        assert_eq!(a, c);
-
-        assert_ne!(b, a);
-        assert_ne!(b, c);
-
-        assert_eq!(interner.get(a), Some(&"hello"));
-        assert_eq!(interner.get(b), Some(&"bye"));
-        assert_eq!(interner.get(c), Some(&"hello"));
     }
 }

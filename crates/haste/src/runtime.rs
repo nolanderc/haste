@@ -68,9 +68,7 @@ impl std::fmt::Debug for Dependency {
         write!(
             f,
             "{}:{}.{}",
-            self.container.encode_u16(),
-            self.resource.raw,
-            self.extra
+            self.container.index, self.resource.raw, self.extra
         )
     }
 }
@@ -81,7 +79,7 @@ impl Dependency {
 
     /// Encode the dependency in 64-bits
     pub(crate) fn encode_u64(self) -> u64 {
-        let ingredient = self.container.encode_u16() as u64;
+        let ingredient = self.container.index as u64;
         let resource = self.resource.raw.get() as u64;
         let extra = self.extra as u64;
         (ingredient << 48) | (resource << 16) | extra
@@ -90,7 +88,9 @@ impl Dependency {
     /// Decode the dependency from a 64-bit value
     pub(crate) fn decode_u64(x: u64) -> Option<Self> {
         Some(Self {
-            container: ContainerPath::decode_u16((x >> 48) as u16),
+            container: ContainerPath {
+                index: (x >> 48) as u16,
+            },
             resource: crate::Id::new(NonMaxU32::new((x >> 16) as u32)?),
             extra: x as u16,
         })

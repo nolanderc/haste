@@ -14,7 +14,7 @@ pub struct Database {
     storage: haste::DatabaseStorage<Self>,
 }
 
-impl Db for Database {}
+impl crate::Db for Database {}
 
 #[haste::storage]
 pub struct Storage(Text, fib, Person, cyclic, file, digit_sum);

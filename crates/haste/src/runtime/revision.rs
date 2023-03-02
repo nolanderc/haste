@@ -263,22 +263,22 @@ mod tests {
         history.push(1);
         history.push(2);
         history.push(3);
-        assert_eq!(history.min_since(0), 1);
-        assert_eq!(history.min_since(1), 2);
-        assert_eq!(history.min_since(2), 3);
+        assert_eq!(history.min_since(0), Some(1));
+        assert_eq!(history.min_since(1), Some(2));
+        assert_eq!(history.min_since(2), Some(3));
     }
 
     #[test]
     fn revision_history_from_vec() {
         let history = MinHistory::from_vec(vec![1, 2, 3, 1, 8, 5, 6, 9]);
-        assert_eq!(history.min_since(0), 1);
-        assert_eq!(history.min_since(1), 1);
-        assert_eq!(history.min_since(2), 1);
-        assert_eq!(history.min_since(3), 1);
-        assert_eq!(history.min_since(4), 5);
-        assert_eq!(history.min_since(5), 5);
-        assert_eq!(history.min_since(6), 6);
-        assert_eq!(history.min_since(7), 9);
+        assert_eq!(history.min_since(0), Some(1));
+        assert_eq!(history.min_since(1), Some(1));
+        assert_eq!(history.min_since(2), Some(1));
+        assert_eq!(history.min_since(3), Some(1));
+        assert_eq!(history.min_since(4), Some(5));
+        assert_eq!(history.min_since(5), Some(5));
+        assert_eq!(history.min_since(6), Some(6));
+        assert_eq!(history.min_since(7), Some(9));
     }
 
     #[test]
@@ -286,13 +286,13 @@ mod tests {
         let mut history = MinHistory::new();
         for i in 0..32 {
             history.push(i as u32);
-            assert_eq!(history.min_since(i), i as u32);
+            assert_eq!(history.min_since(i), Some(i as u32));
         }
 
         let mut history = MinHistory::new();
         for i in 0..32 {
             history.push(32 - i as u32);
-            assert_eq!(history.min_since(i), 32 - i as u32);
+            assert_eq!(history.min_since(i), Some(32 - i as u32));
         }
     }
 
@@ -322,7 +322,7 @@ mod tests {
 
         for _ in 0..10 {
             for (i, &min) in minimums.iter().enumerate() {
-                assert_eq!(history.min_since(i), min);
+                assert_eq!(history.min_since(i), Some(min));
             }
         }
     }

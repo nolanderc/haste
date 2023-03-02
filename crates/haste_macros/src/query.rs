@@ -69,7 +69,10 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     };
 
     let cycle_recovery = match args.cycle {
-        None => quote! { async move { unreachable!() } },
+        None => quote! { async move {
+            let db = haste::Database::as_dyn(db);
+            panic!("unexpected dependency cycle: {:#}", cycle.fmt(db)) }
+        },
         Some(recovery_fn) => quote! { #recovery_fn(db, cycle, #input_spread) },
     };
 

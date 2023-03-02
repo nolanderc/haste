@@ -6,15 +6,15 @@ use std::{future::Future, pin::Pin, task::Poll};
 use futures_lite::FutureExt;
 
 use crate::{
-    Container, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, DynContainer,
-    ExecFuture, Id, IngredientPath, Query, QueryTask, Revision, Runtime,
+    ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Container, ExecFuture, Id,
+    IngredientPath, MakeContainer, Query, QueryTask, Revision, Runtime, WithStorage,
 };
 
 use self::storage::{OutputSlot, QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
 
-pub trait QueryCache: DynQueryCache + Container {
+pub trait QueryCache: MakeContainer {
     type Query: Query;
 
     /// Executes the query with the given input, returning an ID for accessing the result of the
@@ -46,7 +46,7 @@ pub trait QueryCache: DynQueryCache + Container {
         Self::Query: crate::Input;
 }
 
-pub trait DynQueryCache: DynContainer {
+pub trait DynQueryCache<DB: ?Sized>: Container<DB> {
     /// Get the cycle recovery stategy used by the query
     fn cycle_strategy(&self) -> CycleStrategy;
 
@@ -81,7 +81,7 @@ pub struct QueryCacheImpl<Q: Query, Lookup> {
     storage: QueryStorage<Q>,
 }
 
-impl<Q: Query, Lookup> crate::Container for QueryCacheImpl<Q, Lookup>
+impl<Q: Query, Lookup> crate::MakeContainer for QueryCacheImpl<Q, Lookup>
 where
     Lookup: Default + Sync + 'static,
 {
@@ -94,8 +94,9 @@ where
     }
 }
 
-impl<Q: Query, Lookup> crate::DynContainer for QueryCacheImpl<Q, Lookup>
+impl<DB: ?Sized, Q: Query, Lookup> crate::Container<DB> for QueryCacheImpl<Q, Lookup>
 where
+    DB: WithStorage<Q::Storage>,
     Lookup: Sync + 'static,
 {
     fn path(&self) -> ContainerPath {
@@ -107,7 +108,7 @@ where
         Q::fmt(slot.input(), f)
     }
 
-    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache<DB>> {
         Some(self)
     }
 }
@@ -147,8 +148,9 @@ where
     }
 }
 
-impl<Q: Query, Lookup> DynQueryCache for QueryCacheImpl<Q, Lookup>
+impl<DB: ?Sized, Q: Query, Lookup> DynQueryCache<DB> for QueryCacheImpl<Q, Lookup>
 where
+    DB: WithStorage<Q::Storage>,
     Lookup: Sync + 'static,
 {
     fn cycle_strategy(&self) -> CycleStrategy {

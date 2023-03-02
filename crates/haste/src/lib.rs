@@ -12,7 +12,7 @@ mod shard_map;
 mod storage;
 pub mod util;
 
-use std::{any::TypeId, future::Future};
+use std::future::Future;
 
 pub use haste_macros::*;
 pub use query_cache::*;
@@ -49,34 +49,38 @@ pub trait Database: Sync {
 
     fn runtime(&self) -> &Runtime;
 
-    fn storage_list(&self) -> &dyn DynStorageList;
+    /// Determine how an ingredient handles dependency cycles.
+    fn cycle_strategy(&self, path: ContainerPath) -> CycleStrategy;
 
-    /// Gets the storage of the given type.
-    fn dyn_storage(&self, typ: TypeId) -> Option<&dyn DynStorage> {
-        self.storage_list().get(typ)
-    }
-
-    /// Gets the storage for the given ingredient.
-    fn dyn_storage_path(&self, path: ContainerPath) -> Option<&dyn DynStorage> {
-        self.storage_list().get_path(path)
-    }
-
-    /// Gets the container for the given ingredient.
-    fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer> {
-        self.dyn_storage_path(path)?.dyn_container_path(path)
-    }
+    /// The ingredient is part of a cycle.
+    fn set_cycle(&self, path: IngredientPath, cycle: Cycle);
 
     /// Given an ingredient, return the revision in which its value was last changed.
     fn last_changed(&self, dep: Dependency) -> Option<Revision>;
+
+    /// Format an ingredient
+    fn fmt_index(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+
+    /// Get a type-erased pointer to a storage of the given type.
+    fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any>;
 }
 
-pub trait StaticDatabase: Database {
+impl dyn Database {
+    fn get_storage<S: Storage + 'static>(&self) -> Option<&S> {
+        self.get_storage_any(std::any::TypeId::of::<S>())?
+            .downcast_ref()
+    }
+}
+
+pub trait StaticDatabase: Database + Sized {
     /// A type containing all the storages used by a database.
-    type StorageList: StorageList;
+    type StorageList: StorageList<Self>;
 
     fn storage(&self) -> &DatabaseStorage<Self>;
 
     fn storage_mut(&mut self) -> &mut DatabaseStorage<Self>;
+
+    fn container(&self, path: ContainerPath) -> &dyn Container<Self>;
 }
 
 /// Implemented by databases which contain a specific type of storage.
@@ -90,7 +94,7 @@ pub trait Ingredient: 'static {
     type Storage: Storage + HasIngredient<Self>;
 
     /// Type which contains all information required by the ingredient.
-    type Container: Container;
+    type Container: MakeContainer;
 }
 
 /// The database required by some database
@@ -145,7 +149,7 @@ pub trait Query: Ingredient {
 pub trait Input: Query {}
 
 /// A container that stores values (elements) which are accessed by an ID.
-pub trait ElementContainer: Container {
+pub trait ElementContainer: MakeContainer {
     type Value: ?Sized;
 
     type Ref<'a>: std::ops::Deref<Target = Self::Value>
@@ -182,7 +186,7 @@ type ExecuteFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
     Q::Storage: 'db,
-    Q::Container: QueryCache<Query = Q> + 'db,
+    Q::Container: QueryCache<Query = Q> + DynQueryCache<DB> + 'db,
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
@@ -190,7 +194,7 @@ type SpawnFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
     Q::Storage: 'db,
-    Q::Container: QueryCache<Query = Q> + 'db,
+    Q::Container: QueryCache<Query = Q> + DynQueryCache<DB> + 'db,
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
@@ -203,7 +207,7 @@ pub trait DatabaseExt: Database {
     where
         Q: Query,
         Q::Storage: 'db,
-        Q::Container: QueryCache<Query = Q> + 'db,
+        Q::Container: QueryCache<Query = Q> + DynQueryCache<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.cast_dyn();
@@ -233,7 +237,7 @@ pub trait DatabaseExt: Database {
     where
         Q: Query,
         Q::Storage: 'db,
-        Q::Container: QueryCache<Query = Q> + 'db,
+        Q::Container: QueryCache<Query = Q> + DynQueryCache<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.cast_dyn();
@@ -349,7 +353,7 @@ pub trait DatabaseExt: Database {
     where
         T: Ingredient + TrackedReference,
         T::Storage: 'db,
-        T::Container: ElementContainer + 'db,
+        T::Container: ElementContainer + Container<Self> + 'db,
         Self: WithStorage<T::Storage>,
     {
         let runtime = self.runtime();

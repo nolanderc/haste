@@ -1,67 +1,33 @@
 use crate::{Database, DynQueryCache, Runtime, StaticDatabase, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
-pub trait Storage: DynStorage {
+pub trait Storage {
     /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
     type DynDatabase: Database + ?Sized + WithStorage<Self>;
 
-    fn new(router: &mut StorageRouter) -> Self;
-}
-
-pub trait DynStorage: std::any::Any {
-    fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer>;
-}
-
-impl dyn DynStorage {
-    pub(crate) fn downcast<S: 'static>(&self) -> Option<&S> {
-        if self.type_id() == std::any::TypeId::of::<S>() {
-            // SAFETY: `self` and `S` are of the same type:
-            Some(unsafe { &*(self as *const _ as *const S) })
-        } else {
-            None
-        }
-    }
+    /// Initialize the storage within some database.
+    fn new<DB: WithStorage<Self>>(router: &mut StorageRouter<DB>) -> Self;
 }
 
 /// Stores the data requried by a single ingredient
-pub trait Container: DynContainer {
-    fn new(path: ContainerPath) -> Self;
-}
-
-pub trait DynContainer: 'static + Sync {
+pub trait Container<DB: ?Sized>: 'static + Sync {
     fn path(&self) -> ContainerPath;
 
-    fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let path = IngredientPath {
-            container: self.path(),
-            resource: id,
-        };
-        write!(f, "{:?}", path)
-    }
+    fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
-    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache<DB>> {
         None
     }
+}
+
+pub trait MakeContainer {
+    fn new(path: ContainerPath) -> Self;
 }
 
 /// Identifies a single container in a database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContainerPath {
-    pub storage: u8,
-    pub container: u8,
-}
-
-impl ContainerPath {
-    pub(crate) fn encode_u16(self) -> u16 {
-        (self.storage as u16) << 8 | (self.container as u16)
-    }
-
-    pub(crate) fn decode_u16(x: u16) -> Self {
-        Self {
-            storage: (x >> 8) as u8,
-            container: x as u8,
-        }
-    }
+    pub(crate) index: u16,
 }
 
 /// Identifies a single resource in a database
@@ -73,7 +39,7 @@ pub struct IngredientPath {
 
 impl std::fmt::Debug for IngredientPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.container.encode_u16(), self.resource.raw,)
+        write!(f, "{}:{}", self.container.index, self.resource.raw,)
     }
 }
 
@@ -81,21 +47,24 @@ impl std::fmt::Debug for IngredientPath {
 pub struct DatabaseStorage<DB: StaticDatabase + ?Sized> {
     pub(crate) runtime: Runtime,
     pub(crate) list: DB::StorageList,
+    router: StorageRouter<DB>,
 }
 
-impl<DB: StaticDatabase + ?Sized> Default for DatabaseStorage<DB> {
+impl<DB: StaticDatabase + 'static> Default for DatabaseStorage<DB> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<DB: StaticDatabase + ?Sized> DatabaseStorage<DB> {
+impl<DB: StaticDatabase + 'static> DatabaseStorage<DB> {
     pub fn new() -> Self {
         let mut router = StorageRouter::new();
+        let list = DB::StorageList::new(&mut router);
 
         Self {
             runtime: Runtime::new(),
-            list: DB::StorageList::new(&mut router),
+            list,
+            router,
         }
     }
 
@@ -110,59 +79,47 @@ impl<DB: StaticDatabase + ?Sized> DatabaseStorage<DB> {
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
+
+    pub fn get_path<'a>(&self, db: &'a DB, path: ContainerPath) -> &'a dyn Container<DB> {
+        self.router.paths[path.index as usize](db)
+    }
 }
 
-pub trait StorageList: DynStorageList {
-    fn new(router: &mut StorageRouter) -> Self
+pub trait StorageList<DB> {
+    fn new(router: &mut StorageRouter<DB>) -> Self
     where
         Self: Sized;
 
     fn get_mut<T: 'static>(&mut self) -> Option<&mut T>;
 }
 
-pub trait DynStorageList {
-    fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage>;
-    fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage>;
+pub struct StorageRouter<DB: ?Sized> {
+    paths: Vec<Route<DB>>,
 }
 
-pub struct StorageRouter {
-    max_storages: usize,
-    next_path: ContainerPath,
-}
+type Route<DB> = fn(&DB) -> &dyn Container<DB>;
 
-impl StorageRouter {
+impl<DB> StorageRouter<DB> {
     pub(crate) fn new() -> Self {
-        Self {
-            max_storages: u8::MAX as usize,
-            next_path: ContainerPath {
-                storage: 0,
-                container: 0,
-            },
-        }
+        Self { paths: Vec::new() }
     }
 
-    pub(crate) fn end_storage(&mut self) {
-        if usize::from(self.next_path.storage) >= self.max_storages {
-            panic!("routed more storages than there were available");
-        }
-        self.next_path.storage += 1;
-    }
-
-    pub fn next_container(&mut self) -> ContainerPath {
-        let id = self.next_path;
-        self.next_path.container += 1;
-        id
+    pub fn push(&mut self, route: Route<DB>) -> ContainerPath {
+        let index = u16::try_from(self.paths.len()).expect("too many containers");
+        self.paths.push(route);
+        ContainerPath { index }
     }
 }
 
 macro_rules! impl_tuple {
     ($($T:ident)*) => {
         #[allow(unused, clippy::unused_unit, non_snake_case)]
-        impl<$($T: Storage + 'static),*> StorageList for ($($T,)*) {
-            fn new(router: &mut StorageRouter) -> Self {
+        impl<DB, $($T: Storage + 'static),*> StorageList<DB> for ($($T,)*)
+            where $( DB: WithStorage<$T> ),*
+        {
+            fn new(router: &mut StorageRouter<DB>) -> Self {
                 $(
                     let $T: $T = $T::new(router);
-                    router.end_storage();
                 )*
 
                 ($($T,)*)
@@ -176,38 +133,6 @@ macro_rules! impl_tuple {
                     if std::any::TypeId::of::<$T>() == std::any::TypeId::of::<T>() {
                         return unsafe { Some(std::mem::transmute::<&mut $T, &mut T>($T)) }
                     }
-                )*
-
-                None
-            }
-        }
-
-        #[allow(unused, clippy::unused_unit, non_snake_case)]
-        impl<$($T: Storage),*> DynStorageList for ($($T,)*) {
-            #[inline]
-            fn get(&self, id: std::any::TypeId) -> Option<&dyn DynStorage> {
-                let ($($T,)*) = self;
-
-                $(
-                    if std::any::TypeId::of::<$T>() == id {
-                        return Some($T)
-                    }
-                )*
-
-                None
-            }
-
-
-            fn get_path(&self, path: ContainerPath) -> Option<&dyn DynStorage> {
-                let ($($T,)*) = self;
-
-                let mut i = 0;
-
-                $(
-                    if i == path.storage {
-                        return Some($T);
-                    }
-                    i += 1;
                 )*
 
                 None

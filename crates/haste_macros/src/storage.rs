@@ -71,20 +71,15 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
         impl haste::Storage for #ident {
             type DynDatabase = dyn #db_path;
 
-            fn new(router: &mut haste::StorageRouter) -> Self {
+            fn new<DB>(router: &mut haste::StorageRouter<DB>) -> Self 
+                where DB: haste::WithStorage<Self> 
+            {
                 Self {
                     #(
-                        #field_members: <#container_types as haste::Container>::new(router.next_container()),
+                        #field_members: <#container_types as haste::MakeContainer>::new(
+                            router.push(|db| &db.storage().#field_members)
+                        ),
                     )*
-                }
-            }
-        }
-
-        impl haste::DynStorage for #ident {
-            fn dyn_container_path(&self, path: haste::ContainerPath) -> Option<&dyn haste::DynContainer> {
-                match path.container {
-                    #( #field_members => Some(&self.#field_members), )*
-                    _ => None,
                 }
             }
         }

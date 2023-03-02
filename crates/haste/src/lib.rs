@@ -65,6 +65,9 @@ pub trait Database: Sync {
     fn dyn_container_path(&self, path: ContainerPath) -> Option<&dyn DynContainer> {
         self.dyn_storage_path(path)?.dyn_container_path(path)
     }
+
+    /// Given an ingredient, return the revision in which its value was last changed.
+    fn last_changed(&self, dep: Dependency) -> Option<Revision>;
 }
 
 pub trait StaticDatabase: Database {

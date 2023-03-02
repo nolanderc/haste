@@ -49,7 +49,10 @@ struct State {
     /// - if `0x20` is set, the task is being executed
     addr: AtomicUsize,
 
+    /// The revision during which the query slot was last verified to be valid and up-to-date.
     verified_at: AtomicRevision,
+
+    /// The revision during which the output was last changed
     changed_at: AtomicRevision,
 }
 
@@ -85,10 +88,22 @@ const ADDR_MASK: usize = usize::MAX << 6;
 #[derive(Default)]
 pub(crate) struct BlockedState {
     /// List of wakers blocked on the cell.
-    wakers: SmallVec<[Waker; 6]>,
+    wakers: SmallVec<[Waker; WAKER_INLINE_CAP]>,
     /// If there has been a dependency cycle it is stored here.
     cycle: Option<Cycle>,
 }
+
+const WAKER_INLINE_CAP: usize = {
+    const ALIGN: usize = 64;
+    const WAKER: usize = std::mem::size_of::<Waker>();
+    const CYCLE: usize = std::mem::size_of::<Cycle>();
+    const USIZE: usize = std::mem::size_of::<usize>();
+    let mut count = (ALIGN - (USIZE + CYCLE)) / WAKER;
+    while count < 4 {
+        count += ALIGN / WAKER;
+    }
+    count
+};
 
 impl<I, T> Default for QueryCell<I, T> {
     fn default() -> Self {
@@ -102,7 +117,7 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Initialize the cell with some input value.
-    pub fn write_input(&self, value: I) -> Result<&I, &I> {
+    pub fn write_input(&self, value: I) -> &I {
         // take the lock, ensuring that we are the only thread writing to the value
         let lock = self.state.lock();
 
@@ -110,7 +125,7 @@ impl<I, O> QueryCell<I, O> {
             // the value has already been initialized
             // SAFETY: since we grabbed the lock, there's no need further need to synchronize
             // with the writer
-            return unsafe { Err(self.input_assume_init()) };
+            return unsafe { self.input_assume_init() };
         }
 
         // initialize the slot
@@ -120,7 +135,7 @@ impl<I, O> QueryCell<I, O> {
         // set the `HAS_INPUT` bit, allowing other threads to read the value
         lock.set_initialized();
 
-        Ok(value)
+        value
     }
 
     /// # Safety
@@ -156,10 +171,10 @@ impl<I, O> QueryCell<I, O> {
         *state |= HAS_OUTPUT;
 
         let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(had_input.then_some(last_change));
+        let current = runtime.update_input(last_change);
 
-        self.state.verified_at.set(current);
-        self.state.changed_at.set(current);
+        self.state.verified_at.set(Some(current));
+        self.state.changed_at.set(Some(current));
     }
 
     pub fn write_output(&self, value: O, revision: Revision) -> &O {
@@ -168,7 +183,7 @@ impl<I, O> QueryCell<I, O> {
 
         if (lock.addr & HAS_OUTPUT) != 0 {
             // the value has already been written
-            if revision == self.state.verified_at.load(Relaxed) {
+            if Some(revision) == self.state.verified_at.load(Relaxed) {
                 // SAFETY: since we grabbed the lock, there's no need further need to synchronize
                 // with the writer
                 return unsafe { self.output_assume_init() };
@@ -176,11 +191,12 @@ impl<I, O> QueryCell<I, O> {
         }
 
         // initialize the slot
-        // SAFETY: the `HAS_OUTPUT` bit was not set, so we are the first (and only) to write
+        // SAFETY: the slot was not verified in the current revision and we hold the lock, so we
+        // have exclusive access to the output
         let value = unsafe { (*self.output.get()).write(value) };
 
         // we changed the slot's value in the current revision:
-        self.state.changed_at.store(revision, Relaxed);
+        self.state.changed_at.store(Some(revision), Relaxed);
 
         // set the `HAS_OUTPUT` bit, allowing tasks to read the value
         let blocked = lock.set_finished(revision);
@@ -239,25 +255,21 @@ impl<I, O> QueryCell<I, O> {
         }
     }
 
-    /// Reserve the query for execution.
+    /// Reserve the query for execution in the given revision.
     ///
     /// # Returns
     ///
     /// `true` if successful, or `false` if the query has been reserved previously.
-    pub fn reserve(&self, runtime: &Runtime) -> bool {
-        let current = runtime.current_revision();
-
-        if self.state.verified_at.load(Relaxed) == current {
+    pub fn reserve(&self, revision: Revision) -> bool {
+        if self.state.verified_at.load(Relaxed) == Some(revision) {
             // the query is already up-to-date
             return false;
         }
 
         let lock = self.state.lock();
 
-        let last_verified = self.state.verified_at.load(Relaxed);
-
         // the query was completed while we waited on the lock
-        if last_verified == current {
+        if self.state.verified_at.load(Relaxed) == Some(revision) {
             return false;
         }
 
@@ -272,7 +284,7 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Waits until the output value has been set
-    pub fn wait_until_finished(&self, revision: Revision) -> impl Future<Output = &O> + '_ {
+    pub fn wait_until_verified(&self, revision: Revision) -> impl Future<Output = &O> + '_ {
         let mut pending = self.state.wait(revision);
         // we cannot use an `async` block here, since they don't implement `Unpin`
         std::future::poll_fn(move |cx| {
@@ -303,6 +315,14 @@ impl<I, O> QueryCell<I, O> {
         let mut lock = self.state.lock();
         lock.get_or_init().cycle.take()
     }
+
+    pub fn last_verified(&self) -> Option<Revision> {
+        self.state.verified_at.load(Acquire)
+    }
+
+    pub fn last_changed(&self) -> Option<Revision> {
+        self.state.changed_at.load(Relaxed)
+    }
 }
 
 impl State {
@@ -313,7 +333,7 @@ impl State {
         let mut registered = None;
 
         std::future::poll_fn(move |ctx| {
-            if self.verified_at.load(Acquire) == revision {
+            if self.verified_at.load(Acquire) == Some(revision) {
                 // SAFETY: we used `Acquire` ordering, so we synchronized with the write
                 return std::task::Poll::Ready(());
             }
@@ -322,7 +342,7 @@ impl State {
             let mut lock = self.lock();
 
             // Maybe the value was written while we were waiting for the lock?
-            if self.verified_at.load(Relaxed) == revision {
+            if self.verified_at.load(Relaxed) == Some(revision) {
                 // SAFETY: since we grabbed the lock, we are synchronized with the write
                 return std::task::Poll::Ready(());
             }
@@ -474,7 +494,7 @@ impl StateLock<'_> {
     /// of the inner pointer by clearing it to `null`.
     fn set_finished(self, revision: Revision) -> Option<Box<BlockedState>> {
         // SAFETY: we only set `verified_at` while holding the lock.
-        self.state.verified_at.store(revision, Release);
+        self.state.verified_at.store(Some(revision), Release);
 
         // - set the `HAS_OUTPUT` bit
         // - clear the address to `null`

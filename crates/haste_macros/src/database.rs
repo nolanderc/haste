@@ -59,6 +59,10 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     haste::DynStorageList::get_path(self.storage.list(), path)?
                         .dyn_container_path(path)
                 }
+
+                fn last_changed(&self, dep: haste::Dependency) -> Option<haste::Revision> {
+                    todo!("last_changed({:?})", dep)
+                }
             }
         });
     }

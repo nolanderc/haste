@@ -1,15 +1,15 @@
 use crate::{shard_map::ShardMap, Id, Query, TrackedReference};
 
-use super::storage::QueryStorage;
+use super::storage::{QuerySlot, QueryStorage};
 
 use std::hash::Hash;
 
 pub trait LookupStrategy<Q: Query>: Sync {
-    fn try_insert<'a>(
+    fn get_or_insert<'a>(
         &self,
         input: Q::Input,
         storage: &'a QueryStorage<Q>,
-    ) -> Result<(Id, &'a Q::Input), Id>;
+    ) -> (Id, &'a QuerySlot<Q>);
 }
 
 /// Uses the hash of the input as the key.
@@ -22,11 +22,11 @@ impl<Q: Query> LookupStrategy<Q> for HashStrategy
 where
     Q::Input: Hash + Eq,
 {
-    fn try_insert<'a>(
+    fn get_or_insert<'a>(
         &self,
         input: Q::Input,
         storage: &'a QueryStorage<Q>,
-    ) -> Result<(Id, &'a Q::Input), Id> {
+    ) -> (Id, &'a QuerySlot<Q>) {
         let eq_fn = |key: &Id| {
             // SAFETY: all entries are valid
             let slot = unsafe { storage.get_slot_unchecked(*key) };
@@ -37,8 +37,8 @@ where
 
         // First check if the value already exists.
         let shard = self.entries.shard(hash).read().unwrap();
-        if let Some(id) = shard.get(hash, eq_fn) {
-            return Err(*id);
+        if let Some(&id) = shard.get(hash, eq_fn) {
+            return (id, unsafe { storage.get_slot_unchecked(id) });
         }
 
         let len_before = shard.len();
@@ -50,12 +50,12 @@ where
         // Make sure the value was not inserted while we waited on the write lock
         if len_before != len_after {
             // a value has been inserted (we never remove values, so the comparison above is sound)
-            if let Some(id) = shard.get(hash, eq_fn) {
-                return Err(*id);
+            if let Some(&id) = shard.get(hash, eq_fn) {
+                return (id, unsafe { storage.get_slot_unchecked(id) });
             }
         }
 
-        let (id, input) = storage.allocate_slot(input);
+        let (id, slot) = storage.allocate_slot(input);
 
         shard.insert(hash, id, |key| {
             // SAFETY: all IDs in the cache are valid
@@ -63,7 +63,7 @@ where
             self.entries.hash(slot.input())
         });
 
-        Ok((id, input))
+        (id, slot)
     }
 }
 
@@ -75,15 +75,13 @@ impl<Q: Query> LookupStrategy<Q> for TrackedStrategy
 where
     Q::Input: TrackedReference + Copy,
 {
-    fn try_insert<'a>(
+    fn get_or_insert<'a>(
         &self,
         input: Q::Input,
         storage: &'a QueryStorage<Q>,
-    ) -> Result<(Id, &'a Q::Input), Id> {
+    ) -> (Id, &'a QuerySlot<Q>) {
         let id = input.id();
-        match storage.init_slot(id, input) {
-            Ok(input) => Ok((id, input)),
-            Err(_) => Err(id),
-        }
+        let slot = storage.init_slot(id, input);
+        (id, slot)
     }
 }

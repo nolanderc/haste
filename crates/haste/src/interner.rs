@@ -13,7 +13,7 @@ pub struct ArenaInterner<T> {
     entries: ShardMap<NonMaxU32>,
 }
 
-impl<T: 'static> crate::Container for ArenaInterner<T> {
+impl<T: Send + Sync + 'static> crate::Container for ArenaInterner<T> {
     fn new(path: ContainerPath) -> Self {
         Self {
             path,
@@ -23,7 +23,7 @@ impl<T: 'static> crate::Container for ArenaInterner<T> {
     }
 }
 
-impl<T: 'static> crate::DynContainer for ArenaInterner<T> {
+impl<T: Send + Sync + 'static> crate::DynContainer for ArenaInterner<T> {
     fn path(&self) -> ContainerPath {
         self.path
     }
@@ -31,7 +31,7 @@ impl<T: 'static> crate::DynContainer for ArenaInterner<T> {
 
 impl<T> crate::ElementContainer for ArenaInterner<T>
 where
-    T: Eq + Hash + 'static,
+    T: Eq + Hash + Send + Sync + 'static,
 {
     type Value = T;
 

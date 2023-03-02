@@ -72,6 +72,10 @@ where
     fn storage_list(&self) -> &dyn crate::DynStorageList {
         self.raw.storage_list()
     }
+
+    fn last_changed(&self, dep: crate::Dependency) -> Option<crate::Revision> {
+        self.raw.last_changed(dep)
+    }
 }
 
 impl<'db, S> WithStorage<S> for FmtDatabase<'db, S>

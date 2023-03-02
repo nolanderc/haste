@@ -1,39 +1,58 @@
 #![allow(dead_code)]
 
-use std::sync::atomic::{
-    AtomicU32, AtomicU64,
-    Ordering::{self, Relaxed},
+use std::{
+    num::NonZeroU32,
+    sync::atomic::{
+        AtomicU32, AtomicU64,
+        Ordering::{self, Relaxed},
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Revision(u32);
+pub struct Revision(NonZeroU32);
+
+impl Revision {
+    fn new(x: u32) -> Option<Revision> {
+        Some(Self(NonZeroU32::new(x)?))
+    }
+}
+
+unsafe impl bytemuck::ZeroableInOption for Revision {}
+
+fn to_u32(rev: Option<Revision>) -> u32 {
+    rev.map(|x| x.0.get()).unwrap_or(0)
+}
 
 #[derive(Debug, bytemuck::Zeroable)]
 pub struct AtomicRevision(AtomicU32);
 
 impl AtomicRevision {
-    pub fn new(revision: Revision) -> Self {
-        Self(AtomicU32::new(revision.0))
+    pub fn new(revision: Option<Revision>) -> Self {
+        Self(AtomicU32::new(to_u32(revision)))
     }
 
-    pub fn load(&self, order: Ordering) -> Revision {
-        Revision(self.0.load(order))
+    pub fn load(&self, order: Ordering) -> Option<Revision> {
+        Self::from_u32(self.0.load(order))
     }
 
-    pub fn store(&self, rev: Revision, order: Ordering) {
-        self.0.store(rev.0, order)
+    pub fn store(&self, rev: Option<Revision>, order: Ordering) {
+        self.0.store(to_u32(rev), order)
     }
 
-    pub fn swap(&self, rev: Revision, order: Ordering) -> Revision {
-        Revision(self.0.swap(rev.0, order))
+    pub fn swap(&self, rev: Option<Revision>, order: Ordering) -> Option<Revision> {
+        Self::from_u32(self.0.swap(to_u32(rev), order))
     }
 
-    pub(crate) fn set(&mut self, rev: Revision) {
-        *self.0.get_mut() = rev.0;
+    pub(crate) fn set(&mut self, rev: Option<Revision>) {
+        *self.0.get_mut() = to_u32(rev);
     }
 
-    pub(crate) fn get(&mut self) -> Revision {
-        Revision(*self.0.get_mut())
+    pub(crate) fn get(&mut self) -> Option<Revision> {
+        Self::from_u32(*self.0.get_mut())
+    }
+
+    fn from_u32(num: u32) -> Option<Revision> {
+        Some(Revision(NonZeroU32::new(num)?))
     }
 }
 
@@ -44,12 +63,13 @@ pub struct RevisionHistory {
 impl RevisionHistory {
     pub fn new() -> Self {
         let mut history = MinHistory::new();
-        history.push(0);
+        history.push(1);
         Self { history }
     }
 
     pub fn current(&self) -> Revision {
-        Revision(self.history.len() as u32 - 1)
+        let index = self.history.len() as u32;
+        Revision(unsafe { NonZeroU32::new_unchecked(index) })
     }
 
     /// When an input has been modified, this function is called with the previous revision in
@@ -58,17 +78,18 @@ impl RevisionHistory {
     ///
     /// Time complexity: `O(log n)`
     pub fn push_update(&mut self, last_changed: Option<Revision>) -> Revision {
-        let new = Revision(self.history.len() as u32);
-        self.history.push(last_changed.unwrap_or(new).0);
+        let new = Revision::new(self.history.len() as u32 + 1).unwrap();
+        let revision = last_changed.unwrap_or(new);
+        self.history.push(revision.0.get());
         new
     }
 
     /// Given some revision `rev`, finds the earliest input that has been changed in one of the
-    /// revisions `rev, rev+1, rev+2, ..`.
+    /// revisions `rev+1, rev+2, ..`.
     ///
     /// Time complexity: `O(log n)`
-    pub fn earliest_change_since(&self, rev: Revision) -> Revision {
-        Revision(self.history.min_since(rev.0 as usize))
+    pub fn earliest_change_since(&self, rev: Revision) -> Option<Revision> {
+        Revision::new(self.history.min_since(rev.0.get() as usize)?)
     }
 }
 
@@ -198,10 +219,10 @@ impl MinHistory {
         }
     }
 
-    pub fn min_since(&self, index: usize) -> u32 {
-        let cache = &self.cache[index];
+    pub fn min_since(&self, index: usize) -> Option<u32> {
+        let cache = self.cache.get(index)?;
         if let Some(cached) = cache.get(self.len) {
-            return cached;
+            return Some(cached);
         }
 
         let mut min = u32::MAX;
@@ -217,7 +238,7 @@ impl MinHistory {
 
         cache.store(self.len, min);
 
-        min
+        Some(min)
     }
 }
 

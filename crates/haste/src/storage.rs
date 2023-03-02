@@ -28,7 +28,7 @@ pub trait Container: DynContainer {
     fn new(path: ContainerPath) -> Self;
 }
 
-pub trait DynContainer: 'static {
+pub trait DynContainer: 'static + Sync {
     fn path(&self) -> ContainerPath;
 
     fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

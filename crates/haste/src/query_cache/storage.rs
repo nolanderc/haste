@@ -70,19 +70,19 @@ impl<Q: Query> QueryStorage<Q> {
             .expect("attempted to get query slot which does not exist")
     }
 
-    pub fn allocate_slot(&self, input: Q::Input) -> (Id, &Q::Input) {
+    pub fn allocate_slot(&self, input: Q::Input) -> (Id, &QuerySlot<Q>) {
         let index = self.slots.push_zeroed();
         let slot = unsafe { self.slots.get_unchecked(index) };
-        let input = match slot.cell.write_input(input) {
-            Ok(input) | Err(input) => input,
-        };
+        slot.cell.write_input(input);
         let id = Id::try_from_usize(index).expect("exhausted IDs");
-        (id, input)
+        (id, slot)
     }
 
-    pub fn init_slot(&self, id: Id, input: Q::Input) -> Result<&Q::Input, &Q::Input> {
+    pub fn init_slot(&self, id: Id, input: Q::Input) -> &QuerySlot<Q> {
         let index = id.raw.get() as usize;
-        self.slots.get_or_allocate(index).cell.write_input(input)
+        let slot = self.slots.get_or_allocate(index);
+        slot.cell.write_input(input);
+        slot
     }
 }
 
@@ -144,13 +144,13 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.backdate(current);
     }
 
-    pub fn reserve(&self, runtime: &Runtime) -> bool {
-        self.cell.reserve(runtime)
+    pub fn try_reserve_for_execution(&self, runtime: &Runtime) -> bool {
+        self.cell.reserve(runtime.current_revision())
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_finished(&self, runtime: &Runtime) -> WaitFuture<'_, Q> {
-        self.cell.wait_until_finished(runtime.current_revision())
+    pub fn wait_until_verified(&self, runtime: &Runtime) -> WaitFuture<'_, Q> {
+        self.cell.wait_until_verified(runtime.current_revision())
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -172,5 +172,9 @@ impl<Q: Query> QuerySlot<Q> {
             },
             runtime,
         );
+    }
+
+    pub fn last_verified(&self) -> Option<Revision> {
+        self.cell.last_verified()
     }
 }

@@ -16,7 +16,7 @@ use std::{
 use crate::{non_max::NonMaxU32, ContainerPath, Database, DatabaseFor, IngredientPath, Query};
 
 pub use self::cycle::{Cycle, CycleStrategy};
-pub use self::revision::{Revision, AtomicRevision};
+pub use self::revision::{AtomicRevision, Revision};
 pub use self::task::QueryTask;
 
 use self::{cycle::CycleGraph, revision::RevisionHistory, task::Scheduler};
@@ -95,6 +95,13 @@ impl Dependency {
             extra: x as u16,
         })
     }
+
+    pub fn ingredient(&self) -> IngredientPath {
+        IngredientPath {
+            container: self.container,
+            resource: self.resource,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -166,22 +173,22 @@ thread_local! {
     static ACTIVE: ActiveData = ActiveData::new();
 }
 
-pub(crate) struct QueryFuture<'db, Q: Query> {
+pub(crate) struct ExecFuture<'db, Q: Query> {
     db: &'db DatabaseFor<Q>,
     /// Data associated with the executing task.
     task: Option<TaskData>,
     /// The future which drives the query progress.
-    inner: QueryFutureInner<'db, Q>,
-
+    inner: ExecFutureInner<'db, Q>,
+    /// The query is currently blocking this query.
     blocks: Option<IngredientPath>,
 }
 
-enum QueryFutureInner<'a, Q: Query> {
+enum ExecFutureInner<'a, Q: Query> {
     Eval(Q::Future<'a>),
     Recover(Q::RecoverFuture<'a>),
 }
 
-impl<'db, Q: Query> QueryFuture<'db, Q> {
+impl<'db, Q: Query> ExecFuture<'db, Q> {
     pub fn database(&self) -> &'db DatabaseFor<Q> {
         self.db
     }
@@ -190,12 +197,16 @@ impl<'db, Q: Query> QueryFuture<'db, Q> {
         let recovery = Q::recover_cycle(self.db, cycle, input.clone());
         unsafe {
             let this = self.get_unchecked_mut();
-            this.inner = QueryFutureInner::Recover(recovery);
+            this.inner = ExecFutureInner::Recover(recovery);
         }
+    }
+
+    pub fn query(&self) -> IngredientPath {
+        self.task.as_ref().unwrap().this
     }
 }
 
-impl<'db, Q: Query> Drop for QueryFuture<'db, Q> {
+impl<'db, Q: Query> Drop for ExecFuture<'db, Q> {
     fn drop(&mut self) {
         if let Some(parent) = self.blocks {
             self.db.runtime().unblock(parent);
@@ -203,7 +214,7 @@ impl<'db, Q: Query> Drop for QueryFuture<'db, Q> {
     }
 }
 
-impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
+impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
     type Output = ExecutionResult<Q::Output>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -220,8 +231,8 @@ impl<'db, Q: Query> Future for QueryFuture<'db, Q> {
 
             // poll the query for completion
             let poll_inner = match &mut this.inner {
-                QueryFutureInner::Eval(eval) => Pin::new_unchecked(eval).poll(cx),
-                QueryFutureInner::Recover(recover) => Pin::new_unchecked(recover).poll(cx),
+                ExecFutureInner::Eval(eval) => Pin::new_unchecked(eval).poll(cx),
+                ExecFutureInner::Recover(recover) => Pin::new_unchecked(recover).poll(cx),
             };
 
             // restore the previous task
@@ -265,10 +276,10 @@ impl Runtime {
         db: &'db DatabaseFor<Q>,
         input: Q::Input,
         this: IngredientPath,
-    ) -> QueryFuture<'db, Q> {
-        QueryFuture {
+    ) -> ExecFuture<'db, Q> {
+        ExecFuture {
             db,
-            inner: QueryFutureInner::Eval(Q::execute(db, input)),
+            inner: ExecFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new(this)),
             blocks: None,
         }

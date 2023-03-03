@@ -1,3 +1,7 @@
+use std::{future::Future, pin::Pin};
+
+use futures_lite::FutureExt;
+
 use crate::{Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
@@ -15,11 +19,30 @@ pub trait Container<DB: ?Sized>: 'static + Sync {
 
     fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
-    fn as_query_cache(&self) -> Option<&dyn DynQueryCache<DB>> {
+    fn as_query_cache(&self) -> Option<&dyn DynQueryCache> {
         None
     }
 
-    fn last_changed(&self, dep: Dependency) -> Option<Revision>;
+    fn last_changed<'a>(&'a self, db: &'a DB, dep: Dependency) -> LastChangedFuture<'a>;
+}
+
+pub enum LastChangedFuture<'a> {
+    Ready(Option<Revision>),
+    Future(Pin<Box<dyn Future<Output = Option<Revision>> + Send + 'a>>),
+}
+
+impl Future for LastChangedFuture<'_> {
+    type Output = Option<Revision>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            LastChangedFuture::Ready(ready) => std::task::Poll::Ready(*ready),
+            LastChangedFuture::Future(future) => future.poll(cx),
+        }
+    }
 }
 
 pub trait MakeContainer {

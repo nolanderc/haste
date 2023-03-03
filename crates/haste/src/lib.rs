@@ -56,7 +56,7 @@ pub trait Database: Sync {
     fn set_cycle(&self, path: IngredientPath, cycle: Cycle);
 
     /// Given an ingredient, return the revision in which its value was last changed.
-    fn last_changed(&self, dep: Dependency) -> Option<Revision>;
+    fn last_changed(&self, dep: Dependency) -> LastChangedFuture;
 
     /// Format an ingredient
     fn fmt_index(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
@@ -119,7 +119,7 @@ where
 }
 
 pub trait Query: Ingredient {
-    type Input: Eq + Clone + Send + 'static;
+    type Input: Eq + Clone + Send + Sync + 'static;
     type Output: Eq + Send + Sync + 'static;
     type Future<'db>: Future<Output = Self::Output> + Send;
     type RecoverFuture<'db>: Future<Output = Self::Output> + Send;
@@ -186,7 +186,7 @@ type ExecuteFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
     Q::Storage: 'db,
-    Q::Container: QueryCache<Query = Q> + DynQueryCache<DB> + 'db,
+    Q::Container: QueryCache<Query = Q> + Container<DB> + 'db,
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
@@ -194,7 +194,7 @@ type SpawnFuture<'db, DB: ?Sized, Q: Query>
 where
     Q: Query,
     Q::Storage: 'db,
-    Q::Container: QueryCache<Query = Q> + DynQueryCache<DB> + 'db,
+    Q::Container: QueryCache<Query = Q> + Container<DB> + 'db,
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
@@ -207,7 +207,7 @@ pub trait DatabaseExt: Database {
     where
         Q: Query,
         Q::Storage: 'db,
-        Q::Container: QueryCache<Query = Q> + DynQueryCache<Self> + 'db,
+        Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.cast_dyn();
@@ -220,6 +220,7 @@ pub trait DatabaseExt: Database {
             let output = match future {
                 EvalResult::Eval(eval) => eval.await,
                 EvalResult::Pending(pending) => pending.await,
+                EvalResult::Cached(cached) => cached,
             };
 
             runtime.register_dependency(Dependency {
@@ -237,7 +238,7 @@ pub trait DatabaseExt: Database {
     where
         Q: Query,
         Q::Storage: 'db,
-        Q::Container: QueryCache<Query = Q> + DynQueryCache<Self> + 'db,
+        Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
         let db = self.cast_dyn();
@@ -245,12 +246,14 @@ pub trait DatabaseExt: Database {
         let storage = self.storage();
         let cache = storage.container();
 
-        enum SpawnResult<Pending> {
+        enum SpawnResult<Cached, Pending> {
+            Cached(Cached),
             Pending(Pending),
             Spawned(Id),
         }
 
         let spawn_result = match cache.get_or_evaluate(db, input) {
+            EvalResult::Cached(cached) => SpawnResult::Cached(cached),
             EvalResult::Pending(pending) => SpawnResult::Pending(pending),
             EvalResult::Eval(eval) => {
                 // spawn the query, but postpone checking it for completion until the returned
@@ -263,12 +266,23 @@ pub trait DatabaseExt: Database {
 
         async move {
             let pending = match spawn_result {
-                SpawnResult::Pending(pending) => pending,
+                SpawnResult::Cached(cached) => Ok(cached),
+                SpawnResult::Pending(pending) => Err(pending),
                 // the query was spawned in the runtime, so try getting its result again:
-                SpawnResult::Spawned(id) => cache.get(db, id),
+                SpawnResult::Spawned(id) => match cache.get(db, id) {
+                    Ok(ready) => Ok(ready),
+                    Err(pending) => {
+                        // yield to the scheduler so that the query has an oppurtunity to execute
+                        futures_lite::future::yield_now().await;
+                        Err(pending)
+                    }
+                },
             };
 
-            let result = pending.await;
+            let result = match pending {
+                Ok(ready) => ready,
+                Err(pending) => pending.await,
+            };
 
             runtime.register_dependency(Dependency {
                 container: cache.path(),
@@ -298,7 +312,7 @@ pub trait DatabaseExt: Database {
 
         match result {
             // the query is pending, so we are done here
-            EvalResult::Pending(_) => {}
+            EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
             EvalResult::Eval(eval) => db.runtime().spawn_query(eval),

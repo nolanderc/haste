@@ -232,7 +232,7 @@ impl<I, O> QueryCell<I, O> {
     /// # Safety
     ///
     /// The caller must ensure that the output value has been written.
-    unsafe fn output_assume_init(&self) -> &O {
+    pub unsafe fn output_assume_init(&self) -> &O {
         (*self.output.get()).assume_init_ref()
     }
 
@@ -255,32 +255,44 @@ impl<I, O> QueryCell<I, O> {
         }
     }
 
-    /// Reserve the query for execution in the given revision.
+    /// Reserve the query for execution in the given revision. If the query is already ready,
+    /// returns the previous value.
     ///
-    /// # Returns
+    /// # Safety
     ///
-    /// `true` if successful, or `false` if the query has been reserved previously.
-    pub fn reserve(&self, revision: Revision) -> bool {
-        if self.state.verified_at.load(Relaxed) == Some(revision) {
+    /// Only the current revision of the database must be given.
+    pub unsafe fn claim(&self, revision: Revision) -> Result<(), Option<&O>> {
+        if self.state.verified_at.load(Acquire) == Some(revision) {
             // the query is already up-to-date
-            return false;
+            return Err(Some(self.output_assume_init()));
         }
 
         let lock = self.state.lock();
 
         // the query was completed while we waited on the lock
-        if self.state.verified_at.load(Relaxed) == Some(revision) {
-            return false;
+        if self.state.verified_at.load(Acquire) == Some(revision) {
+            return Err(Some(self.output_assume_init()));
         }
 
         if (lock.addr & PENDING) != 0 {
             // another thread has reserved the query
-            return false;
+            return Err(None);
         }
 
         lock.unlock_and_set(PENDING);
 
-        true
+        Ok(())
+    }
+
+    /// Release the claim on the query.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have a claim on the query.
+    pub unsafe fn release_claim(&self) {
+        let lock = self.state.lock();
+        debug_assert!((lock.addr & PENDING) != 0);
+        lock.unlock_set_and_clear(0, PENDING);
     }
 
     /// Waits until the output value has been set

@@ -2,8 +2,6 @@
 #![feature(trivial_bounds)]
 #![allow(clippy::uninlined_format_args)]
 
-use std::sync::Arc;
-
 use haste::DatabaseExt;
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
@@ -17,7 +15,7 @@ pub struct Database {
 impl crate::Db for Database {}
 
 #[haste::storage]
-pub struct Storage(Text, fib, Person, cyclic, file, digit_sum);
+pub struct Storage(Text, fib, Person, cyclic, file, digit_sum, product);
 
 #[haste::intern(Text)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -56,14 +54,21 @@ async fn cyclic_cycle(_db: &dyn crate::Db, _cycle: haste::Cycle, _n: u32) -> u32
 
 #[haste::query]
 #[input]
-async fn file(_db: &dyn crate::Db, path: Arc<str>) -> String {
+async fn file(_db: &dyn crate::Db, path: &'static str) -> String {
     panic!("file not found: {:?}", path)
 }
 
 #[haste::query]
-async fn digit_sum(db: &dyn crate::Db, path: Arc<str>) -> u32 {
+async fn digit_sum(db: &dyn crate::Db, path: &'static str) -> u32 {
     let source = file(db, path).await;
     source.bytes().map(|byte| (byte - b'0') as u32).sum()
+}
+
+#[haste::query]
+async fn product(db: &dyn crate::Db, files: [&'static str; 2]) -> u32 {
+    let a = digit_sum(db, files[0]).await;
+    let b = digit_sum(db, files[1]).await;
+    a * b
 }
 
 fn main() {
@@ -71,19 +76,22 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    db.set_input::<file>("foo".into(), "123".into());
+    db.set_input::<file>("foo", "123".into());
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
-            dbg!(file(db, "foo".into()).await);
-            dbg!(digit_sum(db, "foo".into()).await);
+            dbg!(file(db, "foo").await);
+            dbg!(product(db, ["foo", "foo"]).await);
         })
     });
 
-    db.set_input::<file>("foo".into(), "123".into());
+    db.set_input::<file>("foo", "123".into());
+    db.set_input::<file>("bar", "4321".into());
+
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
-            dbg!(file(db, "foo".into()).await);
-            dbg!(digit_sum(db, "foo".into()).await);
+            dbg!(file(db, "foo").await);
+            dbg!(product(db, ["foo", "foo"]).await);
+            dbg!(product(db, ["foo", "bar"]).await);
         })
     });
 

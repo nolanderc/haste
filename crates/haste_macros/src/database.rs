@@ -69,20 +69,20 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
 
                     if let Err(cycle) = result {
                         panic!(
-                            "encountered cycle while recovering from another cycle: {}", 
+                            "encountered cycle while recovering from another cycle: {}",
                             cycle.fmt(self),
                         );
                     }
                 }
 
-                fn last_changed(&self, dep: haste::Dependency) -> Option<haste::Revision> {
-                    haste::StaticDatabase::container(self, dep.container()).last_changed(dep)
+                fn last_changed(&self, dep: haste::Dependency) -> haste::LastChangedFuture {
+                    haste::StaticDatabase::container(self, dep.container()).last_changed(self, dep)
                 }
 
                 /// Format an ingredient
                 fn fmt_index(
-                    &self, 
-                    path: haste::IngredientPath, 
+                    &self,
+                    path: haste::IngredientPath,
                     f: &mut std::fmt::Formatter<'_>
                 ) -> std::fmt::Result {
                     haste::StaticDatabase::container(self, path.container)

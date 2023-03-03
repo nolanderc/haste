@@ -115,6 +115,10 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.input_assume_init()
     }
 
+    pub unsafe fn output_unchecked(&self) -> &OutputSlot<Q> {
+        self.cell.output_assume_init()
+    }
+
     /// # Safety
     ///
     /// The output must be valid in the current revision, or the caller has exclusive access.
@@ -144,8 +148,15 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.backdate(current);
     }
 
-    pub fn try_reserve_for_execution(&self, runtime: &Runtime) -> bool {
-        self.cell.reserve(runtime.current_revision())
+    /// # Safety
+    ///
+    /// The revision must be monotonically increasing
+    pub unsafe fn claim(&self, current: Revision) -> Result<(), Option<&OutputSlot<Q>>> {
+        self.cell.claim(current)
+    }
+
+    pub unsafe fn release_claim(&self) {
+        self.cell.release_claim()
     }
 
     /// Block on the query until it finishes

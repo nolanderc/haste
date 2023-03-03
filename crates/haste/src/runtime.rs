@@ -178,7 +178,7 @@ thread_local! {
 
 pub(crate) struct ExecFuture<'db, Q: Query> {
     db: &'db DatabaseFor<Q>,
-    /// Data associated with the executing task.
+    /// Data associated with the running task.
     task: Option<TaskData>,
     /// The future which drives the query progress.
     inner: ExecFutureInner<'db, Q>,
@@ -308,7 +308,8 @@ impl Runtime {
         waker: &Waker,
         db: &dyn Database,
     ) {
-        eprintln!("{:?} is blocked on {:?}", parent, child);
+        use crate::util::fmt::query;
+        eprintln!("{parent:?} ({:?}) is blocked on {:?}", query(db, parent), query(db, child));
         self.graph.lock().unwrap().insert(parent, child, waker, db);
     }
 

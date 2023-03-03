@@ -100,17 +100,17 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
                 write!(f, #format_string, name, input)
             }
 
-            fn execute(db: &dyn #db_path, input: #input_type) -> Self::Future<'_> {
+            fn execute<'db>(db: &'db dyn #db_path, input: #input_type) -> Self::Future<'db> {
                 Self::#ident(db, #input_spread)
             }
 
             const CYCLE_STRATEGY: haste::CycleStrategy = #cycle_strategy;
 
-            fn recover_cycle(
-                db: &dyn #db_path,
+            fn recover_cycle<'db>(
+                db: &'db dyn #db_path,
                 cycle: haste::Cycle,
                 input: #input_type,
-            ) -> Self::RecoverFuture<'_> {
+            ) -> Self::RecoverFuture<'db> {
                 #cycle_recovery
             }
         }
@@ -125,7 +125,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     let return_type = if args.clone {
         quote! { #output_type }
     } else {
-        quote! { &#output_type }
+        quote! { &'db #output_type }
     };
 
     let clone = if args.clone {
@@ -136,7 +136,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     tokens.extend(quote! {
         #[allow(unused)]
-        #vis async fn #ident(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
+        #vis async fn #ident<'db>(#db_ident: &'db dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
             #clone (haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*)).await)
         }
 
@@ -147,7 +147,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             }
 
             #[allow(unused)]
-            #vis async fn inline(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
+            #vis async fn inline<'db>(#db_ident: &'db dyn #db_path, #(#input_idents: #input_types),*) -> #return_type {
                 #clone (haste::DatabaseExt::execute_inline::<#ident>(#db_ident, (#(#input_idents),*)).await)
             }
         }

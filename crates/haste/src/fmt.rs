@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{util::CallOnDrop, Database, WithStorage};
+use crate::{util::CallOnDrop, Database, LastChangedFuture, WithStorage};
 
 /// A type which allows the inner value to be formatted inside some database.
 pub struct Adapter<'db, T> {
@@ -68,7 +68,7 @@ where
         self.raw.runtime()
     }
 
-    fn last_changed(&self, dep: crate::Dependency) -> Option<crate::Revision> {
+    fn last_changed(&self, dep: crate::Dependency) -> LastChangedFuture {
         self.raw.last_changed(dep)
     }
 
@@ -97,8 +97,11 @@ impl<'db, S> WithStorage<S> for FmtDatabase<'db, S>
 where
     S: crate::Storage + Sync,
 {
-    fn cast_dyn(&self) -> &<S as crate::Storage>::DynDatabase {
-        panic!("cannot cast `FmtDatabase` as another `DynDatabase`")
+    fn cast_dyn(&self) -> &S::DynDatabase {
+        unimplemented!(
+            "cannot cast `FmtDatabase` to the required `{}`",
+            std::any::type_name::<S::DynDatabase>()
+        )
     }
 
     fn storage(&self) -> &S {

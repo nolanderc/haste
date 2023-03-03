@@ -10,7 +10,6 @@ use std::{
 };
 
 use bytemuck::Zeroable;
-use futures_lite::FutureExt;
 use smallvec::SmallVec;
 
 use crate::{AtomicRevision, Cycle, Revision, Runtime};
@@ -131,7 +130,8 @@ impl<I, T> Default for QueryCell<I, T> {
     }
 }
 
-pub type WaitFuture<'a, O: 'a> = impl Future<Output = &'a O> + 'a;
+pub type WaitFuture<'a> = impl Future<Output = ()> + 'a;
+pub type ChangeFuture<'a> = impl Future<Output = Option<Revision>> + 'a;
 
 impl<I, O> QueryCell<I, O> {
     pub fn new() -> Self {
@@ -320,9 +320,15 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Waits until the output value has been set
-    pub fn wait_until_verified(&self, revision: Revision) -> WaitFuture<O> {
-        wait_until_verified_impl(&self.state, &self.output, revision)
+    pub fn wait_until_verified(&self, revision: Revision) -> WaitFuture {
+        self.state.wait(revision)
     }
+
+    /// Waits until the output value has been set
+    pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture {
+        self.state.wait_for_change(revision)
+    }
+
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
         let mut lock = self.state.lock();
@@ -359,22 +365,9 @@ impl<I, O> QueryCell<I, O> {
     }
 }
 
-// we move the implementation of `wait_until_verified` here since we don't want it to capture the
-// `I` parameter.
-fn wait_until_verified_impl<'a, O: 'a>(
-    state: &'a State,
-    output: &'a SyncCell<O>,
-    revision: Revision,
-) -> WaitFuture<'a, O> {
-    let mut pending = state.wait(revision);
-
-    // we cannot use an `async` block here, since they don't implement `Unpin`
-    std::future::poll_fn(move |cx| pending.poll(cx).map(|()| unsafe { output.assume_init() }))
-}
-
 impl State {
     /// Returns a future which completes once the value has been written.
-    fn wait(&self, revision: Revision) -> impl Future<Output = ()> + Unpin + '_ {
+    fn wait(&self, revision: Revision) -> WaitFuture {
         // If we have registered the current task, this is the index in the list of wakers this
         // task's waker occupies.
         let mut registered = None;
@@ -417,6 +410,13 @@ impl State {
 
             std::task::Poll::Pending
         })
+    }
+
+    fn wait_for_change(&self, revision: Revision) -> ChangeFuture {
+        async move {
+            self.wait(revision).await;
+            self.changed_at.load(Relaxed)
+        }
     }
 
     fn lock(&self) -> StateLock<'_> {

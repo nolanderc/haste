@@ -1,7 +1,5 @@
 use std::{future::Future, pin::Pin};
 
-use futures_lite::FutureExt;
-
 use crate::{Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, WithStorage};
 
 /// Stores the containers for all ingredients in a database.
@@ -29,9 +27,10 @@ pub trait Container<DB: ?Sized>: 'static + Sync {
     fn last_changed<'a>(&'a self, db: &'a DB, dep: Dependency) -> LastChangedFuture<'a>;
 }
 
+#[pin_project::pin_project(project = LastChangedProj)]
 pub enum LastChangedFuture<'a> {
     Ready(Option<Revision>),
-    Future(Pin<Box<dyn Future<Output = Option<Revision>> + Send + 'a>>),
+    Pending(#[pin] crate::query_cache::ChangeFuture<'a>),
 }
 
 impl Future for LastChangedFuture<'_> {
@@ -41,9 +40,9 @@ impl Future for LastChangedFuture<'_> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.get_mut() {
-            LastChangedFuture::Ready(ready) => std::task::Poll::Ready(*ready),
-            LastChangedFuture::Future(future) => future.poll(cx),
+        match self.project() {
+            LastChangedProj::Ready(ready) => std::task::Poll::Ready(*ready),
+            LastChangedProj::Pending(future) => future.poll(cx),
         }
     }
 }

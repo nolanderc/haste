@@ -5,9 +5,13 @@ use crate::{
     Cycle, Dependency, ExecutionResult, Id, Query, Revision, Runtime,
 };
 
+use std::future::Future;
+
 use self::cell::QueryCell;
 
-pub type WaitFuture<'a, Q> = self::cell::WaitFuture<'a, OutputSlot<Q>>;
+pub use self::cell::ChangeFuture;
+
+pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>>;
 
 pub struct QueryStorage<Q: Query> {
     /// Stores data about every query.
@@ -18,6 +22,7 @@ pub struct QueryStorage<Q: Query> {
     dependencies: AppendArena<Dependency>,
 
     current_revision: Option<Revision>,
+    last_revision: Option<Revision>,
 }
 
 impl<Q: Query> Default for QueryStorage<Q> {
@@ -26,18 +31,29 @@ impl<Q: Query> Default for QueryStorage<Q> {
             slots: Default::default(),
             dependencies: Default::default(),
             current_revision: None,
+            last_revision: None,
         }
     }
 }
 
 impl<Q: Query> QueryStorage<Q> {
     pub fn set_current_revision(&mut self, revision: Option<Revision>) {
+        if let Some(current) = self.current_revision {
+            self.last_revision = Some(current);
+        }
+
         match revision {
             None => self.current_revision = None,
             Some(new) => {
-                if self.current_revision.is_some() {
-                    panic!("only one revision may be active at the same time");
-                }
+                assert!(
+                    self.current_revision.is_none(),
+                    "only one revision may be active at the same time"
+                );
+                assert!(
+                    revision >= self.last_revision,
+                    "the revision number must not decrease"
+                );
+
                 self.current_revision = Some(new);
             }
         }
@@ -159,8 +175,11 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_verified(&self, current: Revision) -> WaitFuture<'_, Q> {
-        self.cell.wait_until_verified(current)
+    pub fn wait_until_verified(&self, current: Revision) -> WaitFuture<Q> {
+        async move {
+            self.cell.wait_until_verified(current).await;
+            unsafe { self.cell.output_assume_init() }
+        }
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -193,6 +212,10 @@ impl<Q: Query> QuerySlot<Q> {
 
     pub fn set_verified(&mut self, current: Revision) {
         self.cell.set_verified(current)
+    }
+
+    pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture<'_> {
+        self.cell.wait_for_change(revision)
     }
 }
 

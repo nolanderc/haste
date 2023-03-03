@@ -77,21 +77,26 @@ fn main() {
     let start = std::time::Instant::now();
 
     db.set_input::<file>("foo", "123".into());
+    db.set_input::<file>("bar", "1234".into());
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
             dbg!(file(db, "foo").await);
+            dbg!(file(db, "bar").await);
             dbg!(product(db, ["foo", "foo"]).await);
+            dbg!(product(db, ["foo", "bar"]).await);
+            dbg!(product(db, ["bar", "bar"]).await);
         })
     });
 
-    db.set_input::<file>("foo", "123".into());
-    db.set_input::<file>("bar", "4321".into());
+    db.set_input::<file>("foo", "234".into());
 
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
             dbg!(file(db, "foo").await);
+            dbg!(file(db, "bar").await);
             dbg!(product(db, ["foo", "foo"]).await);
             dbg!(product(db, ["foo", "bar"]).await);
+            dbg!(product(db, ["bar", "bar"]).await);
         })
     });
 

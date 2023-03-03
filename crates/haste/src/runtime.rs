@@ -7,7 +7,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     task::{Poll, Waker},
@@ -43,11 +43,16 @@ impl Runtime {
     pub fn update_input(&mut self, changed_at: Option<Revision>) -> Revision {
         self.revisions.push_update(changed_at)
     }
+
+    pub fn earliest_change_since(&self, revision: Revision) -> Revision {
+        self.revisions.earliest_change_since(revision)
+    }
 }
 
 pub struct ExecutionResult<O> {
     pub output: O,
     pub dependencies: Vec<Dependency>,
+    pub latest_dependency: Option<Revision>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,6 +145,9 @@ struct TaskData {
 
     /// List of all direct dependencies of this task
     dependencies: Vec<Dependency>,
+
+    /// The most recent revision of any of the task's transitive dependencies.
+    latest_dependency: Option<Revision>,
 }
 
 impl TaskData {
@@ -147,6 +155,7 @@ impl TaskData {
         Self {
             this,
             dependencies: Vec::new(),
+            latest_dependency: None,
         }
     }
 }
@@ -192,10 +201,6 @@ enum ExecFutureInner<'a, Q: Query> {
 }
 
 impl<'db, Q: Query> ExecFuture<'db, Q> {
-    pub fn database(&self) -> &'db DatabaseFor<Q> {
-        self.db
-    }
-
     pub fn recover(self: Pin<&mut Self>, cycle: Cycle, input: &Q::Input) {
         let recovery = Q::recover_cycle(self.db, cycle, input.clone());
         unsafe {
@@ -263,11 +268,12 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
             // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
 
-            let dependencies = this.task.take().unwrap().dependencies;
+            let data = this.task.take().unwrap();
 
             Poll::Ready(ExecutionResult {
                 output,
-                dependencies,
+                dependencies: data.dependencies,
+                latest_dependency: data.latest_dependency,
             })
         })
     }
@@ -289,10 +295,11 @@ impl Runtime {
     }
 
     /// Register a dependency under the currently running query
-    pub(crate) fn register_dependency(&self, dependency: Dependency) {
+    pub(crate) fn register_dependency(&self, dependency: Dependency, revision: Option<Revision>) {
         ACTIVE.with(|active| {
             let Some(mut task) = active.task.take() else { return };
             task.dependencies.push(dependency);
+            task.latest_dependency = std::cmp::max(task.latest_dependency, revision);
             active.task.set(Some(task));
         })
     }
@@ -309,7 +316,11 @@ impl Runtime {
         db: &dyn Database,
     ) {
         use crate::util::fmt::query;
-        eprintln!("{parent:?} ({:?}) is blocked on {:?}", query(db, parent), query(db, child));
+        eprintln!(
+            "{parent:?} ({:?}) is blocked on {:?}",
+            query(db, parent),
+            query(db, child)
+        );
         self.graph.lock().unwrap().insert(parent, child, waker, db);
     }
 
@@ -346,13 +357,6 @@ impl Runtime {
     }
 }
 
-/// There may only be one active runtime. This keeps track of what runtime that is.
-///
-/// # Safety
-///
-/// This pointer should only be used for identity comparisons. Dereferincing is forbidden.
-static ACTIVE_RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
-
 impl Runtime {
     /// Enter a new scope, allowing tasks to be spawned into it. If the return value is `true`,
     /// the caller is responsible for exiting the scope.
@@ -361,29 +365,12 @@ impl Runtime {
     ///
     /// The caller must ensure that a successful call to `enter` is followed by a matching call to
     /// `exit` before any further use of the associated database.
-    pub(crate) unsafe fn enter(&mut self) -> bool {
-        use Ordering::Relaxed;
-
-        match ACTIVE_RUNTIME.compare_exchange(std::ptr::null_mut(), self, Relaxed, Relaxed) {
-            Ok(_) => {
-                self.scheduler.start();
-                true
-            }
-
-            // this runtime was already active, so we are done:
-            Err(old) if old == self => false,
-
-            Err(_) => panic!("only one runtime can be in scope at once"),
-        }
+    pub(crate) unsafe fn enter(&mut self) {
+        assert!(self.scheduler.start(), "could not start runtime scheduler");
     }
 
-    pub(crate) fn exit(&mut self) {
+    pub(crate) fn exit(&self) {
         // cancel all running tasks and wait for shutdown
-        let active = ACTIVE_RUNTIME.load(Ordering::Relaxed);
-        assert!(active == self, "can only exit the currently active runtime");
-
         self.scheduler.shutdown();
-
-        ACTIVE_RUNTIME.store(std::ptr::null_mut(), Ordering::Relaxed);
     }
 }

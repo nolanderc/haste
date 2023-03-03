@@ -11,6 +11,9 @@ pub trait Storage {
 
     /// Initialize the storage within some database.
     fn new<DB: WithStorage<Self>>(router: &mut StorageRouter<DB>) -> Self;
+
+    fn begin(&mut self, current: Revision);
+    fn end(&mut self);
 }
 
 /// Stores the data requried by a single ingredient
@@ -45,8 +48,15 @@ impl Future for LastChangedFuture<'_> {
     }
 }
 
-pub trait MakeContainer {
+pub trait StaticContainer {
     fn new(path: ContainerPath) -> Self;
+
+    /// Called at the start of a new revision
+    #[allow(unused_variables)]
+    fn begin(&mut self, current: Revision) {}
+
+    /// Called at the end of a revision
+    fn end(&mut self) {}
 }
 
 /// Identifies a single container in a database
@@ -116,6 +126,9 @@ pub trait StorageList<DB> {
         Self: Sized;
 
     fn get_mut<T: 'static>(&mut self) -> Option<&mut T>;
+
+    fn begin(&mut self, current: Revision);
+    fn end(&mut self);
 }
 
 pub struct StorageRouter<DB: ?Sized> {
@@ -161,6 +174,16 @@ macro_rules! impl_tuple {
                 )*
 
                 None
+            }
+
+            fn begin(&mut self, current: Revision) {
+                let ($($T,)*) = self;
+                $( $T.begin(current); )*
+            }
+
+            fn end(&mut self) {
+                let ($($T,)*) = self;
+                $( $T.end(); )*
             }
         }
     };

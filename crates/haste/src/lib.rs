@@ -22,6 +22,7 @@ pub use storage::*;
 pub mod non_max;
 
 use non_max::NonMaxU32;
+use util::CallOnDrop;
 
 /// A generic value that uniquely identifies a resource within some ingredient.
 ///
@@ -94,7 +95,7 @@ pub trait Ingredient: 'static {
     type Storage: Storage + HasIngredient<Self>;
 
     /// Type which contains all information required by the ingredient.
-    type Container: MakeContainer;
+    type Container: StaticContainer;
 }
 
 /// The database required by some database
@@ -124,12 +125,22 @@ pub trait Query: Ingredient {
     type Future<'db>: Future<Output = Self::Output> + Send;
     type RecoverFuture<'db>: Future<Output = Self::Output> + Send;
 
+    /// Determines if this is an input query.
+    ///
+    /// Input queries may not invoke other queries, but can be set from outside the database.
+    const IS_INPUT: bool = false;
+
+    /// Emit a human-readable version of the query.
     fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
+    /// Execute the query with the given input.
     fn execute(db: &DatabaseFor<Self>, input: Self::Input) -> Self::Future<'_>;
 
-    const CYCLE_STRATEGY: CycleStrategy;
+    /// Determines how the query should handle dependency cycles.
+    const CYCLE_STRATEGY: CycleStrategy = CycleStrategy::Panic;
 
+    /// If the query can recover from cycles, this is called when a cycle is discovered, and makes
+    /// it possible to handle them gracefully without panicking.
     fn recover_cycle(
         db: &DatabaseFor<Self>,
         cycle: Cycle,
@@ -149,7 +160,7 @@ pub trait Query: Ingredient {
 pub trait Input: Query {}
 
 /// A container that stores values (elements) which are accessed by an ID.
-pub trait ElementContainer: MakeContainer {
+pub trait ElementContainer: StaticContainer {
     type Value: ?Sized;
 
     type Ref<'a>: std::ops::Deref<Target = Self::Value>
@@ -223,11 +234,14 @@ pub trait DatabaseExt: Database {
                 EvalResult::Cached(cached) => cached,
             };
 
-            runtime.register_dependency(Dependency {
-                container: cache.path(),
-                resource: output.id,
-                extra: 0,
-            });
+            runtime.register_dependency(
+                Dependency {
+                    container: cache.path(),
+                    resource: output.id,
+                    extra: 0,
+                },
+                output.slot.latest_dependency,
+            );
 
             &output.slot.output
         }
@@ -284,11 +298,14 @@ pub trait DatabaseExt: Database {
                 Err(pending) => pending.await,
             };
 
-            runtime.register_dependency(Dependency {
-                container: cache.path(),
-                resource: result.id,
-                extra: 0,
-            });
+            runtime.register_dependency(
+                Dependency {
+                    container: cache.path(),
+                    resource: result.id,
+                    extra: 0,
+                },
+                result.slot.latest_dependency,
+            );
 
             &result.slot.output
         }
@@ -327,6 +344,8 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: StaticDatabase + WithStorage<Q::Storage>,
     {
+        assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
+
         let storage = self.storage_mut();
         let cache = storage
             .list
@@ -376,11 +395,14 @@ pub trait DatabaseExt: Database {
 
         let id = handle.id();
         let value = container.get_untracked(id);
-        runtime.register_dependency(Dependency {
-            container: container.path(),
-            resource: id,
-            extra: 0,
-        });
+        runtime.register_dependency(
+            Dependency {
+                container: container.path(),
+                resource: id,
+                extra: 0,
+            },
+            None,
+        );
         value
     }
 
@@ -399,25 +421,25 @@ impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
 pub fn scope<DB, F, T>(db: &mut DB, f: F) -> T
 where
     F: FnOnce(Scope<'_>, &DB) -> T,
-    DB: StaticDatabase + Sized,
+    DB: StaticDatabase + Sized + 'static,
 {
-    let entered = unsafe { db.storage_mut().runtime.enter() };
+    let storage = db.storage_mut();
 
-    let scope = Scope {
-        runtime: db.runtime(),
+    unsafe { storage.runtime.enter() };
+    let current = storage.runtime.current_revision();
+    storage.list_mut().begin(current);
+
+    let runtime = db.runtime();
+
+    let result = {
+        let _guard = CallOnDrop(|| runtime.exit());
+        let scope = Scope { runtime };
+        f(scope, db)
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(scope, db)));
+    db.storage_mut().list_mut().end();
 
-    if entered {
-        // we were the ones responsible for calling `enter`, so we must also `exit`
-        db.storage_mut().runtime.exit();
-    }
-
-    match result {
-        Ok(output) => output,
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
+    result
 }
 
 pub struct Scope<'a> {

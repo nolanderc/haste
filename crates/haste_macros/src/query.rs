@@ -76,6 +76,8 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         Some(recovery_fn) => quote! { #recovery_fn(db, cycle, #input_spread) },
     };
 
+    let is_input = args.input;
+
     tokens.extend(quote! {
         #[allow(non_camel_case_types)]
         #vis enum #ident {}
@@ -94,6 +96,8 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             type Output = #output_type;
             type Future<'db> = impl std::future::Future<Output = Self::Output> + 'db;
             type RecoverFuture<'db> = impl std::future::Future<Output = Self::Output> + 'db;
+
+            const IS_INPUT: bool = #is_input;
 
             fn fmt(input: &Self::Input, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 let name = std::any::type_name::<Self>();
@@ -116,7 +120,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         }
     });
 
-    if args.input {
+    if is_input {
         tokens.extend(quote! {
             impl haste::Input for #ident {}
         });

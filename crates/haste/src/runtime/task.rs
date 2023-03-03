@@ -32,7 +32,7 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             injector: Injector::new(),
-            state: AtomicU32::new(RUNNING),
+            state: AtomicU32::new(0),
             workers: Mutex::new(WorkerState { count: 0 }),
             idle_condition: Condvar::new(),
         }
@@ -50,7 +50,7 @@ impl Scheduler {
                 self.resume_workers(workers);
                 true
             }
-            Err(old) => Self::is(old, RUNNING),
+            Err(_) => false,
         }
     }
 
@@ -110,7 +110,7 @@ impl Scheduler {
         self.add_worker();
 
         let _guard = CallOnDrop(|| {
-            // schedule all the local tasks on another queue
+            // reschedule all the local tasks on another queue
             while let Some(task) = worker.pop() {
                 self.schedule(task);
             }
@@ -131,8 +131,12 @@ impl Scheduler {
         }
     }
 
-    #[inline(never)]
     pub fn spawn(self: &Arc<Scheduler>, task: Box<dyn QueryTask + Send>) {
+        assert!(
+            self.state.load(Relaxed) == RUNNING,
+            "attempted to spawn task in scheduler which is not running"
+        );
+
         let task = RawTask::new(task, Arc::downgrade(self));
         self.schedule(task);
     }

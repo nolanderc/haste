@@ -1,13 +1,13 @@
 mod cell;
 
-use std::future::Future;
-
 use crate::{
     arena::{AppendArena, RawArena},
-    Cycle, Dependency, Id, Query, Revision, Runtime,
+    Cycle, Dependency, ExecutionResult, Id, Query, Revision, Runtime,
 };
 
 use self::cell::QueryCell;
+
+pub type WaitFuture<'a, Q> = self::cell::WaitFuture<'a, OutputSlot<Q>>;
 
 pub struct QueryStorage<Q: Query> {
     /// Stores data about every query.
@@ -16,6 +16,8 @@ pub struct QueryStorage<Q: Query> {
     /// Stores the dependencies for all the queries. These are referenced by ranges in the
     /// `OutputSlot`.
     dependencies: AppendArena<Dependency>,
+
+    current_revision: Option<Revision>,
 }
 
 impl<Q: Query> Default for QueryStorage<Q> {
@@ -23,19 +25,35 @@ impl<Q: Query> Default for QueryStorage<Q> {
         Self {
             slots: Default::default(),
             dependencies: Default::default(),
+            current_revision: None,
         }
     }
 }
 
 impl<Q: Query> QueryStorage<Q> {
+    pub fn set_current_revision(&mut self, revision: Option<Revision>) {
+        match revision {
+            None => self.current_revision = None,
+            Some(new) => {
+                if self.current_revision.is_some() {
+                    panic!("only one revision may be active at the same time");
+                }
+                self.current_revision = Some(new);
+            }
+        }
+    }
+
+    pub fn current_revision(&self) -> Revision {
+        self.current_revision.expect(concat!(
+            "the database has not entered a revision",
+            "\nhelp: call `haste::scope` to start a new revision"
+        ))
+    }
+
     /// Record the result of a new query.
-    pub(crate) fn create_output(
-        &self,
-        output: Q::Output,
-        dependencies: &[Dependency],
-    ) -> OutputSlot<Q> {
+    pub(crate) fn create_output(&self, result: ExecutionResult<Q::Output>) -> OutputSlot<Q> {
         let dependencies = {
-            let range = self.dependencies.extend_from_slice(dependencies);
+            let range = self.dependencies.extend_from_slice(&result.dependencies);
             let end = u32::try_from(range.end).unwrap();
             let start = range.start as u32;
             start..end
@@ -43,8 +61,9 @@ impl<Q: Query> QueryStorage<Q> {
 
         // TODO: compute the correct revisions
         OutputSlot {
-            output,
+            output: result.output,
             dependencies,
+            latest_dependency: result.latest_dependency,
         }
     }
 
@@ -100,9 +119,11 @@ pub struct OutputSlot<Q: Query> {
 
     /// The output from a query.
     pub output: Q::Output,
-}
 
-pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>> + 'a;
+    /// Over all the transitive dependencies of this query: the latest revision where one of them
+    /// changed.
+    pub latest_dependency: Option<Revision>,
+}
 
 impl<Q: Query> QuerySlot<Q> {
     pub fn input(&self) -> &Q::Input {
@@ -119,70 +140,47 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.output_assume_init()
     }
 
-    /// # Safety
-    ///
-    /// The output must be valid in the current revision, or the caller has exclusive access.
-    pub unsafe fn get_output(&self) -> Option<&OutputSlot<Q>> {
-        self.cell.get_output()
-    }
-
     pub fn get_output_mut(&mut self) -> Option<&mut OutputSlot<Q>> {
         self.cell.get_output_mut()
     }
 
-    /// Write a new output for the given revision, making it accessible to other threads
-    ///
     /// # Safety
     ///
-    /// The output value must *not* have been written and no other thread must read/write to the output.
-    pub unsafe fn finish(&self, output: OutputSlot<Q>, revision: Revision) -> &OutputSlot<Q> {
-        self.cell.write_output(output, revision)
-    }
-
-    /// Verify the slot for the given revision, making it accessible to other threads
-    ///
-    /// # Safety
-    ///
-    /// The output value must have been written and no other thread may write to the output.
-    pub unsafe fn backdate(&self, current: Revision) {
-        self.cell.backdate(current);
-    }
-
-    /// # Safety
-    ///
-    /// The revision must be monotonically increasing
-    pub unsafe fn claim(&self, current: Revision) -> Result<(), Option<&OutputSlot<Q>>> {
-        self.cell.claim(current)
-    }
-
-    pub unsafe fn release_claim(&self) {
-        self.cell.release_claim()
+    /// The slot must have an input value and the revision must be monotonically increasing.
+    pub unsafe fn claim(
+        &self,
+        revision: Revision,
+    ) -> Result<ClaimedSlot<'_, Q>, Option<&OutputSlot<Q>>> {
+        self.cell.claim(revision)?;
+        Ok(ClaimedSlot {
+            slot: self,
+            revision,
+        })
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_verified(&self, runtime: &Runtime) -> WaitFuture<'_, Q> {
-        self.cell.wait_until_verified(runtime.current_revision())
+    pub fn wait_until_verified(&self, current: Revision) -> WaitFuture<'_, Q> {
+        self.cell.wait_until_verified(current)
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
         self.cell.set_cycle(cycle)
     }
 
-    pub fn take_cycle(&self) -> Option<Cycle> {
-        self.cell.take_cycle()
-    }
-
     pub fn set_output(&mut self, output: Q::Output, runtime: &mut Runtime)
     where
         Q: crate::Input,
     {
-        self.cell.set_output(
+        let current = self.cell.set_output(
             OutputSlot {
                 output,
                 dependencies: 0..0,
+                latest_dependency: None,
             },
             runtime,
         );
+
+        self.cell.get_output_mut().unwrap().latest_dependency = Some(current);
     }
 
     pub fn last_verified(&self) -> Option<Revision> {
@@ -191,5 +189,70 @@ impl<Q: Query> QuerySlot<Q> {
 
     pub fn last_changed(&self) -> Option<Revision> {
         self.cell.last_changed()
+    }
+
+    pub fn set_verified(&mut self, current: Revision) {
+        self.cell.set_verified(current)
+    }
+}
+
+pub struct ClaimedSlot<'a, Q: Query> {
+    slot: &'a QuerySlot<Q>,
+    revision: Revision,
+}
+
+impl<Q: Query> Drop for ClaimedSlot<'_, Q> {
+    fn drop(&mut self) {
+        unsafe { self.slot.cell.release_claim() }
+    }
+}
+
+impl<'a, Q: Query> ClaimedSlot<'a, Q> {
+    pub fn current_revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub fn input(&self) -> &Q::Input {
+        // SAFETY: the input slot must be initialized when calling [`QuerySlot::claim`]
+        unsafe { self.slot.input_unchecked() }
+    }
+
+    pub fn take_cycle(&self) -> Option<Cycle> {
+        self.slot.cell.take_cycle()
+    }
+
+    /// Write a new output for the given revision, releasing the claim.
+    pub fn finish(self, output: OutputSlot<Q>) -> &'a OutputSlot<Q> {
+        let output = unsafe { self.slot.cell.write_output(output, self.revision) };
+
+        // don't release the claim twice:
+        std::mem::forget(self);
+
+        output
+    }
+
+    /// Signals that the previous output is still valid in the current revision.
+    pub fn backdate(self) -> &'a OutputSlot<Q> {
+        unsafe {
+            // SAFETY: we have a claim on the query and use the same revision
+            self.slot.cell.backdate(self.revision);
+
+            // SAFETY: we managed to backdate the value, so the output is initialized.
+            let output = self.slot.output_unchecked();
+
+            // don't release the claim twice:
+            std::mem::forget(self);
+
+            output
+        }
+    }
+
+    pub fn get_output(&self) -> Option<&OutputSlot<Q>> {
+        // SAFETY: we have a claim on the query
+        unsafe { self.slot.cell.get_output() }
+    }
+
+    pub fn last_verified(&self) -> Option<Revision> {
+        self.slot.cell.last_verified()
     }
 }

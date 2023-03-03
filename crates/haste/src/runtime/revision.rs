@@ -88,8 +88,8 @@ impl RevisionHistory {
     /// revisions `rev+1, rev+2, ..`.
     ///
     /// Time complexity: `O(log n)`
-    pub fn earliest_change_since(&self, rev: Revision) -> Option<Revision> {
-        Revision::new(self.history.min_since(rev.0.get() as usize)?)
+    pub fn earliest_change_since(&self, rev: Revision) -> Revision {
+        Revision::new(self.history.min_since(rev.0.get() as usize).unwrap()).unwrap()
     }
 }
 

@@ -13,7 +13,7 @@ pub struct ArenaInterner<T> {
     entries: ShardMap<NonMaxU32>,
 }
 
-impl<T: Send + Sync + 'static> crate::MakeContainer for ArenaInterner<T> {
+impl<T: Send + Sync + 'static> crate::StaticContainer for ArenaInterner<T> {
     fn new(path: ContainerPath) -> Self {
         Self {
             path,
@@ -211,7 +211,7 @@ impl InlineString {
     }
 }
 
-impl crate::MakeContainer for StringInterner {
+impl crate::StaticContainer for StringInterner {
     fn new(path: ContainerPath) -> Self {
         Self {
             path,

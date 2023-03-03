@@ -146,12 +146,14 @@ where
         let slot = self.storage.slot(id);
         let current = self.storage.current_revision();
 
-        if slot.last_verified() == Some(current) {
-            let slot = unsafe { slot.output_unchecked() };
-            return Ok(QueryResult { id, slot });
-        }
+        unsafe {
+            if let Some(slot) = slot.try_get(current) {
+                return Ok(QueryResult { id, slot });
+            }
 
-        Err(wait_until_finished(db, slot, current, self.ingredient(id)))
+            let path = self.ingredient(id);
+            Err(wait_until_finished(db, slot, current, path))
+        }
     }
 
     fn set(&mut self, runtime: &mut Runtime, input: Q::Input, output: Q::Output)
@@ -197,7 +199,10 @@ pub enum EvalResult<'a, Q: Query> {
     Eval(QueryCacheTask<'a, Q>),
 }
 
-fn wait_until_finished<'a, Q: Query>(
+/// # Safety
+///
+/// Only the current revision of the database must be used.
+unsafe fn wait_until_finished<'a, Q: Query>(
     db: &'a DatabaseFor<Q>,
     slot: &'a QuerySlot<Q>,
     revision: Revision,
@@ -289,7 +294,8 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
                 // the query is executed elsewhere: await its result
                 let path = self.ingredient(id);
                 let current = self.storage.current_revision();
-                EvalResult::Pending(wait_until_finished(db, slot, current, path))
+                let pending = unsafe { wait_until_finished(db, slot, current, path) };
+                EvalResult::Pending(pending)
             }
             Err(Some(slot)) => EvalResult::Cached(QueryResult { id, slot }),
         }
@@ -305,7 +311,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         QueryCacheTask {
             state: TaskState::Verify {
                 db,
-                this,
+                path: this,
                 storage: &self.storage,
                 future: verify::verify(db.as_dyn(), &self.storage, slot),
             },
@@ -320,18 +326,22 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
     }
 }
 
+#[pin_project::pin_project]
 pub struct QueryCacheTask<'a, Q: Query> {
+    #[pin]
     state: TaskState<'a, Q>,
 }
 
+#[pin_project::pin_project(project = TaskStateProj)]
 enum TaskState<'a, Q: Query> {
     Verify {
         db: &'a DatabaseFor<Q>,
         storage: &'a QueryStorage<Q>,
-        this: IngredientPath,
+        path: IngredientPath,
+        #[pin]
         future: verify::VerifyFuture<'a, Q>,
     },
-    Exec(ExecTaskFuture<'a, Q>),
+    Exec(#[pin] ExecTaskFuture<'a, Q>),
 }
 
 impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
@@ -341,7 +351,7 @@ impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
 
     fn path(&self) -> IngredientPath {
         match &self.state {
-            TaskState::Verify { this, .. } => *this,
+            TaskState::Verify { path, .. } => *path,
             TaskState::Exec(future) => future.inner.query(),
         }
     }
@@ -351,37 +361,31 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
     type Output = QueryResult<'a, Q>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let selff = unsafe { self.get_unchecked_mut() };
+        let mut this = self.project();
         loop {
-            match &mut selff.state {
-                TaskState::Verify {
+            match this.state.as_mut().project() {
+                TaskStateProj::Verify {
                     future,
-                    this,
+                    path,
                     db,
                     storage,
-                    ..
-                } => {
-                    let future = unsafe { Pin::new_unchecked(future) };
-                    match std::task::ready!(Future::poll(future, cx)) {
-                        Ok(slot) => {
-                            let id = this.resource;
-                            break Poll::Ready(QueryResult { id, slot });
-                        }
-                        Err(slot) => {
-                            let input = slot.input().clone();
-                            let inner = db.runtime().execute_query(*db, input, *this);
-                            selff.state = TaskState::Exec(ExecTaskFuture {
-                                storage,
-                                slot: Some(slot),
-                                inner,
-                            })
-                        }
+                } => match std::task::ready!(Future::poll(future, cx)) {
+                    Ok(slot) => {
+                        let id = path.resource;
+                        break Poll::Ready(QueryResult { id, slot });
                     }
-                }
-                TaskState::Exec(future) => {
-                    let future = unsafe { Pin::new_unchecked(future) };
-                    break Future::poll(future, cx);
-                }
+                    Err(slot) => {
+                        let input = slot.input().clone();
+                        let inner = db.runtime().execute_query(*db, input, *path);
+                        let next = TaskState::Exec(ExecTaskFuture {
+                            storage,
+                            slot: Some(slot),
+                            inner,
+                        });
+                        this.state.set(next);
+                    }
+                },
+                TaskStateProj::Exec(future) => break Future::poll(future, cx),
             }
         }
     }

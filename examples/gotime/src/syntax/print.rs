@@ -37,14 +37,19 @@ impl<W> PrettyWriter<W> {
 
 impl<W: Write> PrettyWriter<W> {
     fn write_indent(&mut self) -> std::fmt::Result {
-        static SPACES: [u8; 256] = [b' '; 256];
+        static SPACES: &str = match std::str::from_utf8(&[b' '; 256]) {
+            Ok(text) => text,
+            Err(_) => unreachable!(),
+        };
+
         let mut count = self.indent;
         while count > 0 {
             let now = count.min(SPACES.len());
-            let spaces = unsafe { std::str::from_utf8_unchecked(&SPACES[..now]) };
+            let spaces = &SPACES[..now];
             self.writer.write_str(spaces)?;
             count -= now;
         }
+
         Ok(())
     }
 }

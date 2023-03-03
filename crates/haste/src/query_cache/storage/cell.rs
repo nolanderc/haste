@@ -277,6 +277,17 @@ impl<I, O> QueryCell<I, O> {
         }
     }
 
+    /// # Safety
+    ///
+    /// Only the current revision of the database must be given.
+    pub unsafe fn try_get_output(&self, current: Revision) -> Option<&O> {
+        if self.state.verified_at.load(Acquire) == Some(current) {
+            Some(self.output_assume_init())
+        } else {
+            None
+        }
+    }
+
     /// Reserve the query for execution in the given revision. If the query is already ready,
     /// returns the previous value.
     ///
@@ -328,7 +339,6 @@ impl<I, O> QueryCell<I, O> {
     pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture {
         self.state.wait_for_change(revision)
     }
-
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
         let mut lock = self.state.lock();

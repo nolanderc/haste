@@ -175,7 +175,11 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     /// Block on the query until it finishes
-    pub fn wait_until_verified(&self, current: Revision) -> WaitFuture<Q> {
+    ///
+    /// # Safety
+    ///
+    /// Only the current revision of the database must be used.
+    pub unsafe fn wait_until_verified(&self, current: Revision) -> WaitFuture<Q> {
         async move {
             self.cell.wait_until_verified(current).await;
             unsafe { self.cell.output_assume_init() }
@@ -216,6 +220,10 @@ impl<Q: Query> QuerySlot<Q> {
 
     pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture<'_> {
         self.cell.wait_for_change(revision)
+    }
+
+    pub unsafe fn try_get(&self, current: Revision) -> Option<&OutputSlot<Q>> {
+        self.cell.try_get_output(current)
     }
 }
 

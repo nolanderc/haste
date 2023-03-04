@@ -8,6 +8,8 @@ use std::{
     },
 };
 
+use crate::Durability;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Revision(NonZeroU32);
 
@@ -57,18 +59,22 @@ impl AtomicRevision {
 }
 
 pub struct RevisionHistory {
-    history: MinHistory,
+    histories: [MinHistory; Durability::LEVELS],
 }
 
 impl RevisionHistory {
     pub fn new() -> Self {
-        let mut history = MinHistory::new();
-        history.push(1);
-        Self { history }
+        Self {
+            histories: std::array::from_fn(|_| {
+                let mut history = MinHistory::new();
+                history.push(1);
+                history
+            }),
+        }
     }
 
     pub fn current(&self) -> Revision {
-        let index = self.history.len() as u32;
+        let index = self.histories[0].len() as u32;
         Revision(unsafe { NonZeroU32::new_unchecked(index) })
     }
 
@@ -77,10 +83,22 @@ impl RevisionHistory {
     /// input.
     ///
     /// Time complexity: `O(log n)`
-    pub fn push_update(&mut self, last_changed: Option<Revision>) -> Revision {
-        let new = Revision::new(self.history.len() as u32 + 1).unwrap();
-        let revision = last_changed.unwrap_or(new);
-        self.history.push(revision.0.get());
+    pub fn push_update(
+        &mut self,
+        last_changed: Option<Revision>,
+        durability: Durability,
+    ) -> Revision {
+        let new = Revision::new(self.histories[0].len() as u32 + 1).unwrap();
+
+        for (i, history) in self.histories.iter_mut().enumerate() {
+            let revision = if i <= durability.index() {
+                last_changed.unwrap_or(new)
+            } else {
+                new
+            };
+            history.push(revision.0.get());
+        }
+
         new
     }
 
@@ -88,8 +106,10 @@ impl RevisionHistory {
     /// revisions `rev+1, rev+2, ..`.
     ///
     /// Time complexity: `O(log n)`
-    pub fn earliest_change_since(&self, rev: Revision) -> Revision {
-        Revision::new(self.history.min_since(rev.0.get() as usize).unwrap()).unwrap()
+    pub fn earliest_change_since(&self, rev: Revision, durability: Durability) -> Revision {
+        let history = &self.histories[durability.index()];
+        let minimum = history.min_since(rev.0.get() as usize).unwrap();
+        Revision::new(minimum).unwrap()
     }
 }
 

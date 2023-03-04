@@ -3,6 +3,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 mod arena;
+mod durability;
 pub mod fmt;
 mod input;
 pub mod interner;
@@ -14,6 +15,7 @@ pub mod util;
 
 use std::future::Future;
 
+pub use durability::*;
 pub use haste_macros::*;
 pub use query_cache::*;
 pub use runtime::*;
@@ -57,7 +59,7 @@ pub trait Database: Sync {
     fn set_cycle(&self, path: IngredientPath, cycle: Cycle);
 
     /// Given an ingredient, return the revision in which its value was last changed.
-    fn last_changed(&self, dep: Dependency) -> LastChangedFuture;
+    fn last_change(&self, dep: Dependency) -> LastChangeFuture;
 
     /// Format an ingredient
     fn fmt_index(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
@@ -228,7 +230,7 @@ pub trait DatabaseExt: Database {
         let future = cache.get_or_evaluate(db, input);
 
         async move {
-            let output = match future {
+            let result = match future {
                 EvalResult::Eval(eval) => eval.await,
                 EvalResult::Pending(pending) => pending.await,
                 EvalResult::Cached(cached) => cached,
@@ -237,13 +239,13 @@ pub trait DatabaseExt: Database {
             runtime.register_dependency(
                 Dependency {
                     container: cache.path(),
-                    resource: output.id,
+                    resource: result.id,
                     extra: 0,
                 },
-                output.slot.latest_dependency,
+                result.slot.transitive,
             );
 
-            &output.slot.output
+            &result.slot.output
         }
     }
 
@@ -304,7 +306,7 @@ pub trait DatabaseExt: Database {
                     resource: result.id,
                     extra: 0,
                 },
-                result.slot.latest_dependency,
+                result.slot.transitive,
             );
 
             &result.slot.output
@@ -337,7 +339,7 @@ pub trait DatabaseExt: Database {
     }
 
     /// Set the value of an input
-    fn set_input<'db, Q>(&'db mut self, input: Q::Input, output: Q::Output)
+    fn set_input<'db, Q>(&'db mut self, input: Q::Input, output: Q::Output, durability: Durability)
     where
         Q: Input,
         Q::Storage: 'static,
@@ -352,7 +354,7 @@ pub trait DatabaseExt: Database {
             .get_mut::<Q::Storage>()
             .unwrap()
             .container_mut();
-        cache.set(&mut storage.runtime, input, output);
+        cache.set(&mut storage.runtime, input, output, durability);
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T
@@ -401,7 +403,7 @@ pub trait DatabaseExt: Database {
                 resource: id,
                 extra: 0,
             },
-            None,
+            TransitiveDependencies::CONSTANT,
         );
         value
     }

@@ -1,6 +1,9 @@
 use std::{future::Future, pin::Pin};
 
-use crate::{Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, WithStorage};
+use crate::{
+    Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, TransitiveDependencies,
+    WithStorage,
+};
 
 /// Stores the containers for all ingredients in a database.
 pub trait Storage {
@@ -24,25 +27,38 @@ pub trait Container<DB: ?Sized>: 'static + Sync {
         None
     }
 
-    fn last_changed<'a>(&'a self, db: &'a DB, dep: Dependency) -> LastChangedFuture<'a>;
+    fn last_change<'a>(&'a self, db: &'a DB, dep: Dependency) -> LastChangeFuture<'a>;
 }
 
-#[pin_project::pin_project(project = LastChangedProj)]
-pub enum LastChangedFuture<'a> {
-    Ready(Option<Revision>),
+#[pin_project::pin_project(project = LastChangeProj)]
+pub enum LastChangeFuture<'a> {
+    Ready(Change),
     Pending(#[pin] crate::query_cache::ChangeFuture<'a>),
 }
 
-impl Future for LastChangedFuture<'_> {
-    type Output = Option<Revision>;
+#[derive(Clone, Copy)]
+pub struct Change {
+    pub(crate) changed_at: Option<Revision>,
+    pub(crate) transitive: TransitiveDependencies,
+}
+
+impl Change {
+    pub(crate) const NONE: Self = Self {
+        changed_at: None,
+        transitive: TransitiveDependencies::CONSTANT,
+    };
+}
+
+impl Future for LastChangeFuture<'_> {
+    type Output = Change;
 
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         match self.project() {
-            LastChangedProj::Ready(ready) => std::task::Poll::Ready(*ready),
-            LastChangedProj::Pending(future) => future.poll(cx),
+            LastChangeProj::Ready(ready) => std::task::Poll::Ready(*ready),
+            LastChangeProj::Pending(future) => future.poll(cx),
         }
     }
 }

@@ -25,8 +25,8 @@ where
     FromFn(f)
 }
 
-/// Format a query in the given database
-pub fn query(
+/// Format an index in the given database
+pub fn ingredient(
     db: &dyn crate::Database,
     path: crate::IngredientPath,
 ) -> impl std::fmt::Display + std::fmt::Debug + '_ {

@@ -2,7 +2,7 @@
 #![feature(trivial_bounds)]
 #![allow(clippy::uninlined_format_args)]
 
-use haste::DatabaseExt;
+use haste::{DatabaseExt, Durability};
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
@@ -72,32 +72,55 @@ async fn product(db: &dyn crate::Db, files: [&'static str; 2]) -> u32 {
 }
 
 fn main() {
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .without_time()
+        .init();
+
     let mut db = Database::default();
 
     let start = std::time::Instant::now();
 
-    db.set_input::<file>("foo", "123".into());
-    db.set_input::<file>("bar", "1234".into());
+    db.set_input::<file>("bar", "345".into(), Durability::HIGH);
+    db.set_input::<file>("foo", "123".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
             dbg!(file(db, "foo").await);
-            dbg!(file(db, "bar").await);
             dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["foo", "bar"]).await);
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
+    eprintln!();
 
-    db.set_input::<file>("foo", "234".into());
+    db.set_input::<file>("foo", "321".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
             dbg!(file(db, "foo").await);
-            dbg!(file(db, "bar").await);
             dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["foo", "bar"]).await);
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
+    eprintln!();
+
+    db.set_input::<file>("foo", "123".into(), Durability::LOW);
+    haste::scope(&mut db, |scope, db| {
+        scope.block_on(async {
+            dbg!(file(db, "foo").await);
+            dbg!(product(db, ["foo", "foo"]).await);
+            dbg!(product(db, ["bar", "bar"]).await);
+        })
+    });
+    eprintln!();
+
+    db.set_input::<file>("foo", "1234".into(), Durability::LOW);
+    haste::scope(&mut db, |scope, db| {
+        scope.block_on(async {
+            dbg!(file(db, "foo").await);
+            dbg!(product(db, ["foo", "foo"]).await);
+            dbg!(product(db, ["bar", "bar"]).await);
+        })
+    });
+    eprintln!();
 
     let duration = start.elapsed();
     eprintln!("time: {duration:?}");

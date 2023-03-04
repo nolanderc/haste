@@ -75,8 +75,8 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     }
                 }
 
-                fn last_changed(&self, dep: haste::Dependency) -> haste::LastChangedFuture {
-                    haste::StaticDatabase::container(self, dep.container()).last_changed(self, dep)
+                fn last_change(&self, dep: haste::Dependency) -> haste::LastChangeFuture {
+                    haste::StaticDatabase::container(self, dep.container()).last_change(self, dep)
                 }
 
                 /// Format an ingredient

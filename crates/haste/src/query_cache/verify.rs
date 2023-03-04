@@ -11,7 +11,7 @@ pub type VerifyFuture<'a, Q: Query> =
 pub fn verify<'a, Q: Query>(
     db: &'a dyn Database,
     storage: &'a QueryStorage<Q>,
-    slot: ClaimedSlot<'a, Q>,
+    mut slot: ClaimedSlot<'a, Q>,
 ) -> VerifyFuture<'a, Q> {
     async move {
         let Some(last_verified) = slot.last_verified() else { return Err(slot) };
@@ -19,50 +19,65 @@ pub fn verify<'a, Q: Query>(
 
         let runtime = db.runtime();
 
-        let maybe_changed =
-            inputs_maybe_changed(runtime, last_verified, previous.latest_dependency) && {
-                let dependencies = unsafe { storage.dependencies(previous.dependencies.clone()) };
-                dependencies_maybe_changed(db, last_verified, dependencies).await
-            };
+        let latest_input = previous.transitive.latest_input;
+        let durability = previous.transitive.durability;
 
-        if maybe_changed {
-            // the query might be out-of-date, so we need to re-execute it
-            Err(slot)
-        } else {
-            // all dependencies were up-to-date
-            Ok(slot.backdate())
+        if inputs_unchanged(runtime, last_verified, latest_input, durability) {
+            tracing::debug!(reason = "inputs unchanged", "backdating");
+            return Ok(slot.backdate());
         }
+
+        let dependencies = unsafe { storage.dependencies(previous.dependencies) };
+        if let Some(transitive) = dependencies_unchanged(db, last_verified, dependencies).await {
+            tracing::debug!(reason = "dependencies unchanged", "backdating");
+            previous.transitive.extend(transitive);
+            return Ok(slot.backdate());
+        }
+
+        Err(slot)
     }
 }
 
-fn inputs_maybe_changed(
+fn inputs_unchanged(
     runtime: &Runtime,
     last_verified: Revision,
     latest_dependency: Option<Revision>,
+    durability: Durability,
 ) -> bool {
     match latest_dependency {
         // there are no dependencies, so the value is constant
-        None => false,
+        None => true,
 
         // This query only depends on inputs in the revisions `..=latest_dependency`.
         // If the only changes made to dependencies are in the range `latest_dependency+1..`
         // the output of this query cannot have changed.
         Some(latest_dependency) => {
-            let earliest_change = runtime.earliest_change_since(last_verified);
-            latest_dependency >= earliest_change
+            let earliest_change = runtime.earliest_change_since(last_verified, durability);
+            latest_dependency < earliest_change
         }
     }
 }
 
-async fn dependencies_maybe_changed(
+async fn dependencies_unchanged(
     db: &dyn Database,
     last_verified: Revision,
     dependencies: &[Dependency],
-) -> bool {
+) -> Option<TransitiveDependencies> {
+    let mut transitive = TransitiveDependencies::CONSTANT;
+
     for &dependency in dependencies {
-        if Some(last_verified) < db.last_changed(dependency).await {
-            return true;
+        let change = db.last_change(dependency).await;
+
+        if Some(last_verified) < change.changed_at {
+            tracing::debug!(
+                dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
+                "change detected"
+            );
+            return None;
         }
+
+        transitive.extend(change.transitive);
     }
-    false
+
+    Some(transitive)
 }

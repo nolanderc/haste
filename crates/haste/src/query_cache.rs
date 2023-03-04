@@ -5,14 +5,14 @@ mod verify;
 use std::{future::Future, pin::Pin, task::Poll};
 
 use crate::{
-    ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, ExecFuture, Id, IngredientPath,
-    LastChangedFuture, Query, QueryTask, Revision, Runtime, WithStorage,
+    Change, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Durability, ExecFuture, Id,
+    IngredientPath, LastChangeFuture, Query, QueryTask, Revision, Runtime, WithStorage,
 };
 
 use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
-pub use self::storage::ChangeFuture;
+pub use self::storage::{ChangeFuture, TransitiveDependencies};
 
 pub trait QueryCache: DynQueryCache {
     type Query: Query;
@@ -42,6 +42,7 @@ pub trait QueryCache: DynQueryCache {
         runtime: &mut Runtime,
         input: <Self::Query as Query>::Input,
         output: <Self::Query as Query>::Output,
+        durability: Durability,
     ) where
         Self::Query: crate::Input;
 }
@@ -104,26 +105,26 @@ where
         Some(self)
     }
 
-    fn last_changed<'a>(&'a self, db: &'a DB, dep: crate::Dependency) -> LastChangedFuture<'a> {
+    fn last_change<'a>(&'a self, db: &'a DB, dep: crate::Dependency) -> LastChangeFuture<'a> {
         let id = dep.resource;
         let slot = self.storage.slot(id);
         let current = self.storage.current_revision();
 
-        if slot.last_verified() == Some(current) {
-            return LastChangedFuture::Ready(slot.last_changed());
-        }
-
-        let db = db.cast_dyn();
         match self.claim(slot) {
-            Err(Some(_)) => return LastChangedFuture::Ready(slot.last_changed()),
+            Err(Some(output)) => {
+                return LastChangeFuture::Ready(Change {
+                    changed_at: slot.last_changed(),
+                    transitive: output.transitive,
+                })
+            }
             Err(None) => {}
             Ok(claim) => {
-                let task = self.execute_query(db, id, claim);
+                let task = self.execute_query(db.cast_dyn(), id, claim);
                 db.runtime().spawn_query(task);
             }
         }
 
-        LastChangedFuture::Pending(slot.wait_for_change(current))
+        LastChangeFuture::Pending(slot.wait_for_change(current))
     }
 }
 
@@ -135,6 +136,13 @@ where
 
     fn get_or_evaluate<'a>(&'a self, db: &'a DatabaseFor<Q>, input: Q::Input) -> EvalResult<'a, Q> {
         let (id, slot) = self.lookup.get_or_insert(input, &self.storage);
+
+        let span = tracing::trace_span!(
+            "get_or_evaluate",
+            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
+        );
+        let _guard = span.entered();
+
         self.get_or_evaluate_slot(db, id, slot)
     }
 
@@ -156,22 +164,27 @@ where
         }
     }
 
-    fn set(&mut self, runtime: &mut Runtime, input: Q::Input, output: Q::Output)
-    where
+    fn set(
+        &mut self,
+        runtime: &mut Runtime,
+        input: Q::Input,
+        output: Q::Output,
+        durability: Durability,
+    ) where
         Self::Query: crate::Input,
     {
         let (id, _) = self.lookup.get_or_insert(input, &self.storage);
         let slot = self.storage.slot_mut(id);
 
         if let Some(previous) = slot.get_output_mut() {
-            if previous.output == output {
+            if previous.output == output && previous.transitive.durability == durability {
                 // no change: the value is still valid
                 slot.set_verified(runtime.current_revision());
                 return;
             }
         }
 
-        slot.set_output(output, runtime);
+        slot.set_output(output, durability, runtime);
     }
 }
 
@@ -289,15 +302,22 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         slot: &'a QuerySlot<Q>,
     ) -> EvalResult<'a, Q> {
         match self.claim(slot) {
-            Ok(slot) => EvalResult::Eval(self.execute_query(db, id, slot)),
+            Ok(slot) => {
+                tracing::trace!("needs to be evaluated");
+                EvalResult::Eval(self.execute_query(db, id, slot))
+            }
             Err(None) => {
+                tracing::trace!("wait until completed");
                 // the query is executed elsewhere: await its result
                 let path = self.ingredient(id);
                 let current = self.storage.current_revision();
                 let pending = unsafe { wait_until_finished(db, slot, current, path) };
                 EvalResult::Pending(pending)
             }
-            Err(Some(slot)) => EvalResult::Cached(QueryResult { id, slot }),
+            Err(Some(slot)) => {
+                tracing::trace!("using cached output");
+                EvalResult::Cached(QueryResult { id, slot })
+            }
         }
     }
 
@@ -315,6 +335,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
                 storage: &self.storage,
                 future: verify::verify(db.as_dyn(), &self.storage, slot),
             },
+            span: None,
         }
     }
 
@@ -330,6 +351,8 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
 pub struct QueryCacheTask<'a, Q: Query> {
     #[pin]
     state: TaskState<'a, Q>,
+    /// A span representing the duration of the query.
+    span: Option<tracing::Span>,
 }
 
 #[pin_project::pin_project(project = TaskStateProj)]
@@ -342,6 +365,22 @@ enum TaskState<'a, Q: Query> {
         future: verify::VerifyFuture<'a, Q>,
     },
     Exec(#[pin] ExecTaskFuture<'a, Q>),
+}
+
+impl<'a, Q: Query> TaskState<'a, Q> {
+    fn path(&self) -> IngredientPath {
+        match &self {
+            TaskState::Verify { path, .. } => *path,
+            TaskState::Exec(future) => future.inner.query(),
+        }
+    }
+
+    fn database(&self) -> &DatabaseFor<Q> {
+        match &self {
+            TaskState::Verify { db, .. } => *db,
+            TaskState::Exec(future) => future.inner.database(),
+        }
+    }
 }
 
 impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
@@ -362,6 +401,17 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
+
+        if this.span.is_none() {
+            *this.span = Some(tracing::debug_span!(
+                parent: None,
+                "evaluate",
+                query = %crate::util::fmt::ingredient(this.state.database().as_dyn(), this.state.path()),
+            ));
+        }
+
+        let _guard = this.span.as_ref().map(|span| span.enter());
+
         loop {
             match this.state.as_mut().project() {
                 TaskStateProj::Verify {
@@ -405,7 +455,7 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        let slot = this.slot.as_ref().expect("query already completed");
+        let slot = this.slot.as_mut().expect("query already completed");
 
         if let Some(cycle) = slot.take_cycle() {
             this.inner.as_mut().recover(cycle, slot.input());
@@ -414,23 +464,20 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let id = this.inner.query().resource;
 
         let result = std::task::ready!(this.inner.poll(cx));
+        let new = this.storage.create_output(result);
 
         if let Some(previous) = slot.get_output() {
-            if result.output == previous.output {
+            if new.output == previous.output {
                 // backdate the result (verify the output, but keep the revision it was last
                 // changed)
+                previous.dependencies = new.dependencies;
+                previous.transitive = new.transitive;
                 let slot = this.slot.take().unwrap().backdate();
                 return Poll::Ready(QueryResult { id, slot });
             }
         }
 
-        let mut output = this.storage.create_output(result);
-
-        if Q::IS_INPUT {
-            output.latest_dependency = Some(slot.current_revision());
-        }
-
-        let slot = this.slot.take().unwrap().finish(output);
+        let slot = this.slot.take().unwrap().finish(new);
         Poll::Ready(QueryResult { id, slot })
     }
 }

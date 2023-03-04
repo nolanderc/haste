@@ -32,10 +32,7 @@ pub struct ArgumentOptions {
     pub input: bool,
 }
 
-pub fn extract_attrs(
-    attrs: &mut Vec<syn::Attribute>,
-    options: ArgumentOptions,
-) -> Arguments {
+pub fn extract_attrs(attrs: &mut Vec<syn::Attribute>, options: ArgumentOptions) -> Arguments {
     let mut args = Arguments::default();
     let mut parser = AttrParser::default();
 

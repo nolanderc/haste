@@ -2,7 +2,7 @@ use crate::{
     arena::{Arena, RawArena},
     non_max::NonMaxU32,
     shard_map::ShardMap,
-    ContainerPath, LastChangedFuture,
+    Change, ContainerPath, LastChangeFuture,
 };
 
 use std::hash::Hash;
@@ -35,9 +35,9 @@ where
         self.get(id.raw).unwrap().fmt(f)
     }
 
-    fn last_changed(&self, _db: &DB, _dep: crate::Dependency) -> LastChangedFuture {
+    fn last_change(&self, _db: &DB, _dep: crate::Dependency) -> LastChangeFuture {
         // Interned values are constant, so can never change
-        LastChangedFuture::Ready(None)
+        LastChangeFuture::Ready(Change::NONE)
     }
 }
 
@@ -231,9 +231,9 @@ impl<DB: ?Sized> crate::Container<DB> for StringInterner {
         write!(f, "{:?}", self.get(id.raw).unwrap())
     }
 
-    fn last_changed(&self, _db: &DB, _dep: crate::Dependency) -> LastChangedFuture {
+    fn last_change(&self, _db: &DB, _dep: crate::Dependency) -> LastChangeFuture {
         // Interned values are constant, so can never change
-        LastChangedFuture::Ready(None)
+        LastChangeFuture::Ready(Change::NONE)
     }
 }
 

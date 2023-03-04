@@ -2,7 +2,7 @@ mod cell;
 
 use crate::{
     arena::{AppendArena, RawArena},
-    Cycle, Dependency, ExecutionResult, Id, Query, Revision, Runtime,
+    Cycle, Dependency, Durability, ExecutionResult, Id, Query, Revision, Runtime,
 };
 
 use std::future::Future;
@@ -68,23 +68,20 @@ impl<Q: Query> QueryStorage<Q> {
 
     /// Record the result of a new query.
     pub(crate) fn create_output(&self, result: ExecutionResult<Q::Output>) -> OutputSlot<Q> {
-        let dependencies = {
-            let range = self.dependencies.extend_from_slice(&result.dependencies);
-            let end = u32::try_from(range.end).unwrap();
-            let start = range.start as u32;
-            start..end
-        };
+        let range = self.dependencies.extend_from_slice(&result.dependencies);
+        let end = u32::try_from(range.end).unwrap();
+        let start = range.start as u32;
 
         // TODO: compute the correct revisions
         OutputSlot {
             output: result.output,
-            dependencies,
-            latest_dependency: result.latest_dependency,
+            dependencies: DependencyRange::from(start..end),
+            transitive: result.transitive,
         }
     }
 
     /// Get the dependencies of the given query.
-    pub unsafe fn dependencies(&self, range: std::ops::Range<u32>) -> &[Dependency] {
+    pub unsafe fn dependencies(&self, range: DependencyRange) -> &[Dependency] {
         self.dependencies
             .get_slice_unchecked(range.start as usize..range.end as usize)
     }
@@ -131,14 +128,60 @@ unsafe impl<Q: Query> bytemuck::Zeroable for QuerySlot<Q> {}
 
 pub struct OutputSlot<Q: Query> {
     /// Refers to a list of dependencies collected while executing this query.
-    pub dependencies: std::ops::Range<u32>,
+    pub dependencies: DependencyRange,
+
+    /// Details about the transitive dependencies of the query. Used to optimize incremental
+    /// re-evaluation of queries.
+    pub transitive: TransitiveDependencies,
 
     /// The output from a query.
     pub output: Q::Output,
+}
 
-    /// Over all the transitive dependencies of this query: the latest revision where one of them
-    /// changed.
-    pub latest_dependency: Option<Revision>,
+/// Refers to a list of dependencies in the query storage.
+///
+/// We use this over a `Vec` to batch the allocation and reduce the size of the query outputs.
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl From<std::ops::Range<u32>> for DependencyRange {
+    fn from(value: std::ops::Range<u32>) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TransitiveDependencies {
+    /// The most recent revision one of the query's inputs comes from.
+    pub latest_input: Option<Revision>,
+
+    /// Durability of the inputs the query depends on.
+    pub durability: Durability,
+}
+
+impl TransitiveDependencies {
+    /// Used by queries which don't depend on any inputs (ie. they are constant).
+    pub const CONSTANT: Self = Self {
+        latest_input: None,
+        durability: Durability::CONSTANT,
+    };
+
+    pub fn combine(self, other: Self) -> Self {
+        Self {
+            latest_input: std::cmp::max(self.latest_input, other.latest_input),
+            durability: std::cmp::min(self.durability, other.durability),
+        }
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        *self = self.combine(other);
+    }
 }
 
 impl<Q: Query> QuerySlot<Q> {
@@ -190,20 +233,23 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.set_cycle(cycle)
     }
 
-    pub fn set_output(&mut self, output: Q::Output, runtime: &mut Runtime)
+    pub fn set_output(&mut self, output: Q::Output, durability: Durability, runtime: &mut Runtime)
     where
         Q: crate::Input,
     {
         let current = self.cell.set_output(
             OutputSlot {
                 output,
-                dependencies: 0..0,
-                latest_dependency: None,
+                dependencies: (0..0).into(),
+                transitive: TransitiveDependencies {
+                    latest_input: None,
+                    durability,
+                },
             },
+            durability,
             runtime,
         );
-
-        self.cell.get_output_mut().unwrap().latest_dependency = Some(current);
+        self.cell.get_output_mut().unwrap().transitive.latest_input = Some(current);
     }
 
     pub fn last_verified(&self) -> Option<Revision> {
@@ -219,7 +265,9 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture<'_> {
-        self.cell.wait_for_change(revision)
+        self.cell.wait_for_change(revision, |output| unsafe {
+            std::ptr::addr_of!((*output).transitive)
+        })
     }
 
     pub unsafe fn try_get(&self, current: Revision) -> Option<&OutputSlot<Q>> {
@@ -278,9 +326,9 @@ impl<'a, Q: Query> ClaimedSlot<'a, Q> {
         }
     }
 
-    pub fn get_output(&self) -> Option<&OutputSlot<Q>> {
+    pub fn get_output(&mut self) -> Option<&mut OutputSlot<Q>> {
         // SAFETY: we have a claim on the query
-        unsafe { self.slot.cell.get_output() }
+        unsafe { self.slot.cell.get_output_claimed() }
     }
 
     pub fn last_verified(&self) -> Option<Revision> {

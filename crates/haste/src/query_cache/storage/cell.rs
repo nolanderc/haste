@@ -12,7 +12,9 @@ use std::{
 use bytemuck::Zeroable;
 use smallvec::SmallVec;
 
-use crate::{AtomicRevision, Cycle, Revision, Runtime};
+use crate::{AtomicRevision, Change, Cycle, Durability, Revision, Runtime};
+
+use super::TransitiveDependencies;
 
 pub struct QueryCell<I, O> {
     /// The current state of the cell.
@@ -43,6 +45,10 @@ impl<T> SyncCell<T> {
         (*self.0.get()).assume_init_ref()
     }
 
+    unsafe fn assume_init_mut(&self) -> &mut T {
+        (*self.0.get()).assume_init_mut()
+    }
+
     unsafe fn write(&self, value: T) -> &T {
         (*self.0.get()).write(value)
     }
@@ -71,7 +77,7 @@ struct State {
     /// The revision during which the query slot was last verified to be valid and up-to-date.
     verified_at: AtomicRevision,
 
-    /// The revision during which the output was last changed
+    /// The revision during which the output was last changed.
     changed_at: AtomicRevision,
 }
 
@@ -130,8 +136,7 @@ impl<I, T> Default for QueryCell<I, T> {
     }
 }
 
-pub type WaitFuture<'a> = impl Future<Output = ()> + 'a;
-pub type ChangeFuture<'a> = impl Future<Output = Option<Revision>> + 'a;
+pub type ChangeFuture<'a> = impl Future<Output = Change> + Send + 'a;
 
 impl<I, O> QueryCell<I, O> {
     pub fn new() -> Self {
@@ -179,7 +184,12 @@ impl<I, O> QueryCell<I, O> {
         (self.state.addr.load(Acquire) & HAS_INPUT) != 0
     }
 
-    pub fn set_output(&mut self, value: O, runtime: &mut Runtime) -> Revision {
+    pub fn set_output(
+        &mut self,
+        value: O,
+        durability: Durability,
+        runtime: &mut Runtime,
+    ) -> Revision {
         let state = self.state.addr.get_mut();
         let output = self.output.get_mut();
 
@@ -193,7 +203,7 @@ impl<I, O> QueryCell<I, O> {
         *state |= HAS_OUTPUT;
 
         let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(last_change);
+        let current = runtime.update_input(last_change, durability);
 
         self.state.verified_at.set(Some(current));
         self.state.changed_at.set(Some(current));
@@ -260,10 +270,10 @@ impl<I, O> QueryCell<I, O> {
 
     /// # Safety
     ///
-    /// The output must be valid in the current revision, or the caller has exclusive access.
-    pub unsafe fn get_output(&self) -> Option<&O> {
+    /// The output must be claimed by the caller.
+    pub unsafe fn get_output_claimed(&self) -> Option<&mut O> {
         if (self.state.addr.load(Acquire) & HAS_OUTPUT) != 0 {
-            unsafe { Some(self.output_assume_init()) }
+            unsafe { Some(self.output.assume_init_mut()) }
         } else {
             None
         }
@@ -331,13 +341,19 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Waits until the output value has been set
-    pub fn wait_until_verified(&self, revision: Revision) -> WaitFuture {
-        self.state.wait(revision)
+    pub async fn wait_until_verified(&self, revision: Revision) {
+        self.state.wait(revision).await
     }
 
     /// Waits until the output value has been set
-    pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture {
-        self.state.wait_for_change(revision)
+    pub fn wait_for_change(
+        &self,
+        revision: Revision,
+        get_deps: impl FnOnce(*const O) -> *const TransitiveDependencies,
+    ) -> ChangeFuture {
+        let output_ptr = unsafe { (*self.output.0.get()).as_ptr() };
+        let deps_ptr = get_deps(output_ptr);
+        self.state.wait_for_change(revision, deps_ptr)
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -377,7 +393,7 @@ impl<I, O> QueryCell<I, O> {
 
 impl State {
     /// Returns a future which completes once the value has been written.
-    fn wait(&self, revision: Revision) -> WaitFuture {
+    fn wait(&self, revision: Revision) -> impl Future<Output = ()> + '_ {
         // If we have registered the current task, this is the index in the list of wakers this
         // task's waker occupies.
         let mut registered = None;
@@ -422,10 +438,24 @@ impl State {
         })
     }
 
-    fn wait_for_change(&self, revision: Revision) -> ChangeFuture {
+    fn wait_for_change(
+        &self,
+        revision: Revision,
+        transitive: *const TransitiveDependencies,
+    ) -> ChangeFuture {
+        let future = self.wait(revision);
+        let transitive = crate::util::SendWrapper(transitive);
+
         async move {
-            self.wait(revision).await;
-            self.changed_at.load(Relaxed)
+            future.await;
+
+            let transitive: TransitiveDependencies = unsafe { **transitive };
+            let changed_at = self.changed_at.load(Relaxed);
+
+            Change {
+                changed_at,
+                transitive,
+            }
         }
     }
 

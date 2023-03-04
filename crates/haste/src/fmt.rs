@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{util::CallOnDrop, Database, LastChangedFuture, WithStorage};
+use crate::{util::CallOnDrop, Database, LastChangeFuture, WithStorage};
 
 /// A type which allows the inner value to be formatted inside some database.
 pub struct Adapter<'db, T> {
@@ -68,8 +68,8 @@ where
         self.raw.runtime()
     }
 
-    fn last_changed(&self, dep: crate::Dependency) -> LastChangedFuture {
-        self.raw.last_changed(dep)
+    fn last_change(&self, dep: crate::Dependency) -> LastChangeFuture {
+        self.raw.last_change(dep)
     }
 
     fn cycle_strategy(&self, path: crate::ContainerPath) -> crate::CycleStrategy {

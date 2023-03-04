@@ -173,7 +173,7 @@ impl Cycle {
             let mut list = f.debug_list();
             for path in self.iter() {
                 if alternate {
-                    list.entry(&crate::util::fmt::query(db, path));
+                    list.entry(&crate::util::fmt::ingredient(db, path));
                 } else {
                     list.entry(&path);
                 }

@@ -3,7 +3,8 @@ mod cell;
 use crate::{
     arena::{AppendArena, RawArena},
     revision::Revision,
-    Cycle, Dependency, Durability, ExecutionResult, Id, Query, Runtime,
+    runtime::ExecutionResult,
+    Cycle, Dependency, Durability, Id, Query, Runtime,
 };
 
 use std::future::Future;

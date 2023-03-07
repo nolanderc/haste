@@ -7,6 +7,7 @@ mod durability;
 pub mod fmt;
 mod input;
 pub mod interner;
+pub mod non_max;
 pub mod query_cache;
 mod revision;
 mod runtime;
@@ -16,14 +17,12 @@ pub mod util;
 
 use std::future::Future;
 
-pub use durability::*;
+pub use durability::Durability;
 pub use haste_macros::*;
 pub use query_cache::*;
-pub use revision::*;
-pub use runtime::*;
+pub use revision::Revision;
+pub use runtime::{Cycle, CycleStrategy, Dependency, Runtime};
 pub use storage::*;
-
-pub mod non_max;
 
 use non_max::NonMaxU32;
 use util::CallOnDrop;
@@ -276,7 +275,7 @@ pub trait DatabaseExt: Database {
             EvalResult::Eval(eval) => {
                 // spawn the query, but postpone checking it for completion until the returned
                 // future is polled. That way the spawned task has a chance of completing first.
-                let id = eval.path().resource;
+                let id = runtime::QueryTask::path(&eval).resource;
                 runtime.spawn_query(eval);
                 SpawnResult::Spawned(id)
             }

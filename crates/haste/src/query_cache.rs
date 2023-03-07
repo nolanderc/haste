@@ -6,8 +6,8 @@ use std::{future::Future, pin::Pin, task::Poll};
 
 use crate::revision::Revision;
 use crate::{
-    Change, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Durability, ExecFuture, Id,
-    IngredientPath, LastChangeFuture, Query, QueryTask, Runtime, WithStorage,
+    Change, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Durability, Id,
+    IngredientPath, LastChangeFuture, Query, Runtime, WithStorage,
 };
 
 use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture};
@@ -384,7 +384,7 @@ impl<'a, Q: Query> TaskState<'a, Q> {
     }
 }
 
-impl<Q: Query> QueryTask for QueryCacheTask<'_, Q> {
+impl<Q: Query> crate::runtime::QueryTask for QueryCacheTask<'_, Q> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<()> {
         Future::poll(self, cx).map(|_| ())
     }
@@ -447,7 +447,7 @@ struct ExecTaskFuture<'a, Q: Query> {
     storage: &'a QueryStorage<Q>,
     slot: Option<ClaimedSlot<'a, Q>>,
     #[pin]
-    inner: ExecFuture<'a, Q>,
+    inner: crate::runtime::ExecFuture<'a, Q>,
 }
 
 impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {

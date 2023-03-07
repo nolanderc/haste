@@ -39,20 +39,12 @@ fn to_u32(rev: Option<Revision>) -> u32 {
 pub struct AtomicRevision(AtomicU32);
 
 impl AtomicRevision {
-    pub fn new(revision: Option<Revision>) -> Self {
-        Self(AtomicU32::new(to_u32(revision)))
-    }
-
     pub fn load(&self, order: Ordering) -> Option<Revision> {
         Self::from_u32(self.0.load(order))
     }
 
     pub fn store(&self, rev: Option<Revision>, order: Ordering) {
         self.0.store(to_u32(rev), order)
-    }
-
-    pub fn swap(&self, rev: Option<Revision>, order: Ordering) -> Option<Revision> {
-        Self::from_u32(self.0.swap(to_u32(rev), order))
     }
 
     pub(crate) fn set(&mut self, rev: Option<Revision>) {

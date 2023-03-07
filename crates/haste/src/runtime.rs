@@ -6,16 +6,13 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Poll, Waker},
 };
 
 use crate::{
-    non_max::NonMaxU32, revision::Revision, util::CallOnDrop, ContainerPath, Database, DatabaseFor,
-    Durability, IngredientPath, Query, RevisionRange, TransitiveDependencies,
+    revision::Revision, util::CallOnDrop, ContainerPath, Database, DatabaseFor, Durability,
+    IngredientPath, Query, RevisionRange, TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
@@ -91,28 +88,6 @@ impl std::fmt::Debug for Dependency {
 }
 
 impl Dependency {
-    /// A 64-bit value representing a missing dependency.
-    pub(crate) const NONE: u64 = u64::MAX;
-
-    /// Encode the dependency in 64-bits
-    pub(crate) fn encode_u64(self) -> u64 {
-        let ingredient = self.container.index as u64;
-        let resource = self.resource.raw.get() as u64;
-        let extra = self.extra as u64;
-        (ingredient << 48) | (resource << 16) | extra
-    }
-
-    /// Decode the dependency from a 64-bit value
-    pub(crate) fn decode_u64(x: u64) -> Option<Self> {
-        Some(Self {
-            container: ContainerPath {
-                index: (x >> 48) as u16,
-            },
-            resource: crate::Id::new(NonMaxU32::new((x >> 16) as u32)?),
-            extra: x as u16,
-        })
-    }
-
     pub fn container(self) -> ContainerPath {
         self.container
     }
@@ -121,31 +96,6 @@ impl Dependency {
             container: self.container,
             resource: self.resource,
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct AtomicDependency {
-    bits: AtomicU64,
-}
-
-impl AtomicDependency {
-    pub fn new(dep: Option<Dependency>) -> Self {
-        Self {
-            bits: AtomicU64::new(Self::encode(dep)),
-        }
-    }
-
-    fn encode(dep: Option<Dependency>) -> u64 {
-        dep.map(|dep| dep.encode_u64()).unwrap_or(Dependency::NONE)
-    }
-
-    pub fn load(&self, ordering: Ordering) -> Option<Dependency> {
-        Dependency::decode_u64(self.bits.load(ordering))
-    }
-
-    pub fn store(&self, value: Option<Dependency>, ordering: Ordering) {
-        self.bits.store(Self::encode(value), ordering)
     }
 }
 

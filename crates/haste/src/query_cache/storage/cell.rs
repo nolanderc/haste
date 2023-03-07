@@ -12,7 +12,10 @@ use std::{
 use bytemuck::Zeroable;
 use smallvec::SmallVec;
 
-use crate::{AtomicRevision, Change, Cycle, Durability, Revision, Runtime};
+use crate::{
+    revision::{AtomicRevision, Revision},
+    Change, Cycle, Durability, Runtime,
+};
 
 use super::TransitiveDependencies;
 

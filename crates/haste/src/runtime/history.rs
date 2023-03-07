@@ -3,86 +3,20 @@
 mod bit_set;
 mod range_query;
 
-use std::{
-    collections::BTreeMap,
-    num::NonZeroU32,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::{collections::BTreeMap, num::NonZeroU32};
 
-use crate::{Durability, RevisionRange};
+use crate::{revision::Revision, Durability, RevisionRange};
 
 use self::{
     bit_set::{BitSet, RangeBitSet},
     range_query::BitHistory,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Revision(NonZeroU32);
-
-impl std::fmt::Debug for Revision {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Revision({})", self.0)
-    }
-}
-
-impl Revision {
-    const MAX: Revision = match Revision::new(u32::MAX) {
-        Some(rev) => rev,
-        None => unreachable!(),
-    };
-
-    const fn new(x: u32) -> Option<Revision> {
-        match NonZeroU32::new(x) {
-            None => None,
-            Some(val) => Some(Self(val)),
-        }
-    }
-}
-
-unsafe impl bytemuck::ZeroableInOption for Revision {}
-
-fn to_u32(rev: Option<Revision>) -> u32 {
-    rev.map(|x| x.0.get()).unwrap_or(0)
-}
-
-#[derive(Debug, bytemuck::Zeroable)]
-pub struct AtomicRevision(AtomicU32);
-
-impl AtomicRevision {
-    pub fn new(revision: Option<Revision>) -> Self {
-        Self(AtomicU32::new(to_u32(revision)))
-    }
-
-    pub fn load(&self, order: Ordering) -> Option<Revision> {
-        Self::from_u32(self.0.load(order))
-    }
-
-    pub fn store(&self, rev: Option<Revision>, order: Ordering) {
-        self.0.store(to_u32(rev), order)
-    }
-
-    pub fn swap(&self, rev: Option<Revision>, order: Ordering) -> Option<Revision> {
-        Self::from_u32(self.0.swap(to_u32(rev), order))
-    }
-
-    pub(crate) fn set(&mut self, rev: Option<Revision>) {
-        *self.0.get_mut() = to_u32(rev);
-    }
-
-    pub(crate) fn get(&mut self) -> Option<Revision> {
-        Self::from_u32(*self.0.get_mut())
-    }
-
-    fn from_u32(num: u32) -> Option<Revision> {
-        Some(Revision(NonZeroU32::new(num)?))
-    }
-}
-
-pub struct RevisionHistory {
+pub struct ChangeHistory {
     histories: [History; Durability::LEVELS],
 }
 
-impl RevisionHistory {
+impl ChangeHistory {
     pub fn new() -> Self {
         Self {
             histories: std::array::from_fn(|_| {
@@ -95,7 +29,7 @@ impl RevisionHistory {
 
     pub fn current(&self) -> Revision {
         let index = self.histories[0].len() as u32;
-        Revision(unsafe { NonZeroU32::new_unchecked(index) })
+        Revision::from_index(unsafe { NonZeroU32::new_unchecked(index) })
     }
 
     /// When an input has been modified, this function is called with the previous revision in
@@ -108,7 +42,8 @@ impl RevisionHistory {
         last_changed: Option<Revision>,
         durability: Durability,
     ) -> Revision {
-        let new = Revision::new(self.histories[0].len() as u32 + 1).unwrap();
+        let new =
+            Revision::new(self.histories[0].len() as u32 + 1).expect("exhausted revision IDs");
 
         let (lower, higher) = self.histories.split_at_mut(durability.index() + 1);
 
@@ -170,7 +105,7 @@ impl History {
 
         // more detailed check if there has been an update:
 
-        let index = rev.0.get() as usize;
+        let index = rev.index() as usize;
 
         let mut has_changed = false;
         self.detailed.query(index.., |changed| {
@@ -202,7 +137,7 @@ impl RevisionSet {
     }
 
     fn insert(&mut self, revision: Revision) {
-        let index = revision.0.get();
+        let index = revision.index();
 
         match self {
             RevisionSet::Small(small) => {
@@ -234,8 +169,8 @@ impl RevisionSet {
     }
 
     fn contains_range(&self, range: RevisionRange) -> bool {
-        let min = range.earliest.0.get();
-        let max = range.latest.0.get();
+        let min = range.earliest.index();
+        let max = range.latest.index();
 
         match self {
             RevisionSet::Small(small) => small.contains_range(min..=max),

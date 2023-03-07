@@ -1,8 +1,8 @@
 use std::{future::Future, pin::Pin};
 
 use crate::{
-    Database, Dependency, DynQueryCache, Revision, Runtime, StaticDatabase, TransitiveDependencies,
-    WithStorage,
+    revision::Revision, Database, Dependency, DynQueryCache, Runtime, StaticDatabase,
+    TransitiveDependencies, WithStorage,
 };
 
 /// Stores the containers for all ingredients in a database.

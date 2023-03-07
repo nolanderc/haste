@@ -1,4 +1,4 @@
-use crate::{Dependency, Revision};
+use crate::{revision::Revision, Dependency};
 
 use super::*;
 

@@ -1,5 +1,5 @@
 mod cycle;
-mod revision;
+mod history;
 mod task;
 
 use std::{
@@ -14,20 +14,19 @@ use std::{
 };
 
 use crate::{
-    non_max::NonMaxU32, util::CallOnDrop, ContainerPath, Database, DatabaseFor, Durability,
-    IngredientPath, Query, RevisionRange, TransitiveDependencies,
+    non_max::NonMaxU32, revision::Revision, util::CallOnDrop, ContainerPath, Database, DatabaseFor,
+    Durability, IngredientPath, Query, RevisionRange, TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
-pub use self::revision::{AtomicRevision, Revision};
 pub use self::task::QueryTask;
 
-use self::{cycle::CycleGraph, revision::RevisionHistory, task::Scheduler};
+use self::{cycle::CycleGraph, history::ChangeHistory, task::Scheduler};
 
 pub struct Runtime {
     scheduler: Arc<Scheduler>,
     graph: Mutex<CycleGraph>,
-    revisions: RevisionHistory,
+    revisions: ChangeHistory,
 }
 
 impl Runtime {
@@ -35,7 +34,7 @@ impl Runtime {
         Self {
             scheduler: Arc::new(Scheduler::new()),
             graph: Default::default(),
-            revisions: RevisionHistory::new(),
+            revisions: ChangeHistory::new(),
         }
     }
 

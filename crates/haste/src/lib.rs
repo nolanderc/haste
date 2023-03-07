@@ -8,6 +8,7 @@ pub mod fmt;
 mod input;
 pub mod interner;
 pub mod query_cache;
+mod revision;
 mod runtime;
 mod shard_map;
 mod storage;
@@ -18,6 +19,7 @@ use std::future::Future;
 pub use durability::*;
 pub use haste_macros::*;
 pub use query_cache::*;
+pub use revision::*;
 pub use runtime::*;
 pub use storage::*;
 

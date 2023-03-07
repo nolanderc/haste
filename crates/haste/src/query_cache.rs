@@ -4,9 +4,10 @@ mod verify;
 
 use std::{future::Future, pin::Pin, task::Poll};
 
+use crate::revision::Revision;
 use crate::{
     Change, ContainerPath, Cycle, CycleStrategy, Database, DatabaseFor, Durability, ExecFuture, Id,
-    IngredientPath, LastChangeFuture, Query, QueryTask, Revision, Runtime, WithStorage,
+    IngredientPath, LastChangeFuture, Query, QueryTask, Runtime, WithStorage,
 };
 
 use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture};

@@ -147,6 +147,12 @@ pub struct DependencyRange {
     pub end: u32,
 }
 
+impl DependencyRange {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
 impl From<std::ops::Range<u32>> for DependencyRange {
     fn from(value: std::ops::Range<u32>) -> Self {
         Self {
@@ -158,8 +164,8 @@ impl From<std::ops::Range<u32>> for DependencyRange {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransitiveDependencies {
-    /// The most recent revision one of the query's inputs comes from.
-    pub latest_input: Option<Revision>,
+    /// The query only depends on inputs from these revisions.
+    pub inputs: Option<RevisionRange>,
 
     /// Durability of the inputs the query depends on.
     pub durability: Durability,
@@ -168,19 +174,54 @@ pub struct TransitiveDependencies {
 impl TransitiveDependencies {
     /// Used by queries which don't depend on any inputs (ie. they are constant).
     pub const CONSTANT: Self = Self {
-        latest_input: None,
+        inputs: None,
         durability: Durability::CONSTANT,
     };
 
     pub fn combine(self, other: Self) -> Self {
         Self {
-            latest_input: std::cmp::max(self.latest_input, other.latest_input),
+            inputs: RevisionRange::join(self.inputs, other.inputs),
             durability: std::cmp::min(self.durability, other.durability),
         }
     }
 
     pub fn extend(&mut self, other: Self) {
         *self = self.combine(other);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RevisionRange {
+    pub earliest: Revision,
+    pub latest: Revision,
+}
+
+impl std::fmt::Debug for RevisionRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}..={:?}", self.earliest, self.latest)
+    }
+}
+
+impl RevisionRange {
+    fn join(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (None, _) => b,
+            (_, None) => a,
+            (Some(a), Some(b)) => Some(Self {
+                earliest: std::cmp::min(a.earliest, b.earliest),
+                latest: std::cmp::max(a.latest, b.latest),
+            }),
+        }
+    }
+}
+
+impl std::ops::RangeBounds<Revision> for RevisionRange {
+    fn start_bound(&self) -> std::ops::Bound<&Revision> {
+        std::ops::Bound::Included(&self.earliest)
+    }
+
+    fn end_bound(&self) -> std::ops::Bound<&Revision> {
+        std::ops::Bound::Included(&self.latest)
     }
 }
 
@@ -237,19 +278,18 @@ impl<Q: Query> QuerySlot<Q> {
     where
         Q: crate::Input,
     {
-        let current = self.cell.set_output(
-            OutputSlot {
+        self.cell
+            .set_output(runtime, durability, |current| OutputSlot {
                 output,
                 dependencies: (0..0).into(),
                 transitive: TransitiveDependencies {
-                    latest_input: None,
+                    inputs: Some(RevisionRange {
+                        earliest: current,
+                        latest: current,
+                    }),
                     durability,
                 },
-            },
-            durability,
-            runtime,
-        );
-        self.cell.get_output_mut().unwrap().transitive.latest_input = Some(current);
+            });
     }
 
     pub fn last_verified(&self) -> Option<Revision> {

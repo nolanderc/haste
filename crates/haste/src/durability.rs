@@ -18,10 +18,10 @@ impl Durability {
     pub const HIGHEST: Self = Self::HIGH;
 
     /// Total number of durability levels.
-    pub(crate) const LEVELS: usize = Self::CONSTANT.0 as usize;
+    pub(crate) const LEVELS: usize = 1 + Self::CONSTANT.index();
 
-    pub(crate) fn index(&self) -> usize {
-        usize::from(self.0)
+    pub(crate) const fn index(&self) -> usize {
+        self.0 as usize
     }
 }
 

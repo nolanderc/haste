@@ -1,21 +1,41 @@
 #![allow(dead_code)]
 
+mod bit_set;
+mod range_query;
+
 use std::{
+    collections::BTreeMap,
     num::NonZeroU32,
-    sync::atomic::{
-        AtomicU32, AtomicU64,
-        Ordering::{self, Relaxed},
-    },
+    sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::Durability;
+use crate::{Durability, RevisionRange};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use self::{
+    bit_set::{BitSet, RangeBitSet},
+    range_query::BitHistory,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Revision(NonZeroU32);
 
+impl std::fmt::Debug for Revision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Revision({})", self.0)
+    }
+}
+
 impl Revision {
-    fn new(x: u32) -> Option<Revision> {
-        Some(Self(NonZeroU32::new(x)?))
+    const MAX: Revision = match Revision::new(u32::MAX) {
+        Some(rev) => rev,
+        None => unreachable!(),
+    };
+
+    const fn new(x: u32) -> Option<Revision> {
+        match NonZeroU32::new(x) {
+            None => None,
+            Some(val) => Some(Self(val)),
+        }
     }
 }
 
@@ -59,15 +79,15 @@ impl AtomicRevision {
 }
 
 pub struct RevisionHistory {
-    histories: [MinHistory; Durability::LEVELS],
+    histories: [History; Durability::LEVELS],
 }
 
 impl RevisionHistory {
     pub fn new() -> Self {
         Self {
             histories: std::array::from_fn(|_| {
-                let mut history = MinHistory::new();
-                history.push(1);
+                let mut history = History::default();
+                history.record_change(None, None);
                 history
             }),
         }
@@ -90,260 +110,217 @@ impl RevisionHistory {
     ) -> Revision {
         let new = Revision::new(self.histories[0].len() as u32 + 1).unwrap();
 
-        for (i, history) in self.histories.iter_mut().enumerate() {
-            let revision = if i <= durability.index() {
-                last_changed.unwrap_or(new)
-            } else {
-                new
-            };
-            history.push(revision.0.get());
+        let (lower, higher) = self.histories.split_at_mut(durability.index() + 1);
+
+        // any queries with lower durability might be affected by the change
+        for history in lower {
+            history.record_change(last_changed, Some(new));
+        }
+
+        // no detectable change for queries with higher durability:
+        for history in higher {
+            history.record_change(None, Some(new));
         }
 
         new
     }
 
-    /// Given some revision `rev`, finds the earliest input that has been changed in one of the
-    /// revisions `rev+1, rev+2, ..`.
+    /// Checks if any of the inputs from the given range have been changed in one of the revisions
+    /// `rev+1, rev+2, ..`.
     ///
-    /// Time complexity: `O(log n)`
-    pub fn earliest_change_since(&self, rev: Revision, durability: Durability) -> Revision {
+    /// The worst time complexity of this operaiton is `O(log^2 n)` where `n` is the size of the
+    /// history, but in reality it is often closer to `O(1)` when changes are mostly contained to a
+    /// small set of inputs (which is the average case).
+    pub fn any_changed_since(
+        &self,
+        range: RevisionRange,
+        rev: Revision,
+        durability: Durability,
+    ) -> bool {
         let history = &self.histories[durability.index()];
-        let minimum = history.min_since(rev.0.get() as usize).unwrap();
-        Revision::new(minimum).unwrap()
+        history.any_changed_since(range, rev)
     }
 }
 
-/// A Binary-Indxed-Tree (BIT) which for each index `i` stores the minimum of values `i..` in
-/// a growable list.
-///
-/// The implementation is heavily inspired by the paper [Efficient Range Minimum Queries using
-/// Binary Indexed Trees](https://ioinformatics.org/journal/v9_2015_39_44.pdf), but since we
-/// are only interested in `i..` queries (and not the more general `a..b`) we can get away with
-/// a single BIT (BIT2 in the paper). By using the invariant that the BIT's size is always a
-/// power-of-two we don't even need to store the original values, effectively reducing the
-/// memory usage by two thirds.
-///
-/// Since we are expected to query the same ranges repeatedly, there is also a thin caching
-/// layer on top: any time a query `i..` is executed, we cache the current length of the
-/// history and the minimum value at the index `i`. Then, if we encounter that index `i` later
-/// and the length hasn't changed (ie. no modifications have happened) we returned the cached
-/// value.
-struct MinHistory {
-    len: usize,
-    min_bit: Vec<u32>,
-    cache: Vec<Cached>,
+#[derive(Default)]
+struct History {
+    /// The revision in which the last change happened
+    last_change: Option<Revision>,
+    /// A detailed accounting of all changes that have ever been made.
+    detailed: BitHistory<RevisionSet>,
 }
 
-struct Cached {
-    /// Combines two `u32`s:
-    /// - the length of the history when this slot was created.
-    /// - the minimum element at that time.
-    bits: AtomicU64,
-}
+impl History {
+    fn len(&self) -> usize {
+        self.detailed.len()
+    }
 
-impl Cached {
-    fn new(len: usize, min: u32) -> Cached {
-        Cached {
-            bits: AtomicU64::new(Self::make_bits(len, min)),
+    fn record_change(&mut self, change: Option<Revision>, current: Option<Revision>) -> usize {
+        if change.is_some() {
+            self.last_change = current;
         }
+        self.detailed.push(change)
     }
 
-    fn store(&self, len: usize, min: u32) {
-        self.bits.store(Self::make_bits(len, min), Relaxed);
-    }
-
-    fn get(&self, len: usize) -> Option<u32> {
-        let bits = self.bits.load(Relaxed);
-        let (cached_len, min) = Self::from_bits(bits);
-        if cached_len == len {
-            Some(min)
-        } else {
-            None
+    fn any_changed_since(&self, range: RevisionRange, rev: Revision) -> bool {
+        if self.last_change <= Some(rev) {
+            // fast path if there have been no changes at all
+            return false;
         }
-    }
 
-    fn make_bits(len: usize, min: u32) -> u64 {
-        let index = u64::from(min);
-        let len = u64::from(u32::try_from(len).unwrap());
-        (index << 32) | len
-    }
+        // more detailed check if there has been an update:
 
-    fn from_bits(bits: u64) -> (usize, u32) {
-        let min = (bits >> 32) as u32;
-        let len = bits as u32;
-        (len as usize, min)
+        let index = rev.0.get() as usize;
+
+        let mut has_changed = false;
+        self.detailed.query(index.., |changed| {
+            has_changed |= changed.contains_range(range);
+        });
+        has_changed
     }
 }
 
-impl MinHistory {
-    pub fn new() -> Self {
-        Self {
-            len: 0,
-            min_bit: Vec::new(),
-            cache: Vec::new(),
-        }
+enum RevisionSet {
+    Small(RangeBitSet),
+    Tree(BTreeMap<u32, BitSet>),
+}
+
+const SEGMENT_SHIFT: u32 = BitSet::BITS.ilog2();
+const SEGMENT_MASK: u32 = BitSet::BITS as u32 - 1;
+
+const fn segment(index: u32) -> u32 {
+    index >> SEGMENT_SHIFT
+}
+
+const fn segment_index(index: u32) -> u32 {
+    index & SEGMENT_MASK
+}
+
+impl RevisionSet {
+    fn new() -> Self {
+        Self::Small(RangeBitSet::new())
     }
 
-    /// Create a history from an existing list of items.
-    pub fn from_vec(mut values: Vec<u32>) -> Self {
-        // pad to the next power of two
-        let len = values.len();
-        let required_len = len.next_power_of_two();
-        values.resize(required_len, u32::MAX);
+    fn insert(&mut self, revision: Revision) {
+        let index = revision.0.get();
 
-        let mut bit = values;
-        for i in (1..len + 1).rev() {
-            let parent = i - lsb(i);
-            if parent > 0 {
-                bit[parent - 1] = std::cmp::min(bit[parent - 1], bit[i - 1]);
+        match self {
+            RevisionSet::Small(small) => {
+                if small.insert(index).is_err() {
+                    let mut tree = BTreeMap::new();
+
+                    let first = small.first().unwrap();
+                    let segment = segment(first);
+                    let next_segment = segment + 1;
+                    let first_in_next_segment = next_segment << SEGMENT_SHIFT;
+
+                    let (left_bits, right_bits) = small.split_at_raw(first_in_next_segment);
+
+                    tree.insert(segment, left_bits);
+
+                    if !right_bits.is_empty() {
+                        tree.insert(next_segment, right_bits);
+                    }
+
+                    *self = RevisionSet::Tree(tree);
+                }
+            }
+            RevisionSet::Tree(tree) => {
+                tree.entry(segment(index))
+                    .or_insert(BitSet::new())
+                    .insert(segment_index(index));
             }
         }
-
-        let mut cache = Vec::new();
-        cache.resize_with(required_len, || Cached::new(0, 0));
-
-        Self {
-            len,
-            min_bit: bit,
-            cache,
-        }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
+    fn contains_range(&self, range: RevisionRange) -> bool {
+        let min = range.earliest.0.get();
+        let max = range.latest.0.get();
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
+        match self {
+            RevisionSet::Small(small) => small.contains_range(min..=max),
+            RevisionSet::Tree(tree) => {
+                let min_segment = segment(min);
+                let max_segment = segment(max);
 
-    /// Push a new value onto the end of the list, returning its index.
-    pub fn push(&mut self, value: u32) {
-        let index = self.len;
-        self.len += 1;
+                if min_segment == max_segment {
+                    let Some(bits) = tree.get(&min_segment) else { return false };
+                    return bits.contains_range(segment_index(min)..=segment_index(max));
+                }
 
-        // pad to the next power of two
-        let required_len = self.len.next_power_of_two();
-        self.min_bit.resize(required_len, u32::MAX);
-        self.cache.resize_with(required_len, || Cached::new(0, 0));
+                let mut segments = tree.range(min_segment..=max_segment);
 
-        self.min_bit[index] = value;
+                macro_rules! next {
+                    () => {{
+                        let Some((segment, bits)) = segments.next() else { return false };
+                        (*segment, *bits)
+                    }};
+                }
 
-        let mut i = index + 1;
-        loop {
-            i -= lsb(i);
-            if i == 0 {
-                break;
-            }
-            self.min_bit[i - 1] = std::cmp::min(value, self.min_bit[i - 1]);
-        }
-    }
+                let (mut segment, mut bits) = next!();
 
-    pub fn min_since(&self, index: usize) -> Option<u32> {
-        let cache = self.cache.get(index)?;
-        if let Some(cached) = cache.get(self.len) {
-            return Some(cached);
-        }
+                if segment == min_segment {
+                    if bits.contains_range(segment_index(min)..) {
+                        return true;
+                    }
+                    (segment, bits) = next!();
+                }
 
-        let mut min = u32::MAX;
+                if segment == max_segment {
+                    return bits.contains_range(..=segment_index(max));
+                }
 
-        let mut i = index + 1;
-        loop {
-            min = std::cmp::min(min, self.min_bit[i - 1]);
-            i += lsb(i);
-            if i > self.min_bit.len() {
-                break;
+                // we found a segment in-between the min and max segments, since there are no empty
+                // segments in the tree, the range contained an item
+                true
             }
         }
+    }
 
-        cache.store(self.len, min);
-
-        Some(min)
+    fn iter(&self) -> impl Iterator<Item = Revision> + '_ {
+        let mut inner = match self {
+            RevisionSet::Small(bits) => Ok(bits.iter()),
+            RevisionSet::Tree(tree) => Err(tree.iter().flat_map(|(segment, bits)| {
+                let segment_start = segment << SEGMENT_SHIFT;
+                bits.iter().map(move |i| segment_start + i)
+            })),
+        };
+        std::iter::from_fn(move || {
+            let next = match &mut inner {
+                Ok(a) => a.next(),
+                Err(b) => b.next(),
+            };
+            next.map(|i| Revision::new(i).unwrap())
+        })
     }
 }
 
-impl Default for MinHistory {
-    fn default() -> Self {
-        Self::new()
+impl std::fmt::Debug for RevisionSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
     }
 }
 
-/// Returns the least significant bit of `x`
-fn lsb(x: usize) -> usize {
-    x & (!x).wrapping_add(1)
-}
+impl range_query::Set for RevisionSet {
+    type Element = Option<Revision>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn revision_history_query() {
-        let mut history = MinHistory::new();
-        history.push(1);
-        history.push(2);
-        history.push(3);
-        assert_eq!(history.min_since(0), Some(1));
-        assert_eq!(history.min_since(1), Some(2));
-        assert_eq!(history.min_since(2), Some(3));
-    }
-
-    #[test]
-    fn revision_history_from_vec() {
-        let history = MinHistory::from_vec(vec![1, 2, 3, 1, 8, 5, 6, 9]);
-        assert_eq!(history.min_since(0), Some(1));
-        assert_eq!(history.min_since(1), Some(1));
-        assert_eq!(history.min_since(2), Some(1));
-        assert_eq!(history.min_since(3), Some(1));
-        assert_eq!(history.min_since(4), Some(5));
-        assert_eq!(history.min_since(5), Some(5));
-        assert_eq!(history.min_since(6), Some(6));
-        assert_eq!(history.min_since(7), Some(9));
-    }
-
-    #[test]
-    fn revision_history_sequential() {
-        let mut history = MinHistory::new();
-        for i in 0..32 {
-            history.push(i as u32);
-            assert_eq!(history.min_since(i), Some(i as u32));
+    fn make(element: Self::Element) -> Self {
+        let mut this = RevisionSet::new();
+        if let Some(revision) = element {
+            this.insert(revision);
         }
+        this
+    }
 
-        let mut history = MinHistory::new();
-        for i in 0..32 {
-            history.push(32 - i as u32);
-            assert_eq!(history.min_since(i), Some(32 - i as u32));
+    fn insert(&mut self, element: &Self::Element) {
+        if let Some(revision) = element {
+            self.insert(*revision);
         }
     }
 
-    fn xorshift(state: &mut u32) -> u32 {
-        let mut x = *state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *state = x;
-        x
-    }
-
-    #[test]
-    fn revision_history_random() {
-        let count = 12703;
-        let mut rng = 123;
-        let values = (0..count).map(|_| xorshift(&mut rng)).collect::<Vec<_>>();
-
-        let mut minimums = values.clone();
-        let mut min = u32::MAX;
-        for i in (0..count).rev() {
-            min = std::cmp::min(minimums[i], min);
-            minimums[i] = min;
-        }
-
-        let history = MinHistory::from_vec(values);
-
-        for _ in 0..10 {
-            for (i, &min) in minimums.iter().enumerate() {
-                assert_eq!(history.min_since(i), Some(min));
-            }
+    fn merge(&mut self, other: &Self) {
+        for revision in other.iter() {
+            self.insert(revision);
         }
     }
 }

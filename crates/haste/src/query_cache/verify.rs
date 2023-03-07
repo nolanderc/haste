@@ -17,12 +17,18 @@ pub fn verify<'a, Q: Query>(
         let Some(last_verified) = slot.last_verified() else { return Err(slot) };
         let Some(previous) = slot.get_output() else { return Err(slot) };
 
+        if previous.dependencies.is_empty() {
+            // the query does not depend on any side-effects, so is trivially verified.
+            tracing::debug!(reason = "no dependencies", "backdating");
+            return Ok(slot.backdate());
+        }
+
         let runtime = db.runtime();
 
-        let latest_input = previous.transitive.latest_input;
+        let inputs = previous.transitive.inputs;
         let durability = previous.transitive.durability;
 
-        if inputs_unchanged(runtime, last_verified, latest_input, durability) {
+        if inputs_unchanged(runtime, last_verified, inputs, durability) {
             tracing::debug!(reason = "inputs unchanged", "backdating");
             return Ok(slot.backdate());
         }
@@ -30,7 +36,7 @@ pub fn verify<'a, Q: Query>(
         let dependencies = unsafe { storage.dependencies(previous.dependencies) };
         if let Some(transitive) = dependencies_unchanged(db, last_verified, dependencies).await {
             tracing::debug!(reason = "dependencies unchanged", "backdating");
-            previous.transitive.extend(transitive);
+            previous.transitive = transitive;
             return Ok(slot.backdate());
         }
 
@@ -41,20 +47,13 @@ pub fn verify<'a, Q: Query>(
 fn inputs_unchanged(
     runtime: &Runtime,
     last_verified: Revision,
-    latest_dependency: Option<Revision>,
+    inputs: Option<RevisionRange>,
     durability: Durability,
 ) -> bool {
-    match latest_dependency {
-        // there are no dependencies, so the value is constant
+    match inputs {
+        // there are no input dependencies, so the value is constant
         None => true,
-
-        // This query only depends on inputs in the revisions `..=latest_dependency`.
-        // If the only changes made to dependencies are in the range `latest_dependency+1..`
-        // the output of this query cannot have changed.
-        Some(latest_dependency) => {
-            let earliest_change = runtime.earliest_change_since(last_verified, durability);
-            latest_dependency < earliest_change
-        }
+        Some(range) => !runtime.any_changed_since(range, last_verified, durability),
     }
 }
 

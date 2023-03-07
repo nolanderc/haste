@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     non_max::NonMaxU32, util::CallOnDrop, ContainerPath, Database, DatabaseFor, Durability,
-    IngredientPath, Query, TransitiveDependencies,
+    IngredientPath, Query, RevisionRange, TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
@@ -51,8 +51,14 @@ impl Runtime {
         self.revisions.push_update(changed_at, durability)
     }
 
-    pub fn earliest_change_since(&self, revision: Revision, durability: Durability) -> Revision {
-        self.revisions.earliest_change_since(revision, durability)
+    pub(crate) fn any_changed_since(
+        &self,
+        range: RevisionRange,
+        last_verified: Revision,
+        durability: Durability,
+    ) -> bool {
+        self.revisions
+            .any_changed_since(range, last_verified, durability)
     }
 }
 
@@ -304,8 +310,12 @@ impl Runtime {
         this: IngredientPath,
     ) -> ExecFuture<'db, Q> {
         let transitive = if Q::IS_INPUT {
+            let current = self.current_revision();
             TransitiveDependencies {
-                latest_input: Some(self.current_revision()),
+                inputs: Some(RevisionRange {
+                    earliest: current,
+                    latest: current,
+                }),
                 durability: Durability::MEDIUM,
             }
         } else {

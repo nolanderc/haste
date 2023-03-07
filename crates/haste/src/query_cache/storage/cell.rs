@@ -184,31 +184,28 @@ impl<I, O> QueryCell<I, O> {
         (self.state.addr.load(Acquire) & HAS_INPUT) != 0
     }
 
-    pub fn set_output(
-        &mut self,
-        value: O,
-        durability: Durability,
-        runtime: &mut Runtime,
-    ) -> Revision {
+    pub fn set_output<F>(&mut self, runtime: &mut Runtime, durability: Durability, make_output: F)
+    where
+        F: FnOnce(Revision) -> O,
+    {
         let state = self.state.addr.get_mut();
         let output = self.output.get_mut();
+
+        let last_change = self.state.changed_at.get();
+        let current = runtime.update_input(last_change, durability);
+
+        let value = make_output(current);
 
         let had_input = (*state & HAS_OUTPUT) != 0;
         if had_input {
             unsafe { output.assume_init_drop() }
         }
-
         output.write(value);
 
         *state |= HAS_OUTPUT;
 
-        let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(last_change, durability);
-
         self.state.verified_at.set(Some(current));
         self.state.changed_at.set(Some(current));
-
-        current
     }
 
     /// # Safety

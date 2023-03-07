@@ -12,7 +12,7 @@ use crate::{
 use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
-pub use self::storage::{ChangeFuture, TransitiveDependencies};
+pub use self::storage::{ChangeFuture, RevisionRange, TransitiveDependencies};
 
 pub trait QueryCache: DynQueryCache {
     type Query: Query;
@@ -466,18 +466,21 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let result = std::task::ready!(this.inner.poll(cx));
         let new = this.storage.create_output(result);
 
+        let mut slot = this.slot.take().unwrap();
+
         if let Some(previous) = slot.get_output() {
             if new.output == previous.output {
                 // backdate the result (verify the output, but keep the revision it was last
                 // changed)
+                tracing::debug!(reason = "output unchanged", "backdating");
                 previous.dependencies = new.dependencies;
                 previous.transitive = new.transitive;
-                let slot = this.slot.take().unwrap().backdate();
+                let slot = slot.backdate();
                 return Poll::Ready(QueryResult { id, slot });
             }
         }
 
-        let slot = this.slot.take().unwrap().finish(new);
+        let slot = slot.finish(new);
         Poll::Ready(QueryResult { id, slot })
     }
 }

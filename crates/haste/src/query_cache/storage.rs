@@ -13,7 +13,7 @@ use self::cell::QueryCell;
 
 pub use self::cell::ChangeFuture;
 
-pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>>;
+pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>> + Unpin;
 
 pub struct QueryStorage<Q: Query> {
     /// Stores data about every query.
@@ -266,10 +266,7 @@ impl<Q: Query> QuerySlot<Q> {
     ///
     /// Only the current revision of the database must be used.
     pub unsafe fn wait_until_verified(&self, current: Revision) -> WaitFuture<Q> {
-        async move {
-            self.cell.wait_until_verified(current).await;
-            unsafe { self.cell.output_assume_init() }
-        }
+        self.cell.wait_until_verified(current)
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -307,9 +304,11 @@ impl<Q: Query> QuerySlot<Q> {
     }
 
     pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture<'_> {
-        self.cell.wait_for_change(revision, |output| unsafe {
-            std::ptr::addr_of!((*output).transitive)
-        })
+        unsafe {
+            self.cell.wait_for_change(revision, |output| {
+                std::ptr::addr_of!((*output.cast::<OutputSlot<Q>>()).transitive).cast()
+            })
+        }
     }
 
     pub unsafe fn try_get(&self, current: Revision) -> Option<&OutputSlot<Q>> {

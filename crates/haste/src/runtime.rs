@@ -6,7 +6,7 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Poll, Waker},
 };
 
@@ -22,7 +22,7 @@ use self::{cycle::CycleGraph, history::ChangeHistory, task::Scheduler};
 
 pub struct Runtime {
     scheduler: Arc<Scheduler>,
-    graph: Mutex<CycleGraph>,
+    graph: CycleGraph,
     revisions: ChangeHistory,
 }
 
@@ -157,8 +157,6 @@ pub(crate) struct ExecFuture<'db, Q: Query> {
     inner: ExecFutureInner<'db, Q>,
     /// The query is currently blocking this query.
     blocks: Option<IngredientPath>,
-    /// A span representing the duration of the query.
-    span: tracing::Span,
 }
 
 #[pin_project::pin_project(project = ExecFutureInnerProj)]
@@ -177,10 +175,6 @@ impl<'db, Q: Query> ExecFuture<'db, Q> {
     pub fn query(&self) -> IngredientPath {
         self.task.as_ref().unwrap().this
     }
-
-    pub fn database(&self) -> &DatabaseFor<Q> {
-        self.db
-    }
 }
 
 #[pin_project::pinned_drop]
@@ -198,7 +192,6 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         ACTIVE.with(|active| {
             let this = self.project();
-            let _guard = this.span.enter();
 
             if this.task.is_none() {
                 panic!("polled query after it has already completed");
@@ -277,10 +270,6 @@ impl Runtime {
             inner: ExecFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new(this, transitive)),
             blocks: None,
-            span: tracing::error_span!(
-                "execute",
-                query = %crate::util::fmt::ingredient(db.as_dyn(), this),
-            ),
         }
     }
 
@@ -309,19 +298,16 @@ impl Runtime {
         waker: &Waker,
         db: &dyn Database,
     ) {
-        tracing::debug!(
+        tracing::trace!(
             child = %crate::util::fmt::ingredient(db, child),
             "would block on",
         );
-        self.graph.lock().unwrap().insert(parent, child, waker, db);
+        self.graph.insert(parent, child, waker, db);
     }
 
     pub(crate) fn unblock(&self, parent: IngredientPath) {
-        tracing::debug!("unblocked");
-
-        if let Ok(mut graph) = self.graph.lock() {
-            graph.remove(parent);
-        }
+        tracing::trace!("unblocked");
+        self.graph.remove(parent);
     }
 
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T)
@@ -337,7 +323,7 @@ impl Runtime {
                 Box<dyn QueryTask + Send + 'static>,
             >(Box::new(task));
 
-            self.scheduler.spawn(task);
+            self.scheduler.spawn(task).schedule();
         }
     }
 

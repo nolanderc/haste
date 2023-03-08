@@ -131,14 +131,14 @@ impl Scheduler {
         }
     }
 
-    pub fn spawn(self: &Arc<Scheduler>, task: Box<dyn QueryTask + Send>) {
+    #[must_use = "spawned tasks are only executed if scheduled"]
+    pub(super) fn spawn(self: &Arc<Scheduler>, task: Box<dyn QueryTask + Send>) -> RawTask {
         assert!(
             self.state.load(Relaxed) == RUNNING,
             "attempted to spawn task in scheduler which is not running"
         );
 
-        let task = RawTask::new(task, Arc::downgrade(self));
-        self.schedule(task);
+        RawTask::new(task, Arc::downgrade(self))
     }
 
     fn schedule(&self, task: RawTask) {
@@ -182,6 +182,10 @@ impl RawTask {
 
     pub fn poll(self) {
         self.0.try_poll();
+    }
+
+    pub fn schedule(self) {
+        self.0.schedule();
     }
 }
 

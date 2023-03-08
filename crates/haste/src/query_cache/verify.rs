@@ -1,47 +1,45 @@
+use futures_lite::FutureExt;
+
 use crate::{revision::Revision, Dependency};
 
 use super::*;
 
-pub type VerifyFuture<'a, Q: Query> =
-    impl Future<Output = Result<&'a OutputSlot<Q>, ClaimedSlot<'a, Q>>> + 'a;
+pub type VerifyFuture<'a, Q: Query> = impl Future<Output = VerifyResult<'a, Q>> + 'a;
 
-/// Verify that the query slot is up-to-date with respect to its dependencies.
-/// If this returns `None`, the query needs to be re-executed, otherwise it returns the verified
-/// output.
-pub fn verify<'a, Q: Query>(
-    db: &'a dyn Database,
-    storage: &'a QueryStorage<Q>,
-    mut slot: ClaimedSlot<'a, Q>,
-) -> VerifyFuture<'a, Q> {
-    async move {
-        let Some(last_verified) = slot.last_verified() else { return Err(slot) };
-        let Some(previous) = slot.get_output() else { return Err(slot) };
+pub type VerifyResult<'a, Q> = Result<&'a OutputSlot<Q>, VerifyData<'a, Q>>;
 
-        if previous.dependencies.is_empty() {
-            // the query does not depend on any side-effects, so is trivially verified.
+pub struct VerifyData<'a, Q: Query> {
+    pub db: &'a DatabaseFor<Q>,
+    pub slot: ClaimedSlot<'a, Q>,
+    pub storage: &'a QueryStorage<Q>,
+}
+
+pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, VerifyFuture<Q>> {
+    let mut data = data;
+    let Some(last_verified) = data.slot.last_verified() else { return Ok(Err(data)) };
+    let Some(previous) = data.slot.get_output() else { return Ok(Err(data)) };
+
+    if previous.dependencies.is_empty() {
+        // the query does not depend on any side-effects, so is trivially verified.
+        if !Q::IS_INPUT {
             tracing::debug!(reason = "no dependencies", "backdating");
-            return Ok(slot.backdate());
         }
-
-        let runtime = db.runtime();
-
-        let inputs = previous.transitive.inputs;
-        let durability = previous.transitive.durability;
-
-        if inputs_unchanged(runtime, last_verified, inputs, durability) {
-            tracing::debug!(reason = "inputs unchanged", "backdating");
-            return Ok(slot.backdate());
-        }
-
-        let dependencies = unsafe { storage.dependencies(previous.dependencies) };
-        if let Some(transitive) = dependencies_unchanged(db, last_verified, dependencies).await {
-            tracing::debug!(reason = "dependencies unchanged", "backdating");
-            previous.transitive = transitive;
-            return Ok(slot.backdate());
-        }
-
-        Err(slot)
+        return Ok(Ok(data.slot.backdate()));
     }
+
+    let runtime = data.db.runtime();
+
+    let inputs = previous.transitive.inputs;
+    let durability = previous.transitive.durability;
+
+    if inputs_unchanged(runtime, last_verified, inputs, durability) {
+        tracing::debug!(reason = "inputs unchanged", "backdating");
+        return Ok(Ok(data.slot.backdate()));
+    }
+
+    let dependencies = unsafe { data.storage.dependencies(previous.dependencies) };
+
+    Err(verify_deep(data, last_verified, dependencies))
 }
 
 fn inputs_unchanged(
@@ -57,26 +55,84 @@ fn inputs_unchanged(
     }
 }
 
-async fn dependencies_unchanged(
-    db: &dyn Database,
+fn verify_deep<'a, Q: Query>(
+    mut data: VerifyData<'a, Q>,
     last_verified: Revision,
-    dependencies: &[Dependency],
-) -> Option<TransitiveDependencies> {
-    let mut transitive = TransitiveDependencies::CONSTANT;
+    dependencies: &'a [Dependency],
+) -> VerifyFuture<'a, Q> {
+    crate::util::future::map(
+        CheckDeepFuture::new(data.db.as_dyn(), last_verified, dependencies),
+        move |unchanged| match unchanged {
+            None => Err(data),
+            Some(transitive) => {
+                tracing::debug!(reason = "dependencies unchanged", "backdating");
+                if let Some(previous) = data.slot.get_output() {
+                    previous.transitive = transitive;
+                }
+                return Ok(data.slot.backdate());
+            }
+        },
+    )
+}
 
-    for &dependency in dependencies {
-        let change = db.last_change(dependency).await;
+struct CheckDeepFuture<'a> {
+    db: &'a dyn Database,
+    last_verified: Revision,
+    dependencies: std::slice::Iter<'a, Dependency>,
 
-        if Some(last_verified) < change.changed_at {
-            tracing::debug!(
-                dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
-                "change detected"
-            );
-            return None;
+    transitive: TransitiveDependencies,
+
+    pending: Option<(Dependency, ChangeFuture<'a>)>,
+}
+
+impl<'a> CheckDeepFuture<'a> {
+    fn new(db: &'a dyn Database, last_verified: Revision, dependencies: &'a [Dependency]) -> Self {
+        Self {
+            db,
+            last_verified,
+            dependencies: dependencies.iter(),
+            transitive: TransitiveDependencies::CONSTANT,
+            pending: None,
         }
-
-        transitive.extend(change.transitive);
     }
+}
 
-    Some(transitive)
+impl Future for CheckDeepFuture<'_> {
+    type Output = Option<TransitiveDependencies>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let db = self.db;
+
+        loop {
+            let dependency;
+            let change;
+
+            if let Some((dep, ref mut future)) = self.pending {
+                dependency = dep;
+                change = std::task::ready!(future.poll(cx));
+                self.pending = None;
+            } else if let Some(dep) = self.dependencies.next() {
+                dependency = *dep;
+                match db.last_change(dependency) {
+                    LastChangeFuture::Ready(ready) => change = ready,
+                    LastChangeFuture::Pending(pending) => {
+                        self.pending = Some((dependency, pending));
+                        continue;
+                    }
+                }
+            } else {
+                return Poll::Ready(Some(self.transitive));
+            };
+
+            if Some(self.last_verified) < change.changed_at {
+                tracing::debug!(
+                    dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
+                    "change detected"
+                );
+                return Poll::Ready(None);
+            }
+
+            self.transitive.extend(change.transitive);
+        }
+    }
 }

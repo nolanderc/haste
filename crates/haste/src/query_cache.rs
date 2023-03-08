@@ -14,6 +14,7 @@ use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture
 
 pub use self::lookup::*;
 pub use self::storage::{ChangeFuture, RevisionRange, TransitiveDependencies};
+use self::verify::VerifyData;
 
 pub trait QueryCache: DynQueryCache {
     type Query: Query;
@@ -119,10 +120,15 @@ where
                 })
             }
             Err(None) => {}
-            Ok(claim) => {
-                let task = self.execute_query(db.cast_dyn(), id, claim);
-                db.runtime().spawn_query(task);
-            }
+            Ok(claim) => match self.execute_query(db.cast_dyn(), id, claim) {
+                Err(output) => {
+                    return LastChangeFuture::Ready(Change {
+                        changed_at: slot.last_changed(),
+                        transitive: output.slot.transitive,
+                    })
+                }
+                Ok(task) => db.runtime().spawn_query(task),
+            },
         }
 
         LastChangeFuture::Pending(slot.wait_for_change(current))
@@ -137,13 +143,6 @@ where
 
     fn get_or_evaluate<'a>(&'a self, db: &'a DatabaseFor<Q>, input: Q::Input) -> EvalResult<'a, Q> {
         let (id, slot) = self.lookup.get_or_insert(input, &self.storage);
-
-        let span = tracing::trace_span!(
-            "get_or_evaluate",
-            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
-        );
-        let _guard = span.entered();
-
         self.get_or_evaluate_slot(db, id, slot)
     }
 
@@ -207,10 +206,33 @@ pub struct QueryResult<'a, Q: Query> {
     pub slot: &'a OutputSlot<Q>,
 }
 
+impl<'a, Q: Query> Copy for QueryResult<'a, Q> {}
+impl<'a, Q: Query> Clone for QueryResult<'a, Q> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            slot: self.slot,
+        }
+    }
+}
+
+#[pin_project::pin_project(project = EvalResultProj)]
 pub enum EvalResult<'a, Q: Query> {
     Cached(QueryResult<'a, Q>),
-    Pending(PendingFuture<'a, Q>),
-    Eval(QueryCacheTask<'a, Q>),
+    Pending(#[pin] PendingFuture<'a, Q>),
+    Eval(#[pin] QueryCacheTask<'a, Q>),
+}
+
+impl<'a, Q: Query> Future for EvalResult<'a, Q> {
+    type Output = QueryResult<'a, Q>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            EvalResultProj::Cached(cached) => std::task::Poll::Ready(*cached),
+            EvalResultProj::Pending(pending) => pending.poll(cx),
+            EvalResultProj::Eval(eval) => eval.poll(cx),
+        }
+    }
 }
 
 /// # Safety
@@ -302,10 +324,19 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         id: Id,
         slot: &'a QuerySlot<Q>,
     ) -> EvalResult<'a, Q> {
+        let span = tracing::trace_span!(
+            "get_or_evaluate",
+            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
+        );
+        let _guard = span.entered();
+
         match self.claim(slot) {
             Ok(slot) => {
-                tracing::trace!("needs to be evaluated");
-                EvalResult::Eval(self.execute_query(db, id, slot))
+                tracing::trace!("out of date");
+                match self.execute_query(db, id, slot) {
+                    Ok(task) => EvalResult::Eval(task),
+                    Err(backdated) => EvalResult::Cached(backdated),
+                }
             }
             Err(None) => {
                 tracing::trace!("wait until completed");
@@ -327,17 +358,31 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         db: &'a DatabaseFor<Q>,
         id: Id,
         slot: ClaimedSlot<'a, Q>,
-    ) -> QueryCacheTask<'a, Q> {
+    ) -> Result<QueryCacheTask<'a, Q>, QueryResult<'a, Q>> {
         let this = self.ingredient(id);
-        QueryCacheTask {
-            state: TaskState::Verify {
-                db,
+
+        let verify_data = verify::VerifyData {
+            db,
+            storage: &self.storage,
+            slot,
+        };
+
+        let state = match verify::verify_shallow(verify_data) {
+            Ok(Ok(slot)) => return Err(QueryResult { id, slot }),
+            Ok(Err(data)) => TaskState::execute(this, data),
+            Err(deep_verify) => TaskState::Verify {
+                future: deep_verify,
                 path: this,
-                storage: &self.storage,
-                future: verify::verify(db.as_dyn(), &self.storage, slot),
             },
-            span: None,
-        }
+        };
+
+        let span = tracing::debug_span!(
+            parent: None,
+            "evaluate",
+            query = %crate::util::fmt::ingredient(db.as_dyn(), this),
+        );
+
+        Ok(QueryCacheTask { state, span })
     }
 
     fn ingredient(&self, id: Id) -> IngredientPath {
@@ -352,35 +397,30 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
 pub struct QueryCacheTask<'a, Q: Query> {
     #[pin]
     state: TaskState<'a, Q>,
-    /// A span representing the duration of the query.
-    span: Option<tracing::Span>,
+    // /// A span representing the duration of the query.
+    span: tracing::Span,
 }
 
 #[pin_project::pin_project(project = TaskStateProj)]
 enum TaskState<'a, Q: Query> {
     Verify {
-        db: &'a DatabaseFor<Q>,
-        storage: &'a QueryStorage<Q>,
-        path: IngredientPath,
         #[pin]
         future: verify::VerifyFuture<'a, Q>,
+        path: IngredientPath,
     },
     Exec(#[pin] ExecTaskFuture<'a, Q>),
 }
 
 impl<'a, Q: Query> TaskState<'a, Q> {
-    fn path(&self) -> IngredientPath {
-        match &self {
-            TaskState::Verify { path, .. } => *path,
-            TaskState::Exec(future) => future.inner.query(),
-        }
-    }
-
-    fn database(&self) -> &DatabaseFor<Q> {
-        match &self {
-            TaskState::Verify { db, .. } => *db,
-            TaskState::Exec(future) => future.inner.database(),
-        }
+    fn execute(path: IngredientPath, data: VerifyData<'a, Q>) -> Self {
+        let VerifyData { db, slot, storage } = data;
+        let input = slot.input().clone();
+        let inner = db.runtime().execute_query(db, input, path);
+        TaskState::Exec(ExecTaskFuture {
+            storage,
+            slot: Some(slot),
+            inner,
+        })
     }
 }
 
@@ -403,39 +443,22 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        if this.span.is_none() {
-            *this.span = Some(tracing::debug_span!(
-                parent: None,
-                "evaluate",
-                query = %crate::util::fmt::ingredient(this.state.database().as_dyn(), this.state.path()),
-            ));
-        }
-
-        let _guard = this.span.as_ref().map(|span| span.enter());
+        let _span_guard = this.span.enter();
 
         loop {
             match this.state.as_mut().project() {
-                TaskStateProj::Verify {
-                    future,
-                    path,
-                    db,
-                    storage,
-                } => match std::task::ready!(Future::poll(future, cx)) {
-                    Ok(slot) => {
-                        let id = path.resource;
-                        break Poll::Ready(QueryResult { id, slot });
+                TaskStateProj::Verify { future, path } => {
+                    match std::task::ready!(Future::poll(future, cx)) {
+                        Ok(slot) => {
+                            let id = path.resource;
+                            break Poll::Ready(QueryResult { id, slot });
+                        }
+                        Err(data) => {
+                            let next = TaskState::execute(*path, data);
+                            this.state.set(next);
+                        }
                     }
-                    Err(slot) => {
-                        let input = slot.input().clone();
-                        let inner = db.runtime().execute_query(*db, input, *path);
-                        let next = TaskState::Exec(ExecTaskFuture {
-                            storage,
-                            slot: Some(slot),
-                            inner,
-                        });
-                        this.state.set(next);
-                    }
-                },
+                }
                 TaskStateProj::Exec(future) => break Future::poll(future, cx),
             }
         }

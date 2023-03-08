@@ -1,8 +1,12 @@
-use std::{future::Future, pin::Pin};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
-    revision::Revision, Database, Dependency, DynQueryCache, Runtime, StaticDatabase,
-    TransitiveDependencies, WithStorage,
+    non_max::NonMaxU32, revision::Revision, Database, Dependency, DynQueryCache, Runtime,
+    StaticDatabase, TransitiveDependencies, WithStorage,
 };
 
 /// Stores the containers for all ingredients in a database.
@@ -90,6 +94,53 @@ pub struct IngredientPath {
 impl std::fmt::Debug for IngredientPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.container.index, self.resource.raw,)
+    }
+}
+
+impl IngredientPath {
+    pub(crate) fn ordered(self) -> impl Ord {
+        (self.container.index, self.resource.raw.get())
+    }
+}
+
+#[derive(bytemuck::Zeroable)]
+pub struct AtomicIngredientPath {
+    bits: AtomicU64,
+}
+
+impl AtomicIngredientPath {
+    pub fn new(value: Option<IngredientPath>) -> Self {
+        Self {
+            bits: AtomicU64::new(Self::encode(value)),
+        }
+    }
+
+    pub fn store(&self, value: Option<IngredientPath>, order: Ordering) {
+        self.bits.store(Self::encode(value), order)
+    }
+
+    pub fn load(&self, order: Ordering) -> Option<IngredientPath> {
+        Self::decode(self.bits.load(order))
+    }
+
+    fn encode(value: Option<IngredientPath>) -> u64 {
+        match value {
+            Some(path) => {
+                let container = path.container.index as u64;
+                let resource = path.resource.raw.get() as u64 + 1;
+                (container << 32) | resource
+            }
+            None => 0,
+        }
+    }
+
+    fn decode(value: u64) -> Option<IngredientPath> {
+        let container = (value >> 32) as u16;
+        let resource = (value as u32).wrapping_sub(1);
+        Some(IngredientPath {
+            container: ContainerPath { index: container },
+            resource: crate::Id::new(NonMaxU32::new(resource)?),
+        })
     }
 }
 

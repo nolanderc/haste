@@ -75,11 +75,23 @@ fn main() {
     tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .without_time()
+        .with_target(false)
         .init();
 
     let mut db = Database::default();
 
     let start = std::time::Instant::now();
+
+    haste::scope(&mut db, |scope, db| {
+        scope.block_on(async {
+            cyclic::inline(db, 8).await;
+            haste::util::debug_size_val(&cyclic(db, 8));
+            haste::util::debug_size_val(&cyclic::inline(db, 8));
+            haste::util::debug_size_val(&cyclic::cyclic(db, 8));
+
+            dbg!(cyclic(db, 8).await);
+        })
+    });
 
     db.set_input::<file>("bar", "345".into(), Durability::HIGH);
     db.set_input::<file>("foo", "123".into(), Durability::LOW);

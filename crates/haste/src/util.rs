@@ -1,4 +1,5 @@
 pub mod fmt;
+pub mod future;
 mod signal;
 
 pub use signal::{DropSignal, Signal, WaitSignal};
@@ -28,4 +29,22 @@ impl<T> std::ops::DerefMut for SendWrapper<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+#[allow(dead_code)]
+pub fn debug_size<T: Sized>() {
+    eprintln!(
+        "{}: {}",
+        std::any::type_name::<T>(),
+        std::mem::size_of::<T>()
+    );
+}
+
+#[allow(dead_code)]
+pub fn debug_size_val<T: Sized>(_val: &T) {
+    eprintln!(
+        "{}: {}",
+        std::any::type_name::<T>(),
+        std::mem::size_of::<T>()
+    );
 }

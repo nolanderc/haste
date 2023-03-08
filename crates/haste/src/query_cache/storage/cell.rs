@@ -10,9 +10,11 @@ use std::{
 };
 
 use bytemuck::Zeroable;
+use futures_lite::FutureExt;
 use smallvec::SmallVec;
 
 use crate::{
+    non_max::NonMaxU32,
     revision::{AtomicRevision, Revision},
     Change, Cycle, Durability, Runtime,
 };
@@ -48,6 +50,7 @@ impl<T> SyncCell<T> {
         (*self.0.get()).assume_init_ref()
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn assume_init_mut(&self) -> &mut T {
         (*self.0.get()).assume_init_mut()
     }
@@ -139,7 +142,7 @@ impl<I, T> Default for QueryCell<I, T> {
     }
 }
 
-pub type ChangeFuture<'a> = impl Future<Output = Change> + Send + 'a;
+pub type ChangeFuture<'a> = impl Future<Output = Change> + Send + Unpin + 'a;
 
 impl<I, O> QueryCell<I, O> {
     pub fn new() -> Self {
@@ -341,18 +344,23 @@ impl<I, O> QueryCell<I, O> {
     }
 
     /// Waits until the output value has been set
-    pub async fn wait_until_verified(&self, revision: Revision) {
-        self.state.wait(revision).await
+    pub fn wait_until_verified(&self, revision: Revision) -> impl Future<Output = &O> + Unpin + '_ {
+        let mut wait = State::wait_any(self, revision);
+        std::future::poll_fn(move |cx| {
+            std::task::ready!(wait.poll(cx));
+            std::task::Poll::Ready(unsafe { wait.state.output_assume_init() })
+        })
     }
 
     /// Waits until the output value has been set
-    pub fn wait_for_change(
+    pub unsafe fn wait_for_change(
         &self,
         revision: Revision,
-        get_deps: impl FnOnce(*const O) -> *const TransitiveDependencies,
+        get_deps: impl FnOnce(
+            *const UnsafeCell<MaybeUninit<O>>,
+        ) -> *const UnsafeCell<MaybeUninit<TransitiveDependencies>>,
     ) -> ChangeFuture {
-        let output_ptr = unsafe { (*self.output.0.get()).as_ptr() };
-        let deps_ptr = get_deps(output_ptr);
+        let deps_ptr = get_deps(&self.output.0);
         self.state.wait_for_change(revision, deps_ptr)
     }
 
@@ -391,72 +399,124 @@ impl<I, O> QueryCell<I, O> {
     }
 }
 
+struct Wait<S> {
+    state: S,
+    revision: Revision,
+    registered: Option<NonMaxU32>,
+}
+
+impl<S> Future for Wait<S>
+where
+    S: AsQueryState + Unpin,
+{
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut this = &mut *self;
+        let state = this.state.as_state();
+        let revision = this.revision;
+
+        if state.verified_at.load(Acquire) == Some(revision) {
+            // SAFETY: we used `Acquire` ordering, so we synchronized with the write
+            return std::task::Poll::Ready(());
+        }
+
+        // lock the state
+        let mut lock = state.lock();
+
+        // Maybe the value was written while we were waiting for the lock?
+        if state.verified_at.load(Relaxed) == Some(revision) {
+            // SAFETY: since we grabbed the lock, we are synchronized with the write
+            return std::task::Poll::Ready(());
+        }
+
+        let blocked = lock.get_or_init();
+        let wakers = &mut blocked.wakers;
+
+        // register our waker in the state
+        let current_waker = cx.waker();
+        match this.registered {
+            // we need to register our waker to be polled again
+            None => {
+                this.registered = NonMaxU32::new(wakers.len() as u32);
+                wakers.push(current_waker.clone());
+            }
+            // we already have a waker installed
+            Some(index) => {
+                let old = &mut wakers[index.get() as usize];
+                if !old.will_wake(current_waker) {
+                    // we were polled with a new waker, so replace the old
+                    *old = current_waker.clone();
+                }
+            }
+        }
+
+        std::task::Poll::Pending
+    }
+}
+
+trait AsQueryState {
+    fn as_state(&self) -> &State;
+}
+
+impl<T> AsQueryState for &T
+where
+    T: AsQueryState,
+{
+    fn as_state(&self) -> &State {
+        T::as_state(self)
+    }
+}
+
+impl<I, O> AsQueryState for QueryCell<I, O> {
+    fn as_state(&self) -> &State {
+        &self.state
+    }
+}
+
+impl AsQueryState for State {
+    fn as_state(&self) -> &State {
+        self
+    }
+}
+
 impl State {
+    fn wait_any<S>(state: S, revision: Revision) -> Wait<S>
+    where
+        Wait<S>: Future,
+    {
+        Wait {
+            state,
+            revision,
+            registered: None,
+        }
+    }
+
     /// Returns a future which completes once the value has been written.
-    fn wait(&self, revision: Revision) -> impl Future<Output = ()> + '_ {
-        // If we have registered the current task, this is the index in the list of wakers this
-        // task's waker occupies.
-        let mut registered = None;
-
-        std::future::poll_fn(move |ctx| {
-            if self.verified_at.load(Acquire) == Some(revision) {
-                // SAFETY: we used `Acquire` ordering, so we synchronized with the write
-                return std::task::Poll::Ready(());
-            }
-
-            // lock the state
-            let mut lock = self.lock();
-
-            // Maybe the value was written while we were waiting for the lock?
-            if self.verified_at.load(Relaxed) == Some(revision) {
-                // SAFETY: since we grabbed the lock, we are synchronized with the write
-                return std::task::Poll::Ready(());
-            }
-
-            let blocked = lock.get_or_init();
-            let wakers = &mut blocked.wakers;
-
-            // register our waker in the state
-            let current_waker = ctx.waker();
-            match registered {
-                // we need to register our waker to be polled again
-                None => {
-                    registered = Some(wakers.len());
-                    wakers.push(current_waker.clone());
-                }
-                // we already have a waker installed
-                Some(index) => {
-                    let old = &mut wakers[index];
-                    if !old.will_wake(current_waker) {
-                        // we were polled with a new waker, so replace the old
-                        *old = current_waker.clone();
-                    }
-                }
-            }
-
-            std::task::Poll::Pending
-        })
+    fn wait(&self, revision: Revision) -> Wait<&Self> {
+        Self::wait_any(self, revision)
     }
 
     fn wait_for_change(
         &self,
         revision: Revision,
-        transitive: *const TransitiveDependencies,
+        transitive: *const UnsafeCell<MaybeUninit<TransitiveDependencies>>,
     ) -> ChangeFuture {
         let future = self.wait(revision);
         let transitive = crate::util::SendWrapper(transitive);
 
-        async move {
-            future.await;
-
-            let transitive: TransitiveDependencies = unsafe { **transitive };
+        crate::util::future::map(future, move |()| {
+            let transitive = unsafe { (*UnsafeCell::raw_get(*transitive)).assume_init_read() };
             let changed_at = self.changed_at.load(Relaxed);
 
             Change {
                 changed_at,
                 transitive,
             }
-        }
+        })
     }
 
     fn lock(&self) -> StateLock<'_> {

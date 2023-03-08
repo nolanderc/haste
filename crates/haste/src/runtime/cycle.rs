@@ -1,35 +1,39 @@
-use std::{cell::Cell, sync::Arc, task::Waker};
+use std::{
+    sync::{atomic::Ordering::Relaxed, Arc, Mutex, RwLock},
+    task::Waker,
+};
 
 use ahash::HashMap;
+use dashmap::DashMap;
 use smallvec::SmallVec;
 
-use crate::{ContainerPath, Database, IngredientPath};
+use crate::{AtomicIngredientPath, ContainerPath, Database, IngredientPath};
 
 #[derive(Default)]
 pub struct CycleGraph {
     /// For each currently blocked query: the query they are blocked on
-    vertices: HashMap<IngredientPath, Vertex>,
+    vertices: DashMap<IngredientPath, Vertex>,
 
-    /// For each query: its cycle recovery strategy
-    recover_strategies: HashMap<ContainerPath, CycleStrategy>,
+    /// For each kind of query: its cycle recovery strategy
+    recover_strategies: RwLock<HashMap<ContainerPath, CycleStrategy>>,
 }
 
 struct Vertex {
     /// The query this is blocked on
     blocked_on: IngredientPath,
-    /// Points to a query which is known to be further down the dependency chain. This pointer
-    /// is only valid for as long as the corresponding query is a valid `Vertex`. This is used
-    /// as an optimization to reduce the number nodes that need to be visited when detecting
-    /// cycles, similar to path shortening found in
-    /// [Disjoint-Sets](https://en.wikipedia.org/wiki/Disjoint-set_data_structure).
-    shortcut: Cell<IngredientPath>,
 
-    waker: Waker,
+    /// Points to a query which is known to be further down the dependency chain. This is used as
+    /// an optimization to reduce the number nodes that need to be visited when detecting cycles,
+    /// similar to path shortening found in
+    /// [Disjoint-Sets](https://en.wikipedia.org/wiki/Disjoint-set_data_structure).
+    shortcut: AtomicIngredientPath,
+
+    waker: Mutex<Option<Waker>>,
 }
 
 impl CycleGraph {
     pub fn insert(
-        &mut self,
+        &self,
         source: IngredientPath,
         target: IngredientPath,
         waker: &Waker,
@@ -37,40 +41,44 @@ impl CycleGraph {
     ) {
         let vertex = Vertex {
             blocked_on: target,
-            shortcut: Cell::new(target),
-            waker: waker.clone(),
+            shortcut: AtomicIngredientPath::new(None),
+            waker: Mutex::new(Some(waker.clone())),
         };
 
         if let Some(previous) = self.vertices.insert(source, vertex) {
             panic!(
                 concat!(
-                    "the query `{:?}` is blocked on two queries at once ({:?} and {:?})",
+                    "the query `{:?}` is blocked on two queries at once (`{:?}` and `{:?}`)",
                     "\nhelp: use `spawn` or `prefetch` to evaluate queries concurrently"
                 ),
-                source, previous.blocked_on, target
+                crate::util::fmt::ingredient(db, source),
+                crate::util::fmt::ingredient(db, previous.blocked_on),
+                crate::util::fmt::ingredient(db, target),
             );
         }
 
-        self.detect_cycle(source, db);
+        self.resolve_cycle(source, db);
     }
 
-    pub fn remove(&mut self, source: IngredientPath) {
+    pub fn remove(&self, source: IngredientPath) {
         if self.vertices.remove(&source).is_none() {
             panic!("called `remove` on an edge that does not exist")
         }
     }
 
-    fn detect_cycle(&mut self, source: IngredientPath, db: &dyn Database) {
-        if !self.is_cyclic(source) {
-            return;
-        }
+    fn resolve_cycle(&self, source: IngredientPath, db: &dyn Database) {
+        let Some((start, min_length)) = self.find_cycle(source) else { return };
 
         // list of all queries that are a part of the cycle
-        let mut participants = SmallVec::<[IngredientPath; 8]>::new();
+        let mut participants = SmallVec::<[IngredientPath; 8]>::with_capacity(min_length);
         // cycle participants who have cycle recovery set
-        let mut recovered = SmallVec::<[usize; 8]>::new();
+        let mut recovered = SmallVec::<[usize; 8]>::with_capacity(min_length);
 
-        let mut curr = source;
+        // Holds read-guards to the vertices reperesenting the participants.
+        // This ensures that the cycle is not modified while enumerating it.
+        let mut vertices = SmallVec::<[_; 8]>::with_capacity(min_length);
+
+        let mut curr = start;
 
         // enumerate all cycle participants
         for i in 0.. {
@@ -81,65 +89,123 @@ impl CycleGraph {
                 recovered.push(i);
             }
 
-            curr = self.vertices[&curr].blocked_on;
-            if curr == source {
+            let Some(vertex) = self.vertices.get(&curr) else { return };
+            let next = vertex.blocked_on;
+            vertices.push(vertex);
+
+            if next == start {
                 break;
             }
+
+            curr = next;
         }
 
+        // attempt to take ownership of all the wakers: this ensures that the same cycle is not
+        // reported twice
+        let mut wakers = SmallVec::<[_; 8]>::with_capacity(vertices.len());
+        for (vertex, participant) in vertices.iter().zip(&participants) {
+            // tie-break: the cycle started at the query with the highest index wins
+            let waker = if participant.ordered() < start.ordered() {
+                vertex.waker.lock().unwrap()
+            } else {
+                match vertex.waker.try_lock() {
+                    // we lost the tie-break
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                    result => result.unwrap(),
+                }
+            };
+
+            if waker.is_none() {
+                // the cycle has already been reported
+                return;
+            }
+
+            wakers.push(waker);
+        }
+
+        // create the list of participants
         let participants = Arc::<[_]>::from(participants.as_slice());
 
-        let make_cycle = |index: usize| {
+        let wake_cycle = |index: usize| {
             let path = participants[index];
             let cycle = Cycle {
                 start: index,
                 participants: participants.clone(),
             };
             db.set_cycle(path, cycle);
-            self.vertices[&path].waker.wake_by_ref();
+            wakers[index].take().unwrap().wake();
         };
+
+        tracing::info!(
+            cycle = %Cycle {
+                start: 0,
+                participants: participants.clone()
+            }.fmt(db),
+            "found dependency cycle"
+        );
 
         if recovered.is_empty() {
             // distribute the cycle to all participants
-            (0..participants.len()).for_each(make_cycle);
+            (0..participants.len()).for_each(wake_cycle);
         } else {
-            recovered.iter().copied().for_each(make_cycle);
+            recovered.iter().copied().for_each(wake_cycle);
         }
     }
 
-    fn is_cyclic(&self, start: IngredientPath) -> bool {
-        let mut prev: Option<&Vertex> = None;
-        let mut curr = start;
+    /// If a cycle can be reached from `start`, returns a query in the cycle and a lower bound on
+    /// the length of the cycle.
+    fn find_cycle(&self, start: IngredientPath) -> Option<(IngredientPath, usize)> {
+        let mut prev = None;
+        let mut next = |curr: IngredientPath| {
+            let this = self.vertices.get(&curr)?;
 
-        while let Some(vertex) = self.vertices.get(&curr) {
-            let shortcut = vertex.shortcut.get();
-            curr = if shortcut == vertex.blocked_on {
-                vertex.blocked_on
-            } else if self.vertices.contains_key(&shortcut) {
-                // the cached query is still valid, so continue from there
-                shortcut
-            } else {
-                vertex.blocked_on
+            // use the shortcut if it is still valid
+            let next = match this.shortcut.load(Relaxed) {
+                Some(shortcut) if self.vertices.contains_key(&shortcut) => shortcut,
+                _ => this.blocked_on,
             };
 
-            if let Some(prev) = prev.replace(vertex) {
-                // path shortening inspired by disjoint-set datastructure
-                prev.shortcut.set(curr);
+            if let Some(previous) = prev.replace(this) {
+                previous.shortcut.store(Some(next), Relaxed);
             }
 
-            if curr == start {
-                return true;
+            Some(next)
+        };
+
+        // Algorithm Source: https://en.wikipedia.org/wiki/Cycle_detection#Brent's_algorithm
+
+        // lower bound on the length of the cycle
+        let mut length = 1;
+        let mut power = 1;
+
+        let mut tortoise = start;
+        let mut hare = next(start)?;
+
+        while tortoise != hare {
+            if length == power {
+                // continue with next power of two
+                tortoise = hare;
+                power *= 2;
+                length = 0;
             }
+            hare = next(hare)?;
+            length += 1;
         }
 
-        false
+        Some((hare, length))
     }
 
-    fn lookup_strategy(&mut self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
-        *self
-            .recover_strategies
-            .entry(container)
-            .or_insert_with(|| db.cycle_strategy(container))
+    fn lookup_strategy(&self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {
+        if let Some(strategy) = self.recover_strategies.read().unwrap().get(&container) {
+            return *strategy;
+        }
+
+        let strategy = db.cycle_strategy(container);
+        self.recover_strategies
+            .write()
+            .unwrap()
+            .insert(container, strategy);
+        strategy
     }
 }
 
@@ -169,14 +235,9 @@ impl Cycle {
 
     pub fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
         crate::util::fmt::from_fn(|f| {
-            let alternate = f.alternate();
             let mut list = f.debug_list();
             for path in self.iter() {
-                if alternate {
-                    list.entry(&crate::util::fmt::ingredient(db, path));
-                } else {
-                    list.entry(&path);
-                }
+                list.entry(&crate::util::fmt::ingredient(db, path));
             }
             list.finish()
         })

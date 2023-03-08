@@ -18,6 +18,7 @@ pub mod util;
 use std::future::Future;
 
 pub use durability::Durability;
+use futures_lite::FutureExt;
 pub use haste_macros::*;
 pub use query_cache::*;
 pub use revision::Revision;
@@ -224,30 +225,28 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.cast_dyn();
         let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
-        let future = cache.get_or_evaluate(db, input);
+        let path = cache.path();
 
-        async move {
-            let result = match future {
-                EvalResult::Eval(eval) => eval.await,
-                EvalResult::Pending(pending) => pending.await,
-                EvalResult::Cached(cached) => cached,
-            };
+        crate::util::future::poll_fn_pin(
+            cache.get_or_evaluate(self.cast_dyn(), input),
+            move |future, cx| {
+                let result = std::task::ready!(future.poll(cx));
 
-            runtime.register_dependency(
-                Dependency {
-                    container: cache.path(),
-                    resource: result.id,
-                    extra: 0,
-                },
-                result.slot.transitive,
-            );
+                runtime.register_dependency(
+                    Dependency {
+                        container: path,
+                        resource: result.id,
+                        extra: 0,
+                    },
+                    result.slot.transitive,
+                );
 
-            &result.slot.output
-        }
+                std::task::Poll::Ready(&result.slot.output)
+            },
+        )
     }
 
     /// Spawn the query in the runtime, and possibly await its result in the background
@@ -259,7 +258,6 @@ pub trait DatabaseExt: Database {
         Self: WithStorage<Q::Storage>,
     {
         let db = self.cast_dyn();
-        let runtime = self.runtime();
         let storage = self.storage();
         let cache = storage.container();
 
@@ -269,39 +267,31 @@ pub trait DatabaseExt: Database {
             Spawned(Id),
         }
 
-        let spawn_result = match cache.get_or_evaluate(db, input) {
+        let mut spawn = match cache.get_or_evaluate(db, input) {
             EvalResult::Cached(cached) => SpawnResult::Cached(cached),
             EvalResult::Pending(pending) => SpawnResult::Pending(pending),
             EvalResult::Eval(eval) => {
                 // spawn the query, but postpone checking it for completion until the returned
                 // future is polled. That way the spawned task has a chance of completing first.
                 let id = runtime::QueryTask::path(&eval).resource;
-                runtime.spawn_query(eval);
+                db.runtime().spawn_query(eval);
                 SpawnResult::Spawned(id)
             }
         };
 
-        async move {
-            let pending = match spawn_result {
-                SpawnResult::Cached(cached) => Ok(cached),
-                SpawnResult::Pending(pending) => Err(pending),
-                // the query was spawned in the runtime, so try getting its result again:
-                SpawnResult::Spawned(id) => match cache.get(db, id) {
-                    Ok(ready) => Ok(ready),
-                    Err(pending) => {
-                        // yield to the scheduler so that the query has an oppurtunity to execute
-                        futures_lite::future::yield_now().await;
-                        Err(pending)
-                    }
-                },
+        std::future::poll_fn(move |cx| {
+            let result = loop {
+                match &mut spawn {
+                    SpawnResult::Cached(cached) => break *cached,
+                    SpawnResult::Pending(pending) => break std::task::ready!(pending.poll(cx)),
+                    SpawnResult::Spawned(id) => match cache.get(db, *id) {
+                        Ok(output) => break output,
+                        Err(pending) => spawn = SpawnResult::Pending(pending),
+                    },
+                }
             };
 
-            let result = match pending {
-                Ok(ready) => ready,
-                Err(pending) => pending.await,
-            };
-
-            runtime.register_dependency(
+            db.runtime().register_dependency(
                 Dependency {
                     container: cache.path(),
                     resource: result.id,
@@ -310,8 +300,8 @@ pub trait DatabaseExt: Database {
                 result.slot.transitive,
             );
 
-            &result.slot.output
-        }
+            std::task::Poll::Ready(&result.slot.output)
+        })
     }
 
     /// Signals to the runtime that we might eventually need the output of the given query.

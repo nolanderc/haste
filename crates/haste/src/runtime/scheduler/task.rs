@@ -1,0 +1,319 @@
+use super::*;
+
+pub struct Task {
+    header: *mut Header,
+}
+
+unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
+
+impl Clone for Task {
+    fn clone(&self) -> Self {
+        self.header().increase_refcount();
+        Self {
+            header: self.header,
+        }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        unsafe {
+            let needs_drop = self.header().decrease_refcount();
+            if !needs_drop {
+                return;
+            }
+
+            // we have the last reference to the task, so we also need to free it.
+            let header = &mut *self.header;
+
+            // drop the inner future
+            let ptr = header.future_ptr();
+            (header.vtable.drop)(ptr);
+
+            // drop the header, and free the task's memory
+            let layout = header.size_align.layout();
+            self.header.drop_in_place();
+            std::alloc::dealloc(self.header.cast(), layout);
+        }
+    }
+}
+
+impl Task {
+    pub(super) fn new<F>(future: F, scheduler: Weak<Shared>) -> Self
+    where
+        F: Future<Output = ()>,
+    {
+        let layout = std::alloc::Layout::new::<RawTask<F>>();
+
+        let ptr = unsafe { std::alloc::alloc(layout).cast::<RawTask<F>>() };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+
+        unsafe {
+            ptr.write(RawTask::new(future, scheduler));
+        }
+
+        Self { header: ptr.cast() }
+    }
+
+    fn header(&self) -> &Header {
+        unsafe { &*self.header }
+    }
+
+    pub(super) fn poll(self) {
+        let header = self.header();
+
+        if !header.state.try_begin_poll() {
+            return;
+        }
+
+        let waker = self.clone().into_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        unsafe {
+            let future = header.future_ptr();
+            match (header.vtable.poll)(future, &mut cx) {
+                Poll::Ready(()) => header.state.end_poll_ready(),
+                Poll::Pending => {
+                    if header.state.end_poll_pending() {
+                        self.schedule()
+                    }
+                }
+            }
+        }
+    }
+
+    fn into_waker(self) -> Waker {
+        unsafe { Waker::from_raw(self.into_raw_waker()) }
+    }
+
+    fn into_raw_waker(self) -> RawWaker {
+        unsafe fn clone(ptr: *const ()) -> RawWaker {
+            let header = ptr.cast::<Header>().cast_mut();
+            let task = ManuallyDrop::new(Task { header });
+            (*task).clone().into_raw_waker()
+        }
+
+        unsafe fn wake(ptr: *const ()) {
+            let header = ptr.cast::<Header>().cast_mut();
+            let task = Task { header };
+            task.schedule();
+        }
+
+        unsafe fn wake_by_ref(ptr: *const ()) {
+            let header = ptr.cast::<Header>().cast_mut();
+            let task = ManuallyDrop::new(Task { header });
+            (*task).clone().schedule();
+        }
+
+        unsafe fn drop(ptr: *const ()) {
+            let header = ptr.cast::<Header>().cast_mut();
+            std::mem::drop(Task { header });
+        }
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+        let this = ManuallyDrop::new(self);
+
+        RawWaker::new(this.header.cast(), &VTABLE)
+    }
+
+    fn schedule(self) {
+        let header = self.header();
+        if header.state.try_wake() {
+            if let Some(scheduler) = header.scheduler.upgrade() {
+                scheduler.schedule(self);
+            }
+        }
+    }
+}
+
+#[repr(C)]
+struct RawTask<T> {
+    header: Header,
+    future: T,
+}
+
+impl<T> RawTask<T> {
+    fn new(future: T, scheduler: Weak<Shared>) -> Self
+    where
+        T: Future<Output = ()>,
+    {
+        RawTask {
+            header: Header {
+                refcount: AtomicU32::new(1),
+                state: TaskState::new(),
+                size_align: SizeAlign::of::<Self>(),
+                future_offset: Self::future_offset(),
+                scheduler,
+                vtable: VTable {
+                    drop: VTable::drop::<T>,
+                    poll: VTable::poll::<T>,
+                },
+            },
+            future,
+        }
+    }
+
+    fn future_offset() -> u32 {
+        let uninit = MaybeUninit::<Self>::uninit();
+        let ptr = uninit.as_ptr();
+        let future_ptr = unsafe { std::ptr::addr_of!((*ptr).future) };
+        unsafe { future_ptr.cast::<u8>().offset_from(ptr.cast::<u8>()) as u32 }
+    }
+}
+
+#[repr(C)]
+struct Header {
+    refcount: AtomicU32,
+
+    /// Controls the behaviour of polling and scheduling.
+    state: TaskState,
+
+    /// Size and alignment of the `RawTask`
+    size_align: SizeAlign,
+
+    /// Byte offset from the header to the start of the future's data.
+    future_offset: u32,
+
+    /// Reference to the scheduler so that we can schedule this task.
+    scheduler: Weak<Shared>,
+
+    /// Functions for dynamic dispatch.
+    vtable: VTable,
+}
+
+impl Header {
+    fn increase_refcount(&self) {
+        let old_refcount = self.refcount.fetch_add(1, Relaxed);
+        if old_refcount >= u32::MAX / 2 {
+            std::process::abort();
+        }
+    }
+
+    // increases the refcount, returning `true` if the task needs to be dropped
+    unsafe fn decrease_refcount(&self) -> bool {
+        if self.refcount.fetch_sub(1, Release) != 1 {
+            return false;
+        }
+        self.refcount.load(Acquire);
+        true
+    }
+
+    fn future_ptr(&self) -> *mut u8 {
+        let ptr = (self as *const Self).cast_mut();
+        unsafe { ptr.cast::<u8>().offset(self.future_offset as isize) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SizeAlign(u32);
+
+impl SizeAlign {
+    pub const fn of<T: Sized>() -> Self {
+        Self::new(std::mem::size_of::<T>(), std::mem::align_of::<T>())
+    }
+
+    pub const fn new(size: usize, align: usize) -> SizeAlign {
+        assert!(size < (1 << 24), "future is way too large");
+        assert!(align.is_power_of_two(), "alignment must be power of two");
+
+        let align = align.trailing_zeros();
+
+        let size = size as u32;
+
+        SizeAlign((size << 8) | align)
+    }
+
+    fn size(self) -> usize {
+        (self.0 >> 8) as usize
+    }
+
+    fn align(self) -> usize {
+        1 << (self.0 & 0xff)
+    }
+
+    fn layout(self) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(self.size(), self.align()).unwrap()
+    }
+}
+
+struct TaskState {
+    bits: AtomicU32,
+}
+
+/// The task is waiting to be polled.
+/// If this bit is cleared, a thread is currently polling the task.
+const IDLE: u32 = 0x1;
+
+/// The task is scheduled for execution.
+const SCHEDULED: u32 = 0x2;
+
+/// The task has finished executing.
+const FINISHED: u32 = 0x4;
+
+impl TaskState {
+    fn new() -> Self {
+        Self {
+            bits: AtomicU32::new(IDLE | SCHEDULED),
+        }
+    }
+
+    /// Attempt to start polling the task, return `true` if successful.
+    fn try_begin_poll(&self) -> bool {
+        // Clear the `IDLE` and `SCHEDULED` flags.
+        let old = self.bits.fetch_and(!(IDLE | SCHEDULED), Acquire);
+
+        // the task must be idle, or we might have a race condition
+        old & (IDLE | FINISHED) == IDLE
+    }
+
+    /// At the end of a poll: the task is still pending.
+    ///
+    /// Returns `true` if the task needs to be rescheduled.
+    fn end_poll_pending(&self) -> bool {
+        // mark the task as idle
+        let now = self.bits.fetch_or(IDLE, Release);
+
+        // the task was woken while we polled it: we must re-schedule it
+        now & SCHEDULED != 0
+    }
+
+    /// At the end of a poll: the task has finished executing.
+    fn end_poll_ready(&self) {
+        self.bits.fetch_or(IDLE | FINISHED, Release);
+    }
+
+    /// Attempt to wake the task, returning `true` if it should be rescheduled.
+    fn try_wake(&self) -> bool {
+        let old = self.bits.fetch_or(SCHEDULED, Relaxed);
+
+        // Only reschedule if the task is idle. Otherwise:
+        // - if it is polling it will be rescheduled later
+        // - if it is finished it does not need to be rescheduled
+        // - if it is already scheduled we don't have to do it again
+        old & (IDLE | FINISHED | SCHEDULED) == IDLE
+    }
+}
+
+struct VTable {
+    drop: unsafe fn(*mut u8),
+    poll: unsafe fn(*mut u8, &mut std::task::Context) -> Poll<()>,
+}
+
+impl VTable {
+    unsafe fn drop<T>(this: *mut u8) {
+        this.cast::<T>().drop_in_place()
+    }
+
+    unsafe fn poll<T>(this: *mut u8, cx: &mut std::task::Context) -> Poll<()>
+    where
+        T: Future<Output = ()>,
+    {
+        let ptr = this.cast::<T>();
+        let pinned = Pin::new_unchecked(&mut *ptr);
+        pinned.poll(cx)
+    }
+}

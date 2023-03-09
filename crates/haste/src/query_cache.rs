@@ -437,6 +437,26 @@ impl<Q: Query> crate::runtime::QueryTask for QueryCacheTask<'_, Q> {
     }
 }
 
+impl<Q: Query> crate::runtime::StaticQueryTask for QueryCacheTask<'_, Q> {
+    type StaticFuture = StaticQueryCacheTask<'static, Q>;
+
+    unsafe fn into_static(self) -> Self::StaticFuture {
+        std::mem::transmute(StaticQueryCacheTask(self))
+    }
+}
+
+#[repr(transparent)]
+#[pin_project::pin_project]
+pub struct StaticQueryCacheTask<'a, Q: Query>(#[pin] QueryCacheTask<'a, Q>);
+
+impl<Q: Query> Future for StaticQueryCacheTask<'_, Q> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        crate::runtime::QueryTask::poll(self.project().0, cx)
+    }
+}
+
 impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
     type Output = QueryResult<'a, Q>;
 

@@ -1,12 +1,12 @@
 mod cycle;
 mod history;
+mod scheduler;
 mod task;
 
 use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Poll, Waker},
 };
 
@@ -16,12 +16,12 @@ use crate::{
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
-pub use self::task::QueryTask;
+pub use self::task::{QueryTask, StaticQueryTask};
 
-use self::{cycle::CycleGraph, history::ChangeHistory, task::Scheduler};
+use self::{cycle::CycleGraph, history::ChangeHistory, scheduler::Scheduler};
 
 pub struct Runtime {
-    scheduler: Arc<Scheduler>,
+    scheduler: Scheduler,
     graph: CycleGraph,
     revisions: ChangeHistory,
 }
@@ -29,7 +29,7 @@ pub struct Runtime {
 impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
-            scheduler: Arc::new(Scheduler::new()),
+            scheduler: Scheduler::new(),
             graph: Default::default(),
             revisions: ChangeHistory::new(),
         }
@@ -300,39 +300,31 @@ impl Runtime {
     ) {
         tracing::trace!(
             child = %crate::util::fmt::ingredient(db, child),
+            ?parent,
             "would block on",
         );
         self.graph.insert(parent, child, waker, db);
     }
 
     pub(crate) fn unblock(&self, parent: IngredientPath) {
-        tracing::trace!("unblocked");
+        tracing::trace!(?parent, "unblocked");
         self.graph.remove(parent);
     }
 
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T)
     where
-        T: QueryTask + Send + 'a,
+        T: StaticQueryTask + 'a,
     {
-        unsafe {
-            // extend the lifetime of the task to allow it to be stored in the runtime
-            // SAFETY: `in_scope` was set, so `enter` has been called previously on this runtime.
-            // Thus the lifetime of this task is ensured to outlive that.
-            let task = std::mem::transmute::<
-                Box<dyn QueryTask + Send + 'a>,
-                Box<dyn QueryTask + Send + 'static>,
-            >(Box::new(task));
-
-            self.scheduler.spawn(task).schedule();
-        }
+        // extend the lifetime of the task to allow it to be stored in the runtime
+        // SAFETY: we are in an active runtime.
+        self.scheduler.spawn(unsafe { task.into_static() });
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output
     where
         F: Future,
     {
-        let forever = async { self.scheduler.run().await };
-        pollster::block_on(futures_lite::future::or(f, forever))
+        pollster::block_on(f)
     }
 }
 
@@ -350,6 +342,6 @@ impl Runtime {
 
     pub(crate) fn exit(&self) {
         // cancel all running tasks and wait for shutdown
-        self.scheduler.shutdown();
+        assert!(self.scheduler.stop(), "could not stop runtime scheduler");
     }
 }

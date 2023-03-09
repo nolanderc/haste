@@ -31,11 +31,12 @@ struct PersonData {
 }
 
 #[haste::query]
+#[clone]
 async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-    fib(db, n - 1).await + fib(db, n - 2).await
+    fib(db, n - 1).await.wrapping_add(fib(db, n - 2).await)
 }
 
 #[haste::query]
@@ -82,17 +83,6 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    haste::scope(&mut db, |scope, db| {
-        scope.block_on(async {
-            cyclic::inline(db, 8).await;
-            haste::util::debug_size_val(&cyclic(db, 8));
-            haste::util::debug_size_val(&cyclic::inline(db, 8));
-            haste::util::debug_size_val(&cyclic::cyclic(db, 8));
-
-            dbg!(cyclic(db, 8).await);
-        })
-    });
-
     db.set_input::<file>("bar", "345".into(), Durability::HIGH);
     db.set_input::<file>("foo", "123".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
@@ -102,8 +92,7 @@ fn main() {
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
-    eprintln!();
-
+    
     db.set_input::<file>("foo", "321".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
@@ -112,8 +101,7 @@ fn main() {
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
-    eprintln!();
-
+    
     db.set_input::<file>("foo", "123".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
@@ -122,8 +110,7 @@ fn main() {
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
-    eprintln!();
-
+    
     db.set_input::<file>("foo", "1234".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| {
         scope.block_on(async {
@@ -132,7 +119,7 @@ fn main() {
             dbg!(product(db, ["bar", "bar"]).await);
         })
     });
-    eprintln!();
+    
 
     let duration = start.elapsed();
     eprintln!("time: {duration:?}");

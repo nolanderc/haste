@@ -446,11 +446,11 @@ impl<'a> Parser<'a> {
     fn emit_span(&mut self, spanned: impl Spanned) -> SpanId {
         let range = spanned.range(self);
         let key = self.data.span_ranges.push(range);
-        self.data.base.spans.relative_to(key)
+        SpanId::from_relative(self.data.base.spans.relative_to(key))
     }
 
     fn span_range(&self, id: SpanId) -> FileRange {
-        self.data.span_ranges[self.data.base.spans.offset(id)]
+        self.data.span_ranges[self.data.base.spans.offset(id.relative())]
     }
 
     fn get_span(&self, spanned: impl Spanned) -> Span {

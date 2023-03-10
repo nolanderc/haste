@@ -36,9 +36,26 @@ pub struct File {
     pub declarations: KeyList<Key<Decl>, Decl>,
 }
 
-/// References a span relative to the `Base<Key<Span>>` in the closest declaration. If outside a
-/// declaration, is relative to the start of the list.
-pub type SpanId = Relative<Key<Span>>;
+/// References a span relative to the `base_span` in the closent containing declaration. If outside
+/// a declaration, the index is absolute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpanId(NonMaxU16);
+
+impl SpanId {
+    fn from_relative(relative: Relative<Key<Span>>) -> SpanId {
+        use crate::key::KeyOps;
+        Self(NonMaxU16::new(relative.into_offset().index() as u16).unwrap())
+    }
+
+    fn absolute(self) -> Key<Span> {
+        use crate::key::KeyOps;
+        Key::from_index(self.0.get() as usize)
+    }
+
+    fn relative(self) -> Relative<Key<Span>> {
+        Relative::from_offset(self.absolute())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Import {

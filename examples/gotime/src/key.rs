@@ -259,3 +259,13 @@ where
         Relative(K::from_index(k.index() - self.0.index()))
     }
 }
+
+impl<K> Relative<K> {
+    pub fn from_offset(offset: K) -> Relative<K> {
+        Relative(offset)
+    }
+
+    pub fn into_offset(self) -> K {
+        self.0
+    }
+}

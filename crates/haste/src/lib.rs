@@ -15,7 +15,7 @@ mod shard_map;
 mod storage;
 pub mod util;
 
-use std::future::Future;
+use std::{future::Future, marker::PhantomData};
 
 pub use durability::Durability;
 use futures_lite::FutureExt;
@@ -426,7 +426,10 @@ where
 
     let result = {
         let _guard = CallOnDrop(|| runtime.exit());
-        let scope = Scope { runtime };
+        let scope = Scope {
+            runtime,
+            _phantom: PhantomData,
+        };
         f(scope, db)
     };
 
@@ -437,6 +440,9 @@ where
 
 pub struct Scope<'a> {
     runtime: &'a Runtime,
+
+    // The scope needs to be `!Sync` so that only one thread blocks on the runtime.
+    _phantom: PhantomData<*mut ()>,
 }
 
 impl<'a> Scope<'a> {

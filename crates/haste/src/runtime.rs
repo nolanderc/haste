@@ -314,6 +314,7 @@ impl Runtime {
     pub(crate) fn spawn_query<'a, T>(&'a self, task: T)
     where
         T: StaticQueryTask + 'a,
+        T::StaticFuture: Send,
     {
         // extend the lifetime of the task to allow it to be stored in the runtime
         // SAFETY: we are in an active runtime.
@@ -324,7 +325,7 @@ impl Runtime {
     where
         F: Future,
     {
-        pollster::block_on(f)
+        self.scheduler.run(f)
     }
 }
 

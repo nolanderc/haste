@@ -121,13 +121,13 @@ where
             }
             Err(None) => {}
             Ok(claim) => match self.execute_query(db.cast_dyn(), id, claim) {
+                Ok(task) => db.runtime().spawn_query(task),
                 Err(output) => {
                     return LastChangeFuture::Ready(Change {
                         changed_at: slot.last_changed(),
-                        transitive: output.slot.transitive,
+                        transitive: output.transitive,
                     })
                 }
-                Ok(task) => db.runtime().spawn_query(task),
             },
         }
 
@@ -318,6 +318,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         unsafe { slot.claim(self.storage.current_revision()) }
     }
 
+    #[inline]
     fn get_or_evaluate_slot<'a>(
         &'a self,
         db: &'a DatabaseFor<Q>,
@@ -334,8 +335,14 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
             Ok(slot) => {
                 tracing::trace!("out of date");
                 match self.execute_query(db, id, slot) {
-                    Ok(task) => EvalResult::Eval(task),
-                    Err(backdated) => EvalResult::Cached(backdated),
+                    Ok(task) => {
+                        tracing::trace!("execute");
+                        EvalResult::Eval(task)
+                    }
+                    Err(backdated) => EvalResult::Cached(QueryResult {
+                        id,
+                        slot: backdated,
+                    }),
                 }
             }
             Err(None) => {
@@ -358,7 +365,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         db: &'a DatabaseFor<Q>,
         id: Id,
         slot: ClaimedSlot<'a, Q>,
-    ) -> Result<QueryCacheTask<'a, Q>, QueryResult<'a, Q>> {
+    ) -> Result<QueryCacheTask<'a, Q>, &'a OutputSlot<Q>> {
         let this = self.ingredient(id);
 
         let verify_data = verify::VerifyData {
@@ -368,7 +375,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         };
 
         let state = match verify::verify_shallow(verify_data) {
-            Ok(Ok(slot)) => return Err(QueryResult { id, slot }),
+            Ok(Ok(backdated)) => return Err(backdated),
             Ok(Err(data)) => TaskState::execute(this, data),
             Err(deep_verify) => TaskState::Verify {
                 future: deep_verify,

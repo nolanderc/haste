@@ -140,11 +140,12 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     tokens.extend(quote! {
         #[allow(unused)]
-        #vis async fn #ident<'db>(
+        #vis fn #ident<'db>(
             #db_ident: &'db dyn #db_path, 
             #(#input_idents: #input_types),*
-        ) -> #return_type {
-            #clone (haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*)).await)
+        ) -> impl std::future::Future<Output = #return_type> + 'db {
+            let future = haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*));
+            haste::util::future::map(future, |x| #clone(x))
         }
 
         impl #ident {
@@ -154,11 +155,12 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             }
 
             #[allow(unused)]
-            #vis async fn inline<'db>(
+            #vis fn inline<'db>(
                 #db_ident: &'db dyn #db_path, 
                 #(#input_idents: #input_types),*
-            ) -> #return_type {
-                #clone (haste::DatabaseExt::execute_inline::<#ident>(#db_ident, (#(#input_idents),*)).await)
+            ) -> impl std::future::Future<Output = #return_type> + 'db {
+                let future = haste::DatabaseExt::execute_inline::<#ident>(#db_ident, (#(#input_idents),*));
+                haste::util::future::map(future, |x| #clone(x))
             }
         }
     });

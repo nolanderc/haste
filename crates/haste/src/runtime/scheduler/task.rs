@@ -4,6 +4,12 @@ pub struct Task {
     header: *mut Header,
 }
 
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Task({:p})", self.header)
+    }
+}
+
 unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
@@ -40,20 +46,24 @@ impl Drop for Task {
 }
 
 impl Task {
-    pub(super) fn new<F>(future: F, scheduler: Weak<Shared>) -> Self
+    /// Create a new task which represents the inner future.
+    ///
+    /// # Safety
+    ///
+    /// Calling this function erases the future's lifetime. The caller must ensure that the
+    /// lifetime of the task does not outlive that of the future.
+    pub(super) unsafe fn new<F>(future: F, scheduler: Weak<Shared>) -> Self
     where
-        F: Future<Output = ()>,
+        F: Future<Output = ()> + Send,
     {
         let layout = std::alloc::Layout::new::<RawTask<F>>();
 
-        let ptr = unsafe { std::alloc::alloc(layout).cast::<RawTask<F>>() };
+        let ptr = std::alloc::alloc(layout).cast::<RawTask<F>>();
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
 
-        unsafe {
-            ptr.write(RawTask::new(future, scheduler));
-        }
+        ptr.write(RawTask::new(future, scheduler));
 
         Self { header: ptr.cast() }
     }
@@ -75,7 +85,9 @@ impl Task {
         unsafe {
             let future = header.future_ptr();
             match (header.vtable.poll)(future, &mut cx) {
-                Poll::Ready(()) => header.state.end_poll_ready(),
+                Poll::Ready(()) => {
+                    header.state.end_poll_ready();
+                }
                 Poll::Pending => {
                     if header.state.end_poll_pending() {
                         self.schedule()
@@ -99,13 +111,13 @@ impl Task {
         unsafe fn wake(ptr: *const ()) {
             let header = ptr.cast::<Header>().cast_mut();
             let task = Task { header };
-            task.schedule();
+            task.wake();
         }
 
         unsafe fn wake_by_ref(ptr: *const ()) {
             let header = ptr.cast::<Header>().cast_mut();
             let task = ManuallyDrop::new(Task { header });
-            (*task).clone().schedule();
+            (*task).clone().wake();
         }
 
         unsafe fn drop(ptr: *const ()) {
@@ -120,12 +132,15 @@ impl Task {
         RawWaker::new(this.header.cast(), &VTABLE)
     }
 
+    fn wake(self) {
+        if self.header().state.try_wake() {
+            self.schedule();
+        }
+    }
+
     fn schedule(self) {
-        let header = self.header();
-        if header.state.try_wake() {
-            if let Some(scheduler) = header.scheduler.upgrade() {
-                scheduler.schedule(self);
-            }
+        if let Some(scheduler) = self.header().scheduler.upgrade() {
+            scheduler.schedule(self);
         }
     }
 }

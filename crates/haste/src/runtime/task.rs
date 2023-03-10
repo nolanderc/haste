@@ -11,7 +11,7 @@ pub trait QueryTask {
 }
 
 pub trait StaticQueryTask: QueryTask {
-    type StaticFuture: Future<Output = ()> + Send + 'static;
+    type StaticFuture: Future<Output = ()> + 'static;
 
     /// Extend the lifetime of the task to the `'static` lifetime so that it can be spawned on an
     /// executor.

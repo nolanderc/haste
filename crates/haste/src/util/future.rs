@@ -46,12 +46,28 @@ where
     Map::Running { future, func }
 }
 
-pub fn poll_fn_pin<Fut, F, T>(mut future: Fut, mut f: F) -> impl Future<Output = T>
+pub fn poll_fn_pin<Fut, F, T>(future: Fut, poll_fn: F) -> impl Future<Output = T>
 where
     F: FnMut(Pin<&mut Fut>, &mut Context) -> Poll<T>,
 {
-    std::future::poll_fn(move |cx| {
-        let future = unsafe { Pin::new_unchecked(&mut future) };
-        f(future, cx)
-    })
+    #[pin_project::pin_project]
+    struct PollFnPin<Fut, F> {
+        #[pin]
+        future: Fut,
+        poll_fn: F,
+    }
+
+    impl<Fut, F, T> Future for PollFnPin<Fut, F>
+    where
+        F: FnMut(Pin<&mut Fut>, &mut Context) -> Poll<T>,
+    {
+        type Output = T;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.project();
+            (this.poll_fn)(this.future, cx)
+        }
+    }
+
+    PollFnPin { future, poll_fn }
 }

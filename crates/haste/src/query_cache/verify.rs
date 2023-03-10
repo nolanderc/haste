@@ -21,9 +21,7 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
 
     if previous.dependencies.is_empty() {
         // the query does not depend on any side-effects, so is trivially verified.
-        if !Q::IS_INPUT {
-            tracing::debug!(reason = "no dependencies", "backdating");
-        }
+        tracing::debug!(reason = "no dependencies", "backdating");
         return Ok(Ok(data.slot.backdate()));
     }
 

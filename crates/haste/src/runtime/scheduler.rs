@@ -1,39 +1,53 @@
+mod injector;
 mod task;
 
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     future::Future,
     mem::{ManuallyDrop, MaybeUninit},
     pin::Pin,
     sync::{
         atomic::{
-            AtomicU32,
+            AtomicU32, AtomicUsize,
             Ordering::{self, Acquire, Relaxed, Release},
         },
         Arc, Condvar, Mutex, Weak,
     },
     task::{Poll, RawWaker, RawWakerVTable, Waker},
+    thread::JoinHandle,
 };
 
-use self::task::Task;
+use crate::util::CallOnDrop;
+
+use self::{injector::Injector, task::Task};
 
 pub struct Scheduler {
     shared: Arc<Shared>,
+    threads: Vec<JoinHandle<()>>,
+
+    local: Mutex<Option<LocalScheduler>>,
 }
 
 struct Shared {
-    global_queue: GlobalQueue,
+    injector: Injector,
     workers: Vec<WorkerState>,
     state: SharedState,
 
-    /// Number of threads currently suspended.
-    suspended_workers: Mutex<usize>,
-
-    /// Notified when a worker should be woken.
+    /// Aprroximate number of threads that are currently suspended and waiting for work.
+    idle_workers_approx: AtomicUsize,
+    /// Suspended tasks which are waiting for more work hold this lock.
+    idle_mutex: Mutex<()>,
+    /// Notified when a suspended worker has more work available.
     wake_condition: Condvar,
 
-    /// Notified when a worker is suspended.
-    suspend_condition: Condvar,
+    /// Number of threads that are suspended after a shutdown.
+    suspended_workers: Mutex<usize>,
+    /// Approximate number of threads that are suspended after a shutdown.
+    suspended_workers_approx: AtomicU32,
+    /// Notified when an suspended worker should be started after a shutdown.
+    start_condition: Condvar,
+    /// Notified when a worker is put into an suspended state (during shutdown).
+    suspended_condition: Condvar,
 }
 
 struct SharedState {
@@ -41,8 +55,9 @@ struct SharedState {
 }
 
 #[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Suspended = 0,
+    Shutdown = 0,
     Running = 1,
     Terminated = 2,
 }
@@ -86,9 +101,10 @@ struct WorkerState {
     stealer: Stealer,
 }
 
-type GlobalQueue = crossbeam_deque::Injector<Task>;
-type LocalQueue = crossbeam_deque::Worker<Task>;
-type Stealer = crossbeam_deque::Stealer<Task>;
+type LocalQueue = st3::lifo::Worker<Task>;
+type Stealer = st3::lifo::Stealer<Task>;
+
+const MAX_LOCAL_TASKS: usize = 256;
 
 impl Scheduler {
     pub fn new() -> Self {
@@ -96,51 +112,97 @@ impl Scheduler {
             .map(|n| n.get())
             .unwrap_or(8);
 
-        let workers = (0..worker_count)
-            .map(|_| LocalQueue::new_fifo())
+        let workers = (0..worker_count + 1)
+            .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))
             .collect::<Vec<_>>();
 
         let shared = Arc::new(Shared {
-            global_queue: GlobalQueue::new(),
+            injector: Injector::new(),
             workers: workers
                 .iter()
                 .map(|worker| WorkerState {
                     stealer: worker.stealer(),
                 })
                 .collect(),
-            state: SharedState::new(State::Suspended),
+
+            state: SharedState::new(State::Shutdown),
+
+            idle_workers_approx: AtomicUsize::new(0),
+            idle_mutex: Mutex::new(()),
+            wake_condition: Condvar::new(),
 
             suspended_workers: Mutex::new(0),
-            wake_condition: Condvar::new(),
-            suspend_condition: Condvar::new(),
+            suspended_workers_approx: AtomicU32::new(0),
+            start_condition: Condvar::new(),
+            suspended_condition: Condvar::new(),
         });
 
-        for worker in workers {
-            let shared = shared.clone();
-            std::thread::spawn(move || run_worker(shared, worker));
+        let mut locals = workers
+            .into_iter()
+            .map(|worker| LocalScheduler::new(shared.clone(), worker));
+
+        let mut threads = Vec::with_capacity(worker_count);
+        for local in locals.by_ref().take(worker_count) {
+            threads.push(std::thread::spawn(move || {
+                local.run();
+            }));
         }
 
-        Self { shared }
+        let local = locals.next();
+
+        Self {
+            shared,
+            threads,
+            local: Mutex::new(local),
+        }
     }
 
-    pub fn spawn(&self, future: impl Future<Output = ()>) {
-        self.shared.spawn(future)
+    /// Drive the scheduler until the future completes.
+    pub fn run<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let mut local_slot = self
+            .local
+            .try_lock()
+            .expect("cannot run two tasks on the scheduler");
+
+        let local = local_slot.take().unwrap();
+        let (local, output) = local.run_future(future);
+
+        *local_slot = Some(local);
+        output
+    }
+
+    pub fn spawn<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert_eq!(
+            self.shared.state.load(Relaxed),
+            State::Running,
+            concat!(
+                "can only spawn tasks on a running scheduler",
+                "\nhelp: call `haste::scope` to start the task scheduler"
+            )
+        );
+
+        // SAFETY: the future has `'static` lifetime.
+        let task = unsafe { Task::new(future, Arc::downgrade(&self.shared)) };
+
+        self.shared.schedule(task);
     }
 
     pub fn start(&self) -> bool {
-        let result = self.shared.state.compare_exchange(
-            State::Suspended,
+        let shared = &*self.shared;
+
+        let result = shared.state.compare_exchange(
+            State::Shutdown,
             State::Running,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
         );
-        if result.is_err() {
-            return false;
-        }
-
-        self.shared.wake_condition.notify_all();
-
-        true
+        result.is_ok()
     }
 
     pub fn stop(&self) -> bool {
@@ -148,31 +210,47 @@ impl Scheduler {
 
         let result = shared.state.compare_exchange(
             State::Running,
-            State::Suspended,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            State::Shutdown,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
         );
         if result.is_err() {
             return false;
         }
 
-        let worker_count = shared.workers.len();
-        let mut suspended_workers = shared.suspended_workers.lock().unwrap();
+        // notify the workers that we are now in shutdown
+        {
+            let _guard = shared.idle_mutex.lock().unwrap();
+            shared.wake_condition.notify_all();
+        }
 
-        suspended_workers = shared
-            .suspend_condition
-            .wait_while(suspended_workers, |suspended| *suspended != worker_count)
-            .unwrap();
+        // wait until all workers are suspended:
+        {
+            let worker_count = shared.workers.len();
+            let mut suspended_workers = shared.suspended_workers.lock().unwrap();
 
-        assert_eq!(*suspended_workers, worker_count);
+            // we might hold one of the workers, which we need to account for
+            let local = self.local.lock().unwrap();
+            *suspended_workers += local.is_some() as usize;
+
+            while *suspended_workers != worker_count {
+                suspended_workers = shared.suspended_condition.wait(suspended_workers).unwrap();
+            }
+
+            *suspended_workers -= local.is_some() as usize;
+        }
 
         true
     }
 
     fn terminate(&mut self) {
-        self.stop();
         self.shared.state.store(State::Terminated, Ordering::SeqCst);
+        self.shared.start_condition.notify_all();
         self.shared.wake_condition.notify_all();
+
+        for thread in self.threads.drain(..) {
+            thread.join().unwrap();
+        }
     }
 }
 
@@ -183,33 +261,42 @@ impl Drop for Scheduler {
 }
 
 impl Shared {
-    fn spawn(self: &Arc<Shared>, future: impl Future<Output = ()>) {
-        let task = Task::new(future, Arc::downgrade(self));
-        self.schedule(task);
-    }
-
     fn schedule(&self, task: Task) {
-        LocalScheduler::try_with(|local| {
+        LocalScheduler::try_with(move |local| {
             if let Some(local) = local {
-                local.queue.push(task);
+                local.schedule(task);
             } else {
-                self.global_queue.push(task);
+                self.schedule_global(task);
             }
         })
     }
-}
 
-fn run_worker(shared: Arc<Shared>, queue: LocalQueue) {
-    LocalScheduler::enter(shared, queue, |local| {
-        while let Some(task) = local.next_task() {
-            task.poll();
+    fn schedule_global(&self, task: Task) {
+        self.injector.push(task);
+        self.try_wake_suspended();
+    }
+
+    fn try_wake_suspended(&self) {
+        if self.idle_workers_approx.load(Relaxed) != 0 {
+            self.wake_condition.notify_one();
+        } else if self.suspended_workers_approx.load(Relaxed) != 0 {
+            self.start_condition.notify_one();
         }
-    })
+    }
 }
 
 struct LocalScheduler {
     shared: Arc<Shared>,
+
+    /// A queue of tasks that may be stolen by other workers.
     queue: LocalQueue,
+
+    /// Each worker reserves the most recent task which was spawned on it.
+    ///
+    /// This optimizes for the common case where one query spawns another query, and then
+    /// immediately awaits it. This way other threads don't immediately try to steal it, which in
+    /// turn leads to better thread and cache locality and less contention on the stealers.
+    reserved_next: Cell<Option<Task>>,
 }
 
 thread_local! {
@@ -217,6 +304,92 @@ thread_local! {
 }
 
 impl LocalScheduler {
+    fn new(shared: Arc<Shared>, queue: LocalQueue) -> Self {
+        Self {
+            shared,
+            queue,
+            reserved_next: Cell::new(None),
+        }
+    }
+
+    fn run(mut self) -> Self {
+        (self, _) = self.enter(|local| {
+            let _suspend_guard = CallOnDrop(|| {
+                // When the worker exits, mark it as suspended so that the scheduler can terminate
+                // gracefully without waiting endlessly for this thread to complete:
+                if let Ok(mut suspended) = local.shared.suspended_workers.try_lock() {
+                    *suspended += 1;
+                }
+            });
+
+            while let Some(task) = local.next_task() {
+                task.poll();
+            }
+        });
+        self
+    }
+
+    fn run_future<F>(self, future: F) -> (Self, F::Output)
+    where
+        F: Future,
+    {
+        struct TaskState {
+            ready: AtomicU32,
+        }
+
+        impl std::task::Wake for TaskState {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.ready.store(1, Relaxed);
+            }
+        }
+
+        let (this, output) = self.enter(move |local| {
+            let task_state = Arc::new(TaskState {
+                ready: AtomicU32::new(1),
+            });
+
+            let waker = Waker::from(task_state.clone());
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            let mut future = std::pin::pin!(future);
+
+            // number of times we have attempted to grab a task from the queue, but failed.
+            let mut stalled_count: u32 = 0;
+            let max_stalled_count: u32 = 10;
+
+            loop {
+                if task_state.ready.load(Relaxed) != 0 {
+                    // the future may have made some progress, try polling it again.
+                    task_state.ready.store(0, Relaxed);
+                    if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                        break output;
+                    }
+                }
+
+                if let Some(task) = local.try_next_task() {
+                    stalled_count = 0;
+                    task.poll();
+                } else {
+                    stalled_count = stalled_count.saturating_add(1);
+
+                    if stalled_count >= max_stalled_count {
+                        std::thread::yield_now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        });
+
+        this.publish_reserved_tasks();
+
+        (this, output)
+    }
+
     fn try_with<T>(f: impl FnOnce(Option<&LocalScheduler>) -> T) -> T {
         LOCAL.with(|cell| {
             let local = unsafe { (*cell.get()).as_ref() };
@@ -224,7 +397,7 @@ impl LocalScheduler {
         })
     }
 
-    fn enter<T>(shared: Arc<Shared>, queue: LocalQueue, f: impl FnOnce(&LocalScheduler) -> T) -> T {
+    fn enter<T>(mut self, f: impl FnOnce(&LocalScheduler) -> T) -> (LocalScheduler, T) {
         LOCAL.with(|cell| {
             let ptr = cell.get();
 
@@ -233,65 +406,61 @@ impl LocalScheduler {
                     (*ptr).is_none(),
                     "a single thread cannot have two active schedulers"
                 );
-                ptr.write(Some(LocalScheduler { shared, queue }));
+                ptr.write(Some(self));
                 (*ptr).as_ref().unwrap_unchecked()
             };
 
             let output = f(local);
 
-            unsafe { ptr.write(None) };
+            self = unsafe { (*ptr).take().unwrap_unchecked() };
 
-            output
+            (self, output)
         })
     }
 
-    fn next_task(&self) -> Option<Task> {
-        let mut i = 0;
+    fn try_next_task(&self) -> Option<Task> {
+        self.try_next_local()
+            .or_else(|| self.try_next_global())
+            .or_else(|| self.try_next_steal())
+    }
 
+    fn drain(&self) {
         loop {
-            match self.shared.state.load(Relaxed) {
-                State::Running => {}
-                State::Suspended => {
-                    self.suspend();
-                    continue;
-                }
-                State::Terminated => return None,
+            self.reserved_next.take();
+
+            while let Ok(items) = self.queue.drain(|n| n) {
+                items.for_each(drop);
             }
 
-            if let Some(task) = self.try_next_task() {
-                return Some(task);
-            }
+            self.shared.injector.drain();
 
-            std::hint::spin_loop();
-
-            i += 1;
-            if i >= 16 {
-                i = 0;
-
-                // TODO: wait until task becomes ready
-                std::thread::yield_now();
+            if self.try_next_local().is_none() && self.try_next_global().is_none() {
+                break;
             }
         }
     }
 
-    fn try_next_task(&self) -> Option<Task> {
-        if let Some(task) = self.queue.pop() {
-            return Some(task);
+    /// Makes any tasks reserved possible to be stolen by other workers.
+    fn publish_reserved_tasks(&self) {
+        if let Some(reserved) = self.reserved_next.take() {
+            self.schedule_stealable(reserved);
         }
+    }
+
+    fn try_next_local(&self) -> Option<Task> {
+        self.reserved_next.take().or_else(|| self.queue.pop())
+    }
+
+    fn try_next_global(&self) -> Option<Task> {
+        self.shared.injector.pop()
+    }
+
+    fn try_next_steal(&self) -> Option<Task> {
+        use st3::StealError;
+
+        let workers = &self.shared.workers;
 
         loop {
-            let steal = self.shared.global_queue.steal_batch_and_pop(&self.queue);
-
-            if steal.is_retry() {
-                continue;
-            }
-
-            if let Some(task) = steal.success() {
-                return Some(task);
-            }
-
-            let workers = &self.shared.workers;
-
             // pick a random order to steal tasks from the other workers
             let start = fastrand::usize(0..workers.len());
             let (left, right) = workers.split_at(start);
@@ -300,46 +469,99 @@ impl LocalScheduler {
             let mut retry = false;
 
             for worker in order {
-                let steal = worker.stealer.steal_batch_and_pop(&self.queue);
-
-                if steal.is_retry() {
-                    retry = true;
-                    continue;
-                }
-
-                if let Some(task) = steal.success() {
-                    return Some(task);
+                match worker.stealer.steal_and_pop(&self.queue, |n| n / 2) {
+                    Err(StealError::Empty) => continue,
+                    Err(StealError::Busy) => retry = true,
+                    Ok((task, _count)) => return Some(task),
                 }
             }
 
-            if retry {
-                continue;
-            } else {
+            if !retry {
                 return None;
             }
+
+            std::hint::spin_loop();
         }
     }
 
-    fn drain(&self) {
-        while self.try_next_task().is_some() {}
+    fn next_task(&self) -> Option<Task> {
+        if self.shared.state.load(Relaxed) == State::Running {
+            if let Some(task) = self.try_next_task() {
+                return Some(task);
+            }
+        }
+
+        self.suspend()
     }
 
-    fn suspend(&self) {
+    fn suspend(&self) -> Option<Task> {
+        let shared = &*self.shared;
+
+        loop {
+            match shared.state.load(Relaxed) {
+                State::Terminated => return None,
+                State::Shutdown => self.suspend_shutdown(),
+                State::Running => {
+                    if let Some(task) = self.suspend_running() {
+                        return Some(task);
+                    }
+                }
+            };
+        }
+    }
+
+    fn suspend_running(&self) -> Option<Task> {
+        let shared = &*self.shared;
+
+        shared.idle_workers_approx.fetch_add(1, Relaxed);
+        let _guard = CallOnDrop(|| shared.idle_workers_approx.fetch_sub(1, Relaxed));
+
+        let mut guard = shared.idle_mutex.lock().unwrap();
+
+        while shared.state.load(Relaxed) == State::Running {
+            if let Some(task) = self.try_next_task() {
+                return Some(task);
+            }
+            guard = shared.wake_condition.wait(guard).unwrap();
+        }
+
+        None
+    }
+
+    fn suspend_shutdown(&self) {
         self.drain();
 
-        let shared = &self.shared;
+        let shared = &*self.shared;
 
-        let mut suspended_workers = shared.suspended_workers.lock().unwrap();
-        *suspended_workers += 1;
-        shared.suspend_condition.notify_one();
+        shared.suspended_workers_approx.fetch_add(1, Relaxed);
+        let _guard = CallOnDrop(|| shared.suspended_workers_approx.fetch_sub(1, Relaxed));
 
-        suspended_workers = shared
-            .wake_condition
-            .wait_while(suspended_workers, |_| {
-                matches!(shared.state.load(Relaxed), State::Suspended)
-            })
-            .unwrap();
+        let mut suspended = shared.suspended_workers.lock().unwrap();
 
-        *suspended_workers -= 1;
+        *suspended += 1;
+        if *suspended == shared.workers.len() {
+            shared.suspended_condition.notify_one();
+        }
+
+        while shared.state.load(Relaxed) == State::Shutdown {
+            suspended = shared.start_condition.wait(suspended).unwrap();
+        }
+
+        *suspended -= 1;
+    }
+
+    fn schedule(&self, task: Task) {
+        if let Some(old) = self.reserved_next.replace(Some(task)) {
+            self.schedule_stealable(old);
+        }
+    }
+
+    fn schedule_stealable(&self, task: Task) {
+        match self.queue.push(task) {
+            Ok(()) => self.shared.try_wake_suspended(),
+
+            // too many tasks in the local queue:
+            Err(task) => self.shared.schedule_global(task),
+        }
     }
 }

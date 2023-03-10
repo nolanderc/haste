@@ -66,10 +66,30 @@ async fn digit_sum(db: &dyn crate::Db, path: &'static str) -> u32 {
 }
 
 #[haste::query]
+#[clone]
 async fn product(db: &dyn crate::Db, files: [&'static str; 2]) -> u32 {
     let a = digit_sum(db, files[0]).await;
     let b = digit_sum(db, files[1]).await;
     a * b
+}
+
+fn time<T>(f: impl FnOnce() -> T)
+where
+    T: std::fmt::Debug,
+{
+    let start = std::time::Instant::now();
+    let output = f();
+    let duration = start.elapsed();
+    eprintln!("time: {:?} = {:?}", duration, output);
+}
+
+#[allow(clippy::disallowed_names)]
+async fn run(db: &dyn crate::Db) -> (&String, u32, u32, u32) {
+    let foo = file(db, "foo");
+    let foo_foo = product(db, ["foo", "foo"]);
+    let bar_bar = product(db, ["bar", "bar"]);
+    let foo_bar = product(db, ["foo", "bar"]);
+    (foo.await, foo_foo.await, bar_bar.await, foo_bar.await)
 }
 
 fn main() {
@@ -85,44 +105,18 @@ fn main() {
 
     db.set_input::<file>("bar", "345".into(), Durability::HIGH);
     db.set_input::<file>("foo", "123".into(), Durability::LOW);
-    haste::scope(&mut db, |scope, db| {
-        scope.block_on(async {
-            dbg!(file(db, "foo").await);
-            dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["bar", "bar"]).await);
-        })
-    });
-    
-    db.set_input::<file>("foo", "321".into(), Durability::LOW);
-    haste::scope(&mut db, |scope, db| {
-        scope.block_on(async {
-            dbg!(file(db, "foo").await);
-            dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["bar", "bar"]).await);
-        })
-    });
-    
-    db.set_input::<file>("foo", "123".into(), Durability::LOW);
-    haste::scope(&mut db, |scope, db| {
-        scope.block_on(async {
-            dbg!(file(db, "foo").await);
-            dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["bar", "bar"]).await);
-        })
-    });
-    
-    db.set_input::<file>("foo", "1234".into(), Durability::LOW);
-    haste::scope(&mut db, |scope, db| {
-        scope.block_on(async {
-            dbg!(file(db, "foo").await);
-            dbg!(product(db, ["foo", "foo"]).await);
-            dbg!(product(db, ["bar", "bar"]).await);
-        })
-    });
-    
+    haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
-    let duration = start.elapsed();
-    eprintln!("time: {duration:?}");
+    db.set_input::<file>("foo", "321".into(), Durability::LOW);
+    haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
+
+    db.set_input::<file>("foo", "123".into(), Durability::LOW);
+    haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
+
+    db.set_input::<file>("foo", "1234".into(), Durability::LOW);
+    haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
+
+    eprintln!("total time: {:?}", start.elapsed());
 
     let a = Text::new(&db, TextData("hello".into()));
     let b = Text::new(&db, TextData("hello".into()));

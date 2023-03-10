@@ -1,6 +1,6 @@
 mod cycle;
+mod executor;
 mod history;
-mod scheduler;
 mod task;
 
 use std::{
@@ -18,18 +18,32 @@ use crate::{
 pub use self::cycle::{Cycle, CycleStrategy};
 pub use self::task::{QueryTask, StaticQueryTask};
 
-use self::{cycle::CycleGraph, history::ChangeHistory, scheduler::Scheduler};
+use self::{cycle::CycleGraph, executor::Executor, history::ChangeHistory};
 
 pub struct Runtime {
-    scheduler: Scheduler,
+    /// Our custom executor is used for compute-bound tasks.
+    executor: Executor,
+
+    /// The tokio runtime is used to handle any IO-bound tasks.
+    #[allow(dead_code)]
+    tokio_runtime: tokio::runtime::Runtime,
+
+    /// For each blocked task: the task it is blocked on.
+    ///
+    /// This is used to detect and resolve dependency cycles.
     graph: CycleGraph,
+
+    /// A detailed history of all changes ever made to the query inputs.
     revisions: ChangeHistory,
 }
 
 impl Runtime {
     pub(crate) fn new() -> Self {
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let scheduler = Executor::new(tokio_runtime.handle().clone());
         Self {
-            scheduler: Scheduler::new(),
+            tokio_runtime,
+            executor: scheduler,
             graph: Default::default(),
             revisions: ChangeHistory::new(),
         }
@@ -318,14 +332,14 @@ impl Runtime {
     {
         // extend the lifetime of the task to allow it to be stored in the runtime
         // SAFETY: we are in an active runtime.
-        self.scheduler.spawn(unsafe { task.into_static() });
+        self.executor.spawn(unsafe { task.into_static() });
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output
     where
         F: Future,
     {
-        self.scheduler.run(f)
+        self.executor.run(f)
     }
 }
 
@@ -338,11 +352,11 @@ impl Runtime {
     /// The caller must ensure that a successful call to `enter` is followed by a matching call to
     /// `exit` before any further use of the associated database.
     pub(crate) unsafe fn enter(&mut self) {
-        assert!(self.scheduler.start(), "could not start runtime scheduler");
+        assert!(self.executor.start(), "could not start runtime scheduler");
     }
 
     pub(crate) fn exit(&self) {
         // cancel all running tasks and wait for shutdown
-        assert!(self.scheduler.stop(), "could not stop runtime scheduler");
+        assert!(self.executor.stop(), "could not stop runtime scheduler");
     }
 }

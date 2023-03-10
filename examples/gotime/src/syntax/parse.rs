@@ -1,7 +1,7 @@
 use std::{borrow::Cow, ops::Range};
 
 use bstr::{BString, ByteSlice, ByteVec};
-use haste::{non_max::NonMaxU32, DatabaseExt};
+use haste::non_max::NonMaxU32;
 use smallvec::SmallVec;
 
 use crate::{
@@ -13,8 +13,6 @@ use crate::{
 use super::*;
 
 pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Result<File> {
-    eprintln!("{}", crate::util::TextBox::new(db.fmt(path), source));
-
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {

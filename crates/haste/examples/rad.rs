@@ -10,6 +10,7 @@ pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 #[derive(Default)]
 pub struct Database {
     storage: haste::DatabaseStorage<Self>,
+    tokio: tokio::runtime::Handle,
 }
 
 impl crate::Db for Database {}

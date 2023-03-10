@@ -1,5 +1,6 @@
 use super::*;
 
+/// A `Task` is essentially a type-erased version of `Pin<Arc<Mutex<dyn Future<Output = ()>>>>`.
 pub struct Task {
     header: *mut Header,
 }

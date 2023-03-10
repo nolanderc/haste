@@ -49,9 +49,10 @@ impl Db for Database {}
 fn main() {
     let arguments = <Arguments as clap::Parser>::parse();
 
+    let mut db = Database::default();
+
     let start = std::time::Instant::now();
 
-    let mut db = Database::default();
     haste::scope(&mut db, |scope, db| {
         let result = scope.block_on(compile(db, arguments));
 
@@ -67,6 +68,7 @@ fn main() {
             }
         }
     });
+
     eprintln!("time: {:?}", start.elapsed());
 }
 

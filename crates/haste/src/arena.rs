@@ -39,6 +39,7 @@ impl<T> RawArena<T> {
             0,
             "allocated memory was not aligned"
         );
+
         Self {
             ptr: ptr.cast(),
             reserved: AtomicUsize::new(0),

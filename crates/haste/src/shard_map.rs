@@ -52,6 +52,10 @@ impl<T, Hasher, const SHARDS: usize> ShardMap<T, Hasher, SHARDS> {
     pub fn shard(&self, hash: u64) -> &Shard<T> {
         &self.shards[self.shard_index(hash)]
     }
+
+    pub fn shard_mut(&mut self, hash: u64) -> &mut Shard<T> {
+        &mut self.shards[self.shard_index(hash)]
+    }
 }
 
 /// Use a hasher to hash a single value.

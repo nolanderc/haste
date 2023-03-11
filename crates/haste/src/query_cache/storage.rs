@@ -1,5 +1,7 @@
 mod cell;
 
+use bytemuck::Zeroable;
+
 use crate::{
     arena::{AppendArena, RawArena},
     revision::Revision,
@@ -7,7 +9,7 @@ use crate::{
     Cycle, Dependency, Durability, Id, Query, Runtime,
 };
 
-use std::future::Future;
+use std::{future::Future, sync::atomic::AtomicIsize};
 
 use self::cell::QueryCell;
 
@@ -18,6 +20,12 @@ pub type WaitFuture<'a, Q: Query> = impl Future<Output = &'a OutputSlot<Q>> + Un
 pub struct QueryStorage<Q: Query> {
     /// Stores data about every query.
     slots: RawArena<QuerySlot<Q>>,
+
+    /// A list of all free slots.
+    free_slots: Vec<Id>,
+    /// Index of the next free slot. Free slots with indices larger than this have already been
+    /// consumed.
+    next_free_index: AtomicIsize,
 
     /// Stores the dependencies for all the queries. These are referenced by ranges in the
     /// `OutputSlot`.
@@ -31,6 +39,8 @@ impl<Q: Query> Default for QueryStorage<Q> {
     fn default() -> Self {
         Self {
             slots: Default::default(),
+            free_slots: Vec::new(),
+            next_free_index: AtomicIsize::new(-1),
             dependencies: Default::default(),
             current_revision: None,
             last_revision: None,
@@ -89,19 +99,25 @@ impl<Q: Query> QueryStorage<Q> {
     }
 
     pub fn slot(&self, id: Id) -> &QuerySlot<Q> {
-        self.slots
-            .get(id.raw.get() as usize)
+        self.try_get_slot(id)
             .expect("attempted to get query slot which does not exist")
+    }
+
+    pub fn try_get_slot(&self, id: Id) -> Option<&QuerySlot<Q>> {
+        self.slots.get(id.raw.get() as usize)
     }
 
     pub unsafe fn get_slot_unchecked(&self, id: Id) -> &QuerySlot<Q> {
         self.slots.get_unchecked(id.raw.get() as usize)
     }
 
-    pub(crate) fn slot_mut(&mut self, id: Id) -> &mut QuerySlot<Q> {
-        self.slots
-            .get_mut(id.raw.get() as usize)
+    pub fn slot_mut(&mut self, id: Id) -> &mut QuerySlot<Q> {
+        self.try_get_slot_mut(id)
             .expect("attempted to get query slot which does not exist")
+    }
+
+    pub fn try_get_slot_mut(&mut self, id: Id) -> Option<&mut QuerySlot<Q>> {
+        self.slots.get_mut(id.raw.get() as usize)
     }
 
     pub fn allocate_slot(&self, input: Q::Input) -> (Id, &QuerySlot<Q>) {
@@ -118,6 +134,27 @@ impl<Q: Query> QueryStorage<Q> {
         slot.cell.write_input(input);
         slot
     }
+
+    /// Delete the slot with the given ID.
+    ///
+    /// Requires that there are no outstanding references to this slot (eg. through dependencies).
+    pub fn delete(&mut self, id: Id) {
+        *self.slot_mut(id) = QuerySlot::zeroed();
+
+        let next_index = self.next_free_index.get_mut();
+        if *next_index < 0 {
+            *next_index = 0;
+        } else {
+            *next_index += 1;
+        }
+        let index = *next_index as usize;
+
+        if index < self.free_slots.len() {
+            self.free_slots[index] = id;
+        } else {
+            self.free_slots.push(id);
+        }
+    }
 }
 
 pub struct QuerySlot<Q: Query> {
@@ -126,7 +163,7 @@ pub struct QuerySlot<Q: Query> {
 }
 
 unsafe impl<Q: Query> Sync for QuerySlot<Q> {}
-unsafe impl<Q: Query> bytemuck::Zeroable for QuerySlot<Q> {}
+unsafe impl<Q: Query> Zeroable for QuerySlot<Q> {}
 
 pub struct OutputSlot<Q: Query> {
     /// Refers to a list of dependencies collected while executing this query.
@@ -289,6 +326,16 @@ impl<Q: Query> QuerySlot<Q> {
                     durability,
                 },
             });
+    }
+
+    pub fn remove_output(&mut self, runtime: &mut Runtime)
+    where
+        Q: crate::Input,
+    {
+        let durability = self
+            .get_output_mut()
+            .map(|output| output.transitive.durability);
+        self.cell.remove_output(runtime, durability);
     }
 
     pub fn last_verified(&self) -> Option<Revision> {

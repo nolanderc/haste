@@ -40,12 +40,13 @@ impl ChangeHistory {
     pub fn push_update(
         &mut self,
         last_changed: Option<Revision>,
-        durability: Durability,
+        durability: Option<Durability>,
     ) -> Revision {
         let new =
             Revision::new(self.histories[0].len() as u32 + 1).expect("exhausted revision IDs");
 
-        let (lower, higher) = self.histories.split_at_mut(durability.index() + 1);
+        let durability_level = durability.map(|d| d.index() + 1).unwrap_or(0);
+        let (lower, higher) = self.histories.split_at_mut(durability_level);
 
         // any queries with lower durability might be affected by the change
         for history in lower {

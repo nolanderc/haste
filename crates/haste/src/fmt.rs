@@ -104,8 +104,16 @@ where
         )
     }
 
-    fn storage(&self) -> &S {
-        self.storage
+    fn storage(&self) -> (&S, &crate::Runtime) {
+        (self.storage, self.raw.runtime())
+    }
+
+    fn storage_with_db(&self) -> (&S, &crate::Runtime, &S::DynDatabase) {
+        (self.storage, self.raw.runtime(), self.cast_dyn())
+    }
+
+    fn storage_mut(&mut self) -> (&mut S, &mut crate::Runtime) {
+        unreachable!()
     }
 }
 

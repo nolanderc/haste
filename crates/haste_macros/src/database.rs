@@ -30,16 +30,12 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
             impl haste::StaticDatabase for #ident {
                 type StorageList = (#(#storage_paths,)*);
 
-                fn storage(&self) -> &haste::DatabaseStorage<Self> {
+                fn database_storage(&self) -> &haste::DatabaseStorage<Self> {
                     &self.storage
                 }
 
-                fn storage_mut(&mut self) -> &mut haste::DatabaseStorage<Self> {
+                fn database_storage_mut(&mut self) -> &mut haste::DatabaseStorage<Self> {
                     &mut self.storage
-                }
-
-                fn container(&self, path: haste::ContainerPath) -> &dyn haste::Container<Self> {
-                    self.storage.get_path(self, path)
                 }
             }
 
@@ -54,16 +50,14 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
 
                 /// Determine how an ingredient handles dependency cycles.
                 fn cycle_strategy(&self, path: haste::ContainerPath) -> haste::CycleStrategy {
-                    haste::StaticDatabase::container(self, path)
+                    self.storage.get_path(self, path)
                         .as_query_cache().unwrap()
                         .cycle_strategy()
                 }
 
                 /// The ingredient is part of a cycle.
                 fn set_cycle(&self, path: haste::IngredientPath, cycle: haste::Cycle) {
-                    let result = self
-                        .storage
-                        .get_path(self, path.container)
+                    let result = self.storage.get_path(self, path.container)
                         .as_query_cache().unwrap()
                         .set_cycle(path.resource, cycle);
 
@@ -76,7 +70,7 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                 }
 
                 fn last_change(&self, dep: haste::Dependency) -> haste::LastChangeFuture {
-                    haste::StaticDatabase::container(self, dep.container()).last_change(self, dep)
+                    self.storage.get_path(self, dep.container()).last_change(self, dep)
                 }
 
                 /// Format an ingredient
@@ -85,12 +79,11 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     path: haste::IngredientPath,
                     f: &mut std::fmt::Formatter<'_>
                 ) -> std::fmt::Result {
-                    haste::StaticDatabase::container(self, path.container)
-                        .fmt(path.resource, f)
+                    self.storage.get_path(self, path.container).fmt(path.resource, f)
                 }
 
                 fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {
-                    let list = self.storage.list();
+                    let (list, _) = self.storage.list();
                     #(
                         if id == std::any::TypeId::of::<#storage_paths>() {
                             return Some(&list.#storage_indices);
@@ -116,8 +109,21 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                 }
 
                 #[inline(always)]
-                fn storage(&self) -> &Storage {
-                    &self.storage.list().#index
+                fn storage(&self) -> (&#storage, &haste::Runtime) {
+                    let (list, runtime) = self.storage.list();
+                    (&list.#index, runtime)
+                }
+
+                #[inline(always)]
+                fn storage_with_db(&self) -> (&#storage, &haste::Runtime, &<#storage as haste::Storage>::DynDatabase) {
+                    let (list, runtime) = self.storage.list();
+                    (&list.#index, runtime, self)
+                }
+
+                #[inline(always)]
+                fn storage_mut(&mut self) -> (&mut #storage, &mut haste::Runtime) {
+                    let (list, runtime) = self.storage.list_mut();
+                    (&mut list.#index, runtime)
                 }
             }
         });

@@ -53,19 +53,11 @@ impl Task {
     ///
     /// Calling this function erases the future's lifetime. The caller must ensure that the
     /// lifetime of the task does not outlive that of the future.
-    pub(super) unsafe fn new<F>(future: F, scheduler: Weak<Shared>) -> Self
+    pub(super) unsafe fn from_raw<F>(task: Box<RawTask<F>>) -> Self
     where
         F: Future<Output = ()> + Send,
     {
-        let layout = std::alloc::Layout::new::<RawTask<F>>();
-
-        let ptr = std::alloc::alloc(layout).cast::<RawTask<F>>();
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        ptr.write(RawTask::new(future, scheduler));
-
+        let ptr = Box::into_raw(task);
         Self { header: ptr.cast() }
     }
 
@@ -140,20 +132,66 @@ impl Task {
     }
 
     fn schedule(self) {
-        if let Some(scheduler) = self.header().scheduler.upgrade() {
-            scheduler.schedule(self);
+        if let Some(executor) = self.header().executor.upgrade() {
+            executor.schedule(self);
         }
     }
 }
 
 #[repr(C)]
-struct RawTask<T> {
+#[pin_project::pin_project]
+pub struct RawTask<T> {
     header: Header,
+    #[pin]
     future: T,
 }
 
+impl<T> Future for RawTask<T>
+where
+    T: Future,
+{
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        this.future.poll(cx)
+    }
+}
+
+impl<T> std::ops::Deref for RawTask<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.future
+    }
+}
+
+impl<T> std::ops::DerefMut for RawTask<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.future
+    }
+}
+
 impl<T> RawTask<T> {
-    fn new(future: T, scheduler: Weak<Shared>) -> Self
+    pub(super) fn new_with(executor: Weak<Shared>, create: impl FnOnce() -> T) -> Box<Self>
+    where
+        T: Future<Output = ()>,
+    {
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+
+            let ptr = std::alloc::alloc(layout).cast::<Self>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+
+            ptr.write(Self::new(executor, create()));
+
+            Box::from_raw(ptr)
+        }
+    }
+
+    pub(super) fn new(executor: Weak<Shared>, future: T) -> Self
     where
         T: Future<Output = ()>,
     {
@@ -163,7 +201,7 @@ impl<T> RawTask<T> {
                 state: TaskState::new(),
                 size_align: SizeAlign::of::<Self>(),
                 future_offset: Self::future_offset(),
-                scheduler,
+                executor,
                 vtable: VTable {
                     drop: VTable::drop::<T>,
                     poll: VTable::poll::<T>,
@@ -194,8 +232,8 @@ struct Header {
     /// Byte offset from the header to the start of the future's data.
     future_offset: u32,
 
-    /// Reference to the scheduler so that we can schedule this task.
-    scheduler: Weak<Shared>,
+    /// Reference to the executor so that we can schedule this task.
+    executor: Weak<Shared>,
 
     /// Functions for dynamic dispatch.
     vtable: VTable,

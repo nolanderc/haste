@@ -21,6 +21,8 @@ use crate::util::CallOnDrop;
 
 use self::{injector::Injector, task::Task};
 
+pub use self::task::RawTask;
+
 pub struct Executor {
     /// State shared between all worker threads.
     shared: Arc<Shared>,
@@ -187,9 +189,17 @@ impl Executor {
         output
     }
 
-    pub fn spawn<F>(&self, future: F)
+    pub fn create_task<F>(&self, create: impl FnOnce() -> F) -> Box<RawTask<F>>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()>,
+    {
+        let executor = Arc::downgrade(&self.shared);
+        RawTask::new_with(executor, create)
+    }
+
+    pub unsafe fn spawn<F>(&self, task: Box<RawTask<F>>)
+    where
+        F: Future<Output = ()> + Send,
     {
         assert_eq!(
             self.shared.state.load(Relaxed),
@@ -200,8 +210,7 @@ impl Executor {
             )
         );
 
-        // SAFETY: the future has `'static` lifetime.
-        let task = unsafe { Task::new(future, Arc::downgrade(&self.shared)) };
+        let task = Task::from_raw(task);
 
         self.shared.schedule(task);
     }

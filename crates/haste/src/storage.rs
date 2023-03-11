@@ -12,7 +12,7 @@ use crate::{
 /// Stores the containers for all ingredients in a database.
 pub trait Storage {
     /// The trait object used by ingredients in this storage (eg. `dyn crate::Db`).
-    type DynDatabase: Database + ?Sized + WithStorage<Self>;
+    type DynDatabase: Database + WithStorage<Self> + ?Sized;
 
     /// Initialize the storage within some database.
     fn new<DB: WithStorage<Self>>(router: &mut StorageRouter<DB>) -> Self;
@@ -169,12 +169,12 @@ impl<DB: StaticDatabase + 'static> DatabaseStorage<DB> {
         }
     }
 
-    pub fn list(&self) -> &DB::StorageList {
-        &self.list
+    pub fn list(&self) -> (&DB::StorageList, &Runtime) {
+        (&self.list, &self.runtime)
     }
 
-    pub fn list_mut(&mut self) -> &mut DB::StorageList {
-        &mut self.list
+    pub fn list_mut(&mut self) -> (&mut DB::StorageList, &mut Runtime) {
+        (&mut self.list, &mut self.runtime)
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -182,7 +182,7 @@ impl<DB: StaticDatabase + 'static> DatabaseStorage<DB> {
     }
 
     pub fn get_path<'a>(&self, db: &'a DB, path: ContainerPath) -> &'a dyn Container<DB> {
-        self.router.paths[path.index as usize](db)
+        self.router.routes[path.index as usize](db)
     }
 }
 
@@ -198,19 +198,25 @@ pub trait StorageList<DB> {
 }
 
 pub struct StorageRouter<DB: ?Sized> {
-    paths: Vec<Route<DB>>,
+    routes: Vec<Route<DB>>,
+    routes_mut: Vec<RouteMut<DB>>,
 }
 
 type Route<DB> = fn(&DB) -> &dyn Container<DB>;
+type RouteMut<DB> = fn(&mut DB) -> &mut dyn Container<DB>;
 
 impl<DB> StorageRouter<DB> {
     pub(crate) fn new() -> Self {
-        Self { paths: Vec::new() }
+        Self {
+            routes: Vec::new(),
+            routes_mut: Vec::new(),
+        }
     }
 
-    pub fn push(&mut self, route: Route<DB>) -> ContainerPath {
-        let index = u16::try_from(self.paths.len()).expect("too many containers");
-        self.paths.push(route);
+    pub fn push(&mut self, route: Route<DB>, route_mut: RouteMut<DB>) -> ContainerPath {
+        let index = u16::try_from(self.routes.len()).expect("too many containers");
+        self.routes.push(route);
+        self.routes_mut.push(route_mut);
         ContainerPath { index }
     }
 }

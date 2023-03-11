@@ -47,6 +47,10 @@ pub trait QueryCache: DynQueryCache {
         durability: Durability,
     ) where
         Self::Query: crate::Input;
+
+    fn remove(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
+    where
+        Self::Query: crate::Input;
 }
 
 pub trait DynQueryCache {
@@ -186,6 +190,15 @@ where
 
         slot.set_output(output, durability, runtime);
     }
+
+    fn remove(&mut self, runtime: &mut Runtime, input: &Q::Input)
+    where
+        Self::Query: crate::Input,
+    {
+        if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
+            slot.remove_output(runtime);
+        }
+    }
 }
 
 impl<Q: Query, Lookup> DynQueryCache for QueryCacheImpl<Q, Lookup>
@@ -220,7 +233,7 @@ impl<'a, Q: Query> Clone for QueryResult<'a, Q> {
 pub enum EvalResult<'a, Q: Query> {
     Cached(QueryResult<'a, Q>),
     Pending(#[pin] PendingFuture<'a, Q>),
-    Eval(#[pin] QueryCacheTask<'a, Q>),
+    Eval(#[pin] BoxedQueryCacheTask<'a, Q>),
 }
 
 impl<'a, Q: Query> Future for EvalResult<'a, Q> {
@@ -265,6 +278,10 @@ impl<'a, Q: Query> PendingFuture<'a, Q> {
             blocks: None,
             fut,
         }
+    }
+
+    pub fn path(&self) -> IngredientPath {
+        self.path
     }
 }
 
@@ -365,7 +382,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         db: &'a DatabaseFor<Q>,
         id: Id,
         slot: ClaimedSlot<'a, Q>,
-    ) -> Result<QueryCacheTask<'a, Q>, &'a OutputSlot<Q>> {
+    ) -> Result<BoxedQueryCacheTask<'a, Q>, &'a OutputSlot<Q>> {
         let this = self.ingredient(id);
 
         let verify_data = verify::VerifyData {
@@ -389,7 +406,10 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
             query = %crate::util::fmt::ingredient(db.as_dyn(), this),
         );
 
-        Ok(QueryCacheTask { state, span })
+        Ok(crate::runtime::BoxedQueryTask::new(
+            db.runtime(),
+            move || QueryCacheTask { state, span },
+        ))
     }
 
     fn ingredient(&self, id: Id) -> IngredientPath {
@@ -399,6 +419,8 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         }
     }
 }
+
+pub type BoxedQueryCacheTask<'a, Q> = crate::runtime::BoxedQueryTask<QueryCacheTask<'a, Q>>;
 
 #[pin_project::pin_project]
 pub struct QueryCacheTask<'a, Q: Query> {
@@ -441,26 +463,6 @@ impl<Q: Query> crate::runtime::QueryTask for QueryCacheTask<'_, Q> {
             TaskState::Verify { path, .. } => *path,
             TaskState::Exec(future) => future.inner.query(),
         }
-    }
-}
-
-impl<Q: Query> crate::runtime::StaticQueryTask for QueryCacheTask<'_, Q> {
-    type StaticFuture = StaticQueryCacheTask<'static, Q>;
-
-    unsafe fn into_static(self) -> Self::StaticFuture {
-        std::mem::transmute(StaticQueryCacheTask(self))
-    }
-}
-
-#[repr(transparent)]
-#[pin_project::pin_project]
-pub struct StaticQueryCacheTask<'a, Q: Query>(#[pin] QueryCacheTask<'a, Q>);
-
-impl<Q: Query> Future for StaticQueryCacheTask<'_, Q> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        crate::runtime::QueryTask::poll(self.project().0, cx)
     }
 }
 

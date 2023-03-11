@@ -50,7 +50,7 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
         };
 
         impls.extend(quote! {
-            impl haste::HasIngredient<#ty> for Storage {
+            impl haste::HasIngredient<#ty> for #ident {
                 fn container(&self) -> &#container_type {
                     &self.#field_member
                 }
@@ -77,7 +77,10 @@ pub fn storage_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenS
                 Self {
                     #(
                         #field_members: <#container_types as haste::StaticContainer>::new(
-                            router.push(|db| &db.storage().#field_members)
+                            router.push(
+                                |db| &haste::WithStorage::<Self>::storage(db).0.#field_members,
+                                |db| &mut haste::WithStorage::<Self>::storage_mut(db).0.#field_members,
+                            )
                         ),
                     )*
                 }

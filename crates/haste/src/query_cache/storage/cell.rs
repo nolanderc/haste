@@ -198,12 +198,11 @@ impl<I, O> QueryCell<I, O> {
         let output = self.output.get_mut();
 
         let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(last_change, durability);
+        let current = runtime.update_input(last_change, Some(durability));
 
         let value = make_output(current);
 
-        let had_input = (*state & HAS_OUTPUT) != 0;
-        if had_input {
+        if (*state & HAS_OUTPUT) != 0 {
             unsafe { output.assume_init_drop() }
         }
         output.write(value);
@@ -212,6 +211,22 @@ impl<I, O> QueryCell<I, O> {
 
         self.state.verified_at.set(Some(current));
         self.state.changed_at.set(Some(current));
+    }
+
+    pub fn remove_output(&mut self, runtime: &mut Runtime, durability: Option<Durability>) {
+        let state = self.state.addr.get_mut();
+        let output = self.output.get_mut();
+
+        let Some(last_change) = self.state.changed_at.get() else { return };
+
+        let current = runtime.update_input(Some(last_change), durability);
+
+        self.state.changed_at.set(Some(current));
+
+        if (*state & HAS_OUTPUT) != 0 {
+            unsafe { output.assume_init_drop() }
+        }
+        *state &= !HAS_OUTPUT;
     }
 
     /// # Safety

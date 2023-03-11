@@ -1,7 +1,7 @@
 mod cycle;
 mod executor;
 mod history;
-mod task;
+// mod task;
 
 use std::{
     cell::Cell,
@@ -11,14 +11,19 @@ use std::{
 };
 
 use crate::{
-    revision::Revision, util::CallOnDrop, ContainerPath, Database, DatabaseFor, Durability,
-    IngredientPath, Query, RevisionRange, TransitiveDependencies,
+    revision::Revision,
+    util::{future::UnitFuture, CallOnDrop},
+    ContainerPath, Database, DatabaseFor, Durability, IngredientPath, Query, RevisionRange,
+    TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
-pub use self::task::{QueryTask, StaticQueryTask};
 
-use self::{cycle::CycleGraph, executor::Executor, history::ChangeHistory};
+use self::{
+    cycle::CycleGraph,
+    executor::{Executor, RawTask},
+    history::ChangeHistory,
+};
 
 pub struct Runtime {
     /// Our custom executor is used for compute-bound tasks.
@@ -56,7 +61,7 @@ impl Runtime {
     pub fn update_input(
         &mut self,
         changed_at: Option<Revision>,
-        durability: Durability,
+        durability: Option<Durability>,
     ) -> Revision {
         self.revisions.push_update(changed_at, durability)
     }
@@ -325,14 +330,15 @@ impl Runtime {
         self.graph.remove(parent);
     }
 
-    pub(crate) fn spawn_query<'a, T>(&'a self, task: T)
+    pub(crate) fn spawn_query<'a, T>(&'a self, task: BoxedQueryTask<T>)
     where
-        T: StaticQueryTask + 'a,
-        T::StaticFuture: Send,
+        T: QueryTask + Future + Send,
     {
         // extend the lifetime of the task to allow it to be stored in the runtime
         // SAFETY: we are in an active runtime.
-        self.executor.spawn(unsafe { task.into_static() });
+        unsafe {
+            self.executor.spawn(task.raw);
+        }
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output
@@ -340,6 +346,60 @@ impl Runtime {
         F: Future,
     {
         self.executor.run(f)
+    }
+}
+
+pub trait QueryTask {
+    /// Poll the task for completion.
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()>;
+
+    /// Get a unique identifier for the query.
+    fn path(&self) -> IngredientPath;
+}
+
+pub struct BoxedQueryTask<T> {
+    raw: Box<RawTask<UnitFuture<T>>>,
+}
+
+impl<T> QueryTask for BoxedQueryTask<T>
+where
+    T: QueryTask,
+{
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<()> {
+        unsafe {
+            let inner: &mut T = &mut self.get_unchecked_mut().raw;
+            T::poll(Pin::new_unchecked(inner), cx)
+        }
+    }
+
+    fn path(&self) -> IngredientPath {
+        T::path(&self.raw)
+    }
+}
+
+impl<T> Future for BoxedQueryTask<T>
+where
+    T: Future,
+{
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        unsafe {
+            let inner: &mut T = &mut self.get_unchecked_mut().raw;
+            Pin::new_unchecked(inner).poll(cx)
+        }
+    }
+}
+
+impl<T> BoxedQueryTask<T> {
+    pub fn new(runtime: &Runtime, create: impl FnOnce() -> T) -> Self
+    where
+        T: Future,
+    {
+        let raw = runtime
+            .executor
+            .create_task(move || UnitFuture::new(create()));
+        Self { raw }
     }
 }
 

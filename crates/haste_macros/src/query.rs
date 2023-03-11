@@ -165,6 +165,28 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         }
     });
 
+    if args.input {
+        tokens.extend(quote! {
+            impl #ident {
+                #vis fn set(
+                    #db_ident: &mut dyn #db_path,
+                    input: (#(#input_types),*),
+                    output: #output_type,
+                    durability: haste::Durability,
+                ) {
+                    haste::DatabaseExt::set::<Self>(#db_ident, input, output, durability)
+                }
+
+                #vis fn remove(
+                    #db_ident: &mut dyn #db_path,
+                    input: (#(#input_types),*),
+                ) {
+                    haste::DatabaseExt::remove::<Self>(#db_ident, input)
+                }
+            }
+        });
+    }
+
     for error in errors {
         tokens.extend(error.to_compile_error());
     }

@@ -71,3 +71,39 @@ where
 
     PollFnPin { future, poll_fn }
 }
+
+#[pin_project::pin_project]
+pub struct UnitFuture<F> {
+    #[pin]
+    inner: F,
+}
+
+impl<F> Future for UnitFuture<F>
+where
+    F: Future,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx).map(|_| {})
+    }
+}
+
+impl<F> UnitFuture<F> {
+    pub fn new(inner: F) -> Self {
+        Self { inner }
+    }
+}
+
+impl<F> std::ops::Deref for UnitFuture<F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl<F> std::ops::DerefMut for UnitFuture<F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}

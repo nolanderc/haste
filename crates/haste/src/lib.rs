@@ -32,9 +32,15 @@ use util::CallOnDrop;
 ///
 /// Note that misuse of this value (such as using the same ID for different ingredients) may have
 /// adverse affects, such as inconsistent results and crashes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id {
     pub(crate) raw: NonMaxU32,
+}
+
+impl std::fmt::Debug for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Id({})", self.raw)
+    }
 }
 
 impl Id {
@@ -81,17 +87,17 @@ pub trait StaticDatabase: Database + Sized {
     /// A type containing all the storages used by a database.
     type StorageList: StorageList<Self>;
 
-    fn storage(&self) -> &DatabaseStorage<Self>;
+    fn database_storage(&self) -> &DatabaseStorage<Self>;
 
-    fn storage_mut(&mut self) -> &mut DatabaseStorage<Self>;
-
-    fn container(&self, path: ContainerPath) -> &dyn Container<Self>;
+    fn database_storage_mut(&mut self) -> &mut DatabaseStorage<Self>;
 }
 
 /// Implemented by databases which contain a specific type of storage.
 pub trait WithStorage<S: Storage + ?Sized>: Database {
     fn cast_dyn(&self) -> &S::DynDatabase;
-    fn storage(&self) -> &S;
+    fn storage(&self) -> (&S, &Runtime);
+    fn storage_with_db(&self) -> (&S, &Runtime, &S::DynDatabase);
+    fn storage_mut(&mut self) -> (&mut S, &mut Runtime);
 }
 
 pub trait Ingredient: 'static {
@@ -225,28 +231,26 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let runtime = self.runtime();
-        let storage = self.storage();
+        let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
         let path = cache.path();
 
-        crate::util::future::poll_fn_pin(
-            cache.get_or_evaluate(self.cast_dyn(), input),
-            move |future, cx| {
-                let result = std::task::ready!(future.poll(cx));
+        let future = cache.get_or_evaluate(db, input);
 
-                runtime.register_dependency(
-                    Dependency {
-                        container: path,
-                        resource: result.id,
-                        extra: 0,
-                    },
-                    result.slot.transitive,
-                );
+        crate::util::future::poll_fn_pin(future, move |future, cx| {
+            let result = std::task::ready!(future.poll(cx));
 
-                std::task::Poll::Ready(&result.slot.output)
-            },
-        )
+            runtime.register_dependency(
+                Dependency {
+                    container: path,
+                    resource: result.id,
+                    extra: 0,
+                },
+                result.slot.transitive,
+            );
+
+            std::task::Poll::Ready(&result.slot.output)
+        })
     }
 
     /// Spawn the query in the runtime, and possibly await its result in the background
@@ -257,8 +261,7 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.cast_dyn();
-        let storage = self.storage();
+        let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
 
         enum SpawnResult<Cached, Pending> {
@@ -274,7 +277,7 @@ pub trait DatabaseExt: Database {
                 // spawn the query, but postpone checking it for completion until the returned
                 // future is polled. That way the spawned task has a chance of completing first.
                 let id = runtime::QueryTask::path(&eval).resource;
-                db.runtime().spawn_query(eval);
+                runtime.spawn_query(eval);
                 SpawnResult::Spawned(id)
             }
         };
@@ -291,7 +294,7 @@ pub trait DatabaseExt: Database {
                 }
             };
 
-            db.runtime().register_dependency(
+            runtime.register_dependency(
                 Dependency {
                     container: cache.path(),
                     resource: result.id,
@@ -315,8 +318,7 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let db = self.cast_dyn();
-        let storage = self.storage();
+        let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
         let result = cache.get_or_evaluate(db, input);
 
@@ -325,27 +327,38 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(_) | EvalResult::Pending(_) => {}
 
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
-            EvalResult::Eval(eval) => db.runtime().spawn_query(eval),
+            EvalResult::Eval(eval) => runtime.spawn_query(eval),
         }
     }
 
     /// Set the value of an input
-    fn set_input<'db, Q>(&'db mut self, input: Q::Input, output: Q::Output, durability: Durability)
+    fn set<'db, Q>(&'db mut self, input: Q::Input, output: Q::Output, durability: Durability)
     where
         Q: Input,
         Q::Storage: 'static,
         Q::Container: QueryCache<Query = Q> + 'db,
-        Self: StaticDatabase + WithStorage<Q::Storage>,
+        Self: WithStorage<Q::Storage>,
     {
         assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
 
-        let storage = self.storage_mut();
-        let cache = storage
-            .list
-            .get_mut::<Q::Storage>()
-            .unwrap()
-            .container_mut();
-        cache.set(&mut storage.runtime, input, output, durability);
+        let (storage, runtime) = self.storage_mut();
+        let cache = storage.container_mut();
+        cache.set(runtime, input, output, durability);
+    }
+
+    /// Set the value of an input
+    fn remove<'db, Q>(&'db mut self, input: Q::Input)
+    where
+        Q: Input,
+        Q::Storage: 'static,
+        Q::Container: QueryCache<Query = Q> + 'db,
+        Self: WithStorage<Q::Storage>,
+    {
+        assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
+
+        let (storage, runtime) = self.storage_mut();
+        let cache = storage.container_mut();
+        cache.remove(runtime, &input);
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T
@@ -356,7 +369,7 @@ pub trait DatabaseExt: Database {
         <T::Container as ElementContainer>::Value: Sized,
         Self: WithStorage<T::Storage>,
     {
-        let storage = self.storage();
+        let (storage, _runtime) = self.storage();
         let container = storage.container();
         let id = container.insert(value);
         T::from_id(id)
@@ -369,7 +382,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainerRef + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let storage = self.storage();
+        let (storage, _runtime) = self.storage();
         let container = storage.container();
         let id = container.insert_ref(value);
         T::from_id(id)
@@ -382,8 +395,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainer + Container<Self> + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let runtime = self.runtime();
-        let storage = self.storage();
+        let (storage, runtime) = self.storage();
         let container = storage.container();
 
         let id = handle.id();
@@ -406,6 +418,14 @@ pub trait DatabaseExt: Database {
     fn fmt<T>(&self, value: T) -> fmt::Adapter<'_, T> {
         fmt::Adapter::new(self.as_dyn(), value)
     }
+
+    fn scope<F, T>(&mut self, f: F) -> T
+    where
+        F: FnOnce(Scope<'_>, &Self) -> T,
+        Self: StaticDatabase + 'static,
+    {
+        scope(self, f)
+    }
 }
 
 impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
@@ -416,11 +436,12 @@ where
     F: FnOnce(Scope<'_>, &DB) -> T,
     DB: StaticDatabase + Sized + 'static,
 {
-    let storage = db.storage_mut();
+    let storage = db.database_storage_mut();
 
     unsafe { storage.runtime.enter() };
+
     let current = storage.runtime.current_revision();
-    storage.list_mut().begin(current);
+    storage.list_mut().0.begin(current);
 
     let runtime = db.runtime();
 
@@ -433,7 +454,7 @@ where
         f(scope, db)
     };
 
-    db.storage_mut().list_mut().end();
+    db.database_storage_mut().list_mut().0.end();
 
     result
 }
@@ -441,7 +462,7 @@ where
 pub struct Scope<'a> {
     runtime: &'a Runtime,
 
-    // The scope needs to be `!Sync` so that only one thread blocks on the runtime.
+    // The scope needs to be `!Sync` so that only one thread blocks on the runtime at a time.
     _phantom: PhantomData<*mut ()>,
 }
 

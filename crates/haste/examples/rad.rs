@@ -2,7 +2,7 @@
 #![feature(trivial_bounds)]
 #![allow(clippy::uninlined_format_args)]
 
-use haste::{DatabaseExt, Durability};
+use haste::Durability;
 
 pub trait Db: haste::Database + haste::WithStorage<Storage> {}
 
@@ -36,7 +36,10 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-    fib(db, n - 1).await.wrapping_add(fib(db, n - 2).await)
+
+    let a = fib(db, n - 1);
+    let b = fib(db, n - 2);
+    a.await.wrapping_add(b.await)
 }
 
 #[haste::query]
@@ -103,17 +106,17 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    db.set_input::<file>("bar", "345".into(), Durability::HIGH);
-    db.set_input::<file>("foo", "123".into(), Durability::LOW);
+    file::set(&mut db, "foo", "123".into(), Durability::LOW);
+    file::set(&mut db, "bar", "345".into(), Durability::HIGH);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
-    db.set_input::<file>("foo", "321".into(), Durability::LOW);
+    file::set(&mut db, "foo", "321".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
-    db.set_input::<file>("foo", "123".into(), Durability::LOW);
+    file::set(&mut db, "foo", "123".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
-    db.set_input::<file>("foo", "1234".into(), Durability::LOW);
+    file::set(&mut db, "foo", "1234".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
     eprintln!("total time: {:?}", start.elapsed());

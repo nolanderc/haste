@@ -1,6 +1,7 @@
 pub mod fmt;
 pub mod future;
 mod signal;
+pub mod arc;
 
 pub use signal::{DropSignal, Signal, WaitSignal};
 

@@ -7,18 +7,20 @@ use ahash::HashMap;
 use dashmap::DashMap;
 use smallvec::SmallVec;
 
-use crate::{AtomicIngredientPath, ContainerPath, Database, IngredientPath};
+use crate::{util::arc::AtomicWeak, ContainerPath, Database, IngredientPath};
 
 #[derive(Default)]
 pub struct CycleGraph {
     /// For each currently blocked query: the query they are blocked on
-    vertices: DashMap<IngredientPath, Vertex>,
+    vertices: DashMap<IngredientPath, Arc<Vertex>>,
 
     /// For each kind of query: its cycle recovery strategy
     recover_strategies: RwLock<HashMap<ContainerPath, CycleStrategy>>,
 }
 
 struct Vertex {
+    this: IngredientPath,
+
     /// The query this is blocked on
     blocked_on: IngredientPath,
 
@@ -26,7 +28,7 @@ struct Vertex {
     /// an optimization to reduce the number nodes that need to be visited when detecting cycles,
     /// similar to path shortening found in
     /// [Disjoint-Sets](https://en.wikipedia.org/wiki/Disjoint-set_data_structure).
-    shortcut: AtomicIngredientPath,
+    shortcut: AtomicWeak<Vertex>,
 
     waker: Mutex<Option<Waker>>,
 }
@@ -39,11 +41,12 @@ impl CycleGraph {
         waker: &Waker,
         db: &dyn Database,
     ) {
-        let vertex = Vertex {
+        let vertex = Arc::new(Vertex {
+            this: source,
             blocked_on: target,
-            shortcut: AtomicIngredientPath::new(None),
+            shortcut: AtomicWeak::new(None),
             waker: Mutex::new(Some(waker.clone())),
-        };
+        });
 
         if let Some(previous) = self.vertices.insert(source, vertex) {
             panic!(
@@ -156,17 +159,16 @@ impl CycleGraph {
     /// the length of the cycle.
     fn find_cycle(&self, start: IngredientPath) -> Option<(IngredientPath, usize)> {
         let mut prev = None;
-        let mut next = |curr: IngredientPath| {
-            let this = self.vertices.get(&curr)?;
-
+        let mut next = |curr: Arc<Vertex>| {
             // use the shortcut if it is still valid
-            let next = match this.shortcut.load(Relaxed) {
-                Some(shortcut) if self.vertices.contains_key(&shortcut) => shortcut,
-                _ => this.blocked_on,
+            let next = match curr.shortcut.upgrade(Relaxed, Relaxed) {
+                Some(shortcut) => shortcut,
+                None => self.vertices.get(&curr.blocked_on)?.clone(),
             };
 
-            if let Some(previous) = prev.replace(this) {
-                previous.shortcut.store(Some(next), Relaxed);
+            if let Some(previous) = prev.replace(curr) {
+                let shortcut = Arc::downgrade(&next);
+                previous.shortcut.swap(Some(shortcut), Relaxed);
             }
 
             Some(next)
@@ -174,17 +176,19 @@ impl CycleGraph {
 
         // Algorithm Source: https://en.wikipedia.org/wiki/Cycle_detection#Brent's_algorithm
 
+        let start_vertex = self.vertices.get(&start)?.clone();
+
         // lower bound on the length of the cycle
         let mut length = 1;
         let mut power = 1;
 
         let mut tortoise = start;
-        let mut hare = next(start)?;
+        let mut hare = next(start_vertex)?;
 
-        while tortoise != hare {
+        while tortoise != hare.this {
             if length == power {
                 // continue with next power of two
-                tortoise = hare;
+                tortoise = hare.this;
                 power *= 2;
                 length = 0;
             }
@@ -192,7 +196,7 @@ impl CycleGraph {
             length += 1;
         }
 
-        Some((hare, length))
+        Some((hare.this, length))
     }
 
     fn lookup_strategy(&self, container: ContainerPath, db: &dyn Database) -> CycleStrategy {

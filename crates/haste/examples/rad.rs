@@ -47,7 +47,7 @@ async fn fib(db: &dyn crate::Db, n: u64) -> u64 {
 #[cycle(cyclic_cycle)]
 async fn cyclic(db: &dyn crate::Db, n: u32) -> u32 {
     match n {
-        0..=3 => cyclic(db, n + 1).await,
+        0..=100 => cyclic(db, n + 1).await,
         _ => cyclic(db, 0).await,
     }
 }
@@ -118,6 +118,10 @@ fn main() {
 
     file::set(&mut db, "foo", "1234".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
+
+    haste::scope(&mut db, |scope, db| {
+        time(|| scope.block_on(cyclic(db, 321)))
+    });
 
     eprintln!("total time: {:?}", start.elapsed());
 

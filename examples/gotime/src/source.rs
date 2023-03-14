@@ -30,8 +30,8 @@ impl std::fmt::Display for SourcePathData {
 }
 
 /// Get the source text for some file.
-/// TODO: this should be made marked as a mutable input
 #[haste::query]
+#[input]
 pub async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<String> {
     let data = path.get(db);
     let real_path = match data {
@@ -46,7 +46,7 @@ pub async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<String>
                 std::io::ErrorKind::NotFound => {
                     format!("could not find file `{}`", path)
                 }
-                _ => format!("could not open file `{}`: {}", path, error),
+                _ => format!("could not read file `{}`: {}", path, error),
             };
             Err(Diagnostic::error(message))
         }

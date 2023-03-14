@@ -119,10 +119,6 @@ fn main() {
     file::set(&mut db, "foo", "1234".into(), Durability::LOW);
     haste::scope(&mut db, |scope, db| time(|| scope.block_on(run(db))));
 
-    haste::scope(&mut db, |scope, db| {
-        time(|| scope.block_on(cyclic(db, 321)))
-    });
-
     eprintln!("total time: {:?}", start.elapsed());
 
     let a = Text::new(&db, TextData("hello".into()));

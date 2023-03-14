@@ -13,7 +13,7 @@ pub struct Adapter<'db, T> {
 }
 
 thread_local! {
-    static FMT_DATABASE: Cell<Option<NonNull<dyn Database + 'static>>> = Cell::new(None);
+    static FMT_DATABASE: Cell<Option<NonNull<dyn Database>>> = Cell::new(None);
 }
 
 impl<'db, T> Adapter<'db, T> {
@@ -23,6 +23,8 @@ impl<'db, T> Adapter<'db, T> {
 
     fn enter(&self, f: impl FnOnce() -> std::fmt::Result) -> std::fmt::Result {
         let dyn_db: &dyn Database = self.db;
+
+        // temporarily extend the lifetime of `self.db`:
         let dyn_db: &(dyn Database + 'static) = unsafe { std::mem::transmute(dyn_db) };
 
         FMT_DATABASE.with(|db| {

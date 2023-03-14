@@ -36,8 +36,27 @@ pub struct File {
     pub declarations: KeyList<Key<Decl>, Decl>,
 }
 
-/// References a span relative to the `base_span` in the closent containing declaration. If outside
-/// a declaration, the index is absolute.
+impl File {
+    pub fn package_name(&self) -> Text {
+        // the package name cannot be blank:
+        self.package.text.unwrap()
+    }
+
+    pub fn package_span(&self) -> Span {
+        self.span(None, self.package.span)
+    }
+
+    pub fn span(&self, decl: Option<Key<Decl>>, id: SpanId) -> Span {
+        let absolute = match decl {
+            None => id.absolute(),
+            Some(decl) => self.declarations[decl].base_span.offset(id.relative()),
+        };
+        Span::new(self.path, self.span_ranges[absolute])
+    }
+}
+
+/// References a span relative to the `base_span` in the closent containing declaration. If
+/// outside a declaration, the index is absolute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpanId(NonMaxU16);
 
@@ -113,11 +132,19 @@ pub struct TypeSpec {
     pub inner: TypeId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncDecl {
     pub name: Identifier,
     pub signature: Signature,
-    pub body: Option<Block>,
+    pub body: Option<FunctionBody>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionBody {
+    /// List of all statements in the block.
+    pub block: Block,
+    /// List of all labels defined in the function.
+    pub labels: NodeRange,
 }
 
 /// Points to a sequence of nodes representing the parameters of a function.
@@ -409,7 +436,7 @@ pub enum Node {
     Binary(ExprId, BinaryOperator, ExprId),
 
     /// A function literal with a body
-    Function(Signature, Block),
+    Function(Signature, FunctionBody),
 
     /// Index into a container
     Index(ExprId, ExprId),
@@ -538,9 +565,6 @@ pub struct RecvBindings {
 pub struct Block {
     /// A sequence of statements to execute
     pub statements: StmtRange,
-    /// A list of all labels defined in the block (labels have block scope, which is why we declare
-    /// them here for fast access)
-    pub labels: StmtRange,
 }
 
 /// Certain syntax forms accepts both `:=` and `=`.

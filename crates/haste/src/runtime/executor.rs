@@ -211,7 +211,6 @@ impl Executor {
         );
 
         let task = Task::from_raw(task);
-
         self.shared.schedule(task);
     }
 

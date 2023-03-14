@@ -194,6 +194,9 @@ pub struct Key<T> {
     _phantom: PhantomData<*const T>,
 }
 
+unsafe impl<T> Send for Key<T> {}
+unsafe impl<T> Sync for Key<T> {}
+
 impl<T> std::fmt::Debug for Key<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.raw.get().fmt(f)

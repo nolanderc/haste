@@ -393,23 +393,27 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
 
         let state = match verify::verify_shallow(verify_data) {
             Ok(Ok(backdated)) => return Err(backdated),
-            Ok(Err(data)) => TaskState::execute(this, data),
-            Err(deep_verify) => TaskState::Verify {
-                future: deep_verify,
-                path: this,
-            },
+            result => crate::runtime::BoxedQueryTask::new(db.runtime(), move || {
+                let span = tracing::debug_span!(
+                    parent: None,
+                    "evaluate",
+                    query = %crate::util::fmt::ingredient(db.as_dyn(), this),
+                );
+
+                let state = match result {
+                    Ok(Ok(_backdated)) => unreachable!(),
+                    Ok(Err(data)) => TaskState::execute(this, data),
+                    Err(deep_verify) => TaskState::Verify {
+                        future: deep_verify,
+                        path: this,
+                    },
+                };
+
+                QueryCacheTask { state, span }
+            }),
         };
 
-        let span = tracing::debug_span!(
-            parent: None,
-            "evaluate",
-            query = %crate::util::fmt::ingredient(db.as_dyn(), this),
-        );
-
-        Ok(crate::runtime::BoxedQueryTask::new(
-            db.runtime(),
-            move || QueryCacheTask { state, span },
-        ))
+        Ok(state)
     }
 
     fn ingredient(&self, id: Id) -> IngredientPath {

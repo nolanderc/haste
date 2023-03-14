@@ -332,13 +332,11 @@ impl Runtime {
 
     pub(crate) fn spawn_query<'a, T>(&'a self, task: BoxedQueryTask<T>)
     where
-        T: QueryTask + Future + Send,
+        T: QueryTask + Future + Send + 'a,
     {
-        // extend the lifetime of the task to allow it to be stored in the runtime
-        // SAFETY: we are in an active runtime.
-        unsafe {
-            self.executor.spawn(task.raw);
-        }
+        // SAFETY: This extends the lifetime of the task to `'static`, but we ensure that the
+        // executor is stopped before the lifetime of the runtime is over.
+        unsafe { self.executor.spawn(task.raw) }
     }
 
     pub(crate) fn block_on<F>(&self, f: F) -> F::Output

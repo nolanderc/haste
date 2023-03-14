@@ -104,6 +104,9 @@ struct NodeData {
     /// to reuse the same alloction when parsing sequnces such as call arguments or statement
     /// blocks.
     indirect_stack: Vec<NodeId>,
+
+    /// For each function: a list of all labels that occur within it.
+    labels: Vec<StmtId>,
 }
 
 /// Tracks the length of the corresponding lists in `Tmp`.
@@ -232,8 +235,6 @@ type Result<T, E = ErrorToken> = std::result::Result<T, E>;
 
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
-
-type LabelList = SmallVec<[StmtId; 8]>;
 
 impl<'a> Parser<'a> {
     /// Determines if the current expression is followed by a block.
@@ -825,12 +826,14 @@ impl<'a> Parser<'a> {
         let receiver = self.try_receiver()?;
         let name = self.identifier()?;
         let signature = self.signature(receiver)?;
+
         let body = if self.peek_is(Token::LCurly) {
-            let (body, _) = self.statement_block()?;
+            let (body, _) = self.function_body()?;
             Some(body)
         } else {
             None
         };
+
         let decl = FuncDecl {
             name,
             signature,
@@ -1223,14 +1226,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn statement(&mut self, labels: &mut LabelList) -> Result<StmtId> {
-        match self.try_statement(labels)? {
+    fn statement(&mut self) -> Result<StmtId> {
+        match self.try_statement()? {
             Some(stmt) => Ok(stmt),
             None => Err(self.emit_expected("a statement")),
         }
     }
 
-    fn try_statement(&mut self, labels: &mut LabelList) -> Result<Option<StmtId>> {
+    fn try_statement(&mut self) -> Result<Option<StmtId>> {
         static STATEMENTS: LookupTable<ParseFn<StmtId>, 15> = LookupTable::new([
             (Token::LCurly, |this| this.block()),
             (Token::Return, |this| this.return_statement()),
@@ -1291,11 +1294,11 @@ impl<'a> Parser<'a> {
         } else if self.peek_is(Token::Identifier) && self.peek2_is(Token::Colon) {
             let label = self.identifier()?;
             self.eat(Token::Colon);
-            let inner = self.statement(labels)?;
+            let inner = self.statement()?;
             let span = self.emit_join(label, inner);
-            let node = self.emit_stmt(Node::Label(label, inner), span);
-            labels.push(node);
-            Ok(Some(node))
+            let stmt = self.emit_stmt(Node::Label(label, inner), span);
+            self.data.node.labels.push(stmt);
+            Ok(Some(stmt))
         } else if let Some(expr) = self.try_expression()? {
             if let Some(simple) = self.try_simple_statement(expr)? {
                 Ok(Some(simple))
@@ -1331,6 +1334,25 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn function_body(&mut self) -> Result<(FunctionBody, FileRange)> {
+        let labels_start = self.data.node.labels.len();
+
+        let (block, file_range) = self.statement_block()?;
+
+        let labels = self.multi(|this| {
+            let nodes = this
+                .data
+                .node
+                .labels
+                .drain(labels_start..)
+                .map(|label| label.node);
+            this.data.node.indirect_stack.extend(nodes);
+            Ok(())
+        })?;
+
+        Ok((FunctionBody { block, labels }, file_range))
+    }
+
     fn block(&mut self) -> Result<StmtId> {
         let (block, range) = self.statement_block()?;
         let span = self.emit_span(range);
@@ -1346,7 +1368,6 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_list(&mut self, allow_fallthough: bool) -> Result<Block> {
-        let mut labels = LabelList::new();
         let statements = self.multi(|this| loop {
             if allow_fallthough {
                 if let Some(token) = this.try_expect(Token::Fallthrough) {
@@ -1358,7 +1379,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            if let Some(statement) = this.try_statement(&mut labels)? {
+            if let Some(statement) = this.try_statement()? {
                 this.data.push_indirect(statement.node);
             }
 
@@ -1367,15 +1388,8 @@ impl<'a> Parser<'a> {
             }
         })?;
 
-        let labels = self.multi(|this| {
-            let nodes = labels.into_iter().map(|label| label.node);
-            this.data.node.indirect_stack.extend(nodes);
-            Ok(())
-        })?;
-
         Ok(Block {
             statements: StmtRange::new(statements),
-            labels: StmtRange::new(labels),
         })
     }
 
@@ -2211,7 +2225,7 @@ impl<'a> Parser<'a> {
             (Token::Func, |this, func_token| {
                 let signature = this.signature(None)?;
                 if this.peek_is(Token::LCurly) {
-                    let (body, body_range) = this.statement_block()?;
+                    let (body, body_range) = this.function_body()?;
                     let span = this.emit_join(func_token, body_range);
                     Ok(this.emit_expr(Node::Function(signature, body), span))
                 } else {

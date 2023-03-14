@@ -164,7 +164,7 @@ impl FuncDecl {
 
         if let Some(body) = self.body {
             write!(out, " ")?;
-            write_block(out, nodes, body)?;
+            write_block(out, nodes, body.block)?;
         }
 
         Ok(())
@@ -324,13 +324,13 @@ fn write_node(
                 write!(out, "func")?;
                 write_signature(out, nodes, inputs, outputs)
             }
-            Node::Function(signature, block) => {
+            Node::Function(signature, body) => {
                 let inputs = nodes.indirect(signature.inputs());
                 let outputs = nodes.indirect(signature.outputs());
                 write!(out, "func")?;
                 write_signature(out, nodes, inputs, outputs)?;
                 write!(out, " ")?;
-                write_block(out, nodes, block)
+                write_block(out, nodes, body.block)
             }
             Node::Parameter(param) => write_parameter(out, nodes, param),
 

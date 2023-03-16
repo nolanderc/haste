@@ -1,3 +1,8 @@
+#[macro_use]
+mod macros;
+
+pub(crate) use self::macros::*;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
@@ -140,11 +145,19 @@ impl Diagnostic {
 
 type FmtResult<T> = Result<T, std::fmt::Error>;
 
+#[derive(Default)]
+struct VisitedSet {
+    formatted: HashSet<*const Inner>,
+    delta: Vec<*const Inner>,
+}
+
 impl Diagnostic {
     pub async fn write(&self, db: &dyn crate::Db, out: &mut impl Write) -> std::fmt::Result {
         // for each source file: get its text and line numbers
         let sources = self.get_source_infos(db).await;
-        self.format(&sources, &mut Vec::new(), out)?;
+
+        let mut visited = VisitedSet::default();
+        self.format(&sources, &mut Vec::new(), out, &mut visited)?;
 
         Ok(())
     }
@@ -154,6 +167,7 @@ impl Diagnostic {
         sources: &SourceSet,
         attachments: &mut Vec<&'a Attachment>,
         out: &mut impl Write,
+        visited: &mut VisitedSet,
     ) -> FmtResult<()> {
         match &*self.inner {
             Inner::Message(message) => {
@@ -175,18 +189,31 @@ impl Diagnostic {
                     attachment.format(message.severity, sources, out)?;
                 }
 
+                writeln!(out)?;
+
                 Ok(())
             }
             Inner::Attachment(parent, new_attachments) => {
                 attachments.extend(new_attachments.iter());
-                parent.format(sources, attachments, out)?;
+
+                let delta_start = visited.delta.len();
+
+                parent.format(sources, attachments, out, visited)?;
+
+                for delta in visited.delta.drain(delta_start..) {
+                    visited.formatted.remove(&delta);
+                }
+
                 attachments.truncate(attachments.len() - new_attachments.len());
+
                 Ok(())
             }
             Inner::Combine(combined) => {
                 for diagnostic in combined {
-                    diagnostic.format(sources, attachments, out)?;
-                    writeln!(out)?;
+                    if visited.formatted.insert(Arc::as_ptr(&diagnostic.inner)) {
+                        visited.delta.push(Arc::as_ptr(&diagnostic.inner));
+                        diagnostic.format(sources, attachments, out, visited)?;
+                    }
                 }
                 Ok(())
             }
@@ -224,7 +251,13 @@ impl Label {
         let gutter = " ".repeat(gutter_width);
 
         let column = range.start.get() as usize - line_range.start;
-        let underline_offset = " ".repeat(column);
+        let underline_offset = line_text[..column]
+            .chars()
+            .map(|ch| match ch {
+                '\t' => "\t",
+                _ => " ",
+            })
+            .collect::<String>();
 
         let underline_width = (range.end.get() - range.start.get()) as usize;
         let underline = "^".repeat(underline_width.max(1));

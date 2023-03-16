@@ -537,23 +537,17 @@ impl Token {
 
         while len < bytes.len() {
             let first = bytes[len];
+
+            if first == b'\\' {
+                len += 2;
+                continue;
+            }
+
             len += 1;
 
             if first == QUOTE {
                 return Ok(len);
             }
-
-            if first != b'\\' {
-                continue;
-            }
-
-            len += match byte(bytes, len + 1) {
-                b'x' => 3,
-                b'u' => 5,
-                b'U' => 9,
-                b'0'..=b'7' => 3,
-                _ => 1,
-            };
         }
 
         Err(text.len())

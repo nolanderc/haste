@@ -238,12 +238,15 @@ impl Cycle {
     }
 
     pub fn fmt<'a>(&'a self, db: &'a dyn Database) -> impl std::fmt::Display + 'a {
-        crate::util::fmt::from_fn(|f| {
-            let mut list = f.debug_list();
-            for path in self.iter() {
-                list.entry(&crate::util::fmt::ingredient(db, path));
-            }
-            list.finish()
-        })
+        crate::fmt::Adapter::new(
+            db,
+            crate::util::fmt::from_fn(|f| {
+                let mut list = f.debug_list();
+                for path in self.iter() {
+                    list.entry(&crate::util::fmt::ingredient(db, path));
+                }
+                list.finish()
+            }),
+        )
     }
 }

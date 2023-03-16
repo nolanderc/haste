@@ -124,6 +124,7 @@ impl Executor {
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
+        let worker_count = 0;
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))

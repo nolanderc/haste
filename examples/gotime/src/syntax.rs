@@ -1,8 +1,6 @@
 mod parse;
 mod print;
 
-pub use self::parse::parse;
-
 use std::num::{NonZeroU16, NonZeroUsize};
 
 use bstr::BStr;
@@ -15,6 +13,12 @@ use crate::{
     token::Token,
     Text,
 };
+
+#[haste::query]
+pub async fn parse_file(db: &dyn crate::Db, path: SourcePath) -> crate::Result<File> {
+    let source = crate::source::source_text(db, path).await.as_ref()?;
+    self::parse::parse(db, source, path)
+}
 
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;
 

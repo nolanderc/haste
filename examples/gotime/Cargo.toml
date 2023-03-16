@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.1.4", features = ["derive"] }
-tokio = { version = "1.25.0", features = ["fs"] }
+tokio = { version = "1.25.0", features = ["fs", "process"] }
 smallvec = { version = "1.10.0", features = ["union"] }
+serde = { version = "1.0.156", features = ["derive", "rc"] }
+serde_json = "1.0.94"
 
 [dependencies.bstr]
 version = "1.2.0"

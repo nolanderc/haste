@@ -180,3 +180,51 @@ where
         (self.0)(f)
     }
 }
+
+pub trait Fallible {
+    type Success;
+    fn into_result(self) -> crate::Result<Self::Success>;
+}
+
+impl<T> Fallible for crate::Result<T> {
+    type Success = T;
+    fn into_result(self) -> crate::Result<T> {
+        self
+    }
+}
+
+impl<'a, T> Fallible for &'a crate::Result<T> {
+    type Success = &'a T;
+    fn into_result(self) -> crate::Result<&'a T> {
+        match self {
+            Ok(output) => Ok(output),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
+pub async fn try_join_all<F>(
+    items: impl IntoIterator<Item = F>,
+) -> crate::Result<Vec<<F::Output as Fallible>::Success>>
+where
+    F: std::future::Future,
+    F::Output: Fallible,
+{
+    let futures = Vec::from_iter(items);
+
+    let mut outputs = Vec::with_capacity(futures.len());
+    let mut errors = Vec::new();
+
+    for future in futures {
+        match future.await.into_result() {
+            Ok(output) => outputs.push(output),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(outputs)
+    } else {
+        Err(crate::Diagnostic::combine(errors.into_iter()))
+    }
+}

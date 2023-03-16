@@ -1,12 +1,20 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Diagnostic, Result};
 
 #[haste::intern(SourcePath)]
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 pub enum SourcePathData {
     Absolute(PathBuf),
     Relative(PathBuf),
+}
+
+impl std::fmt::Debug for SourcePathData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourcePathData::Absolute(path) | SourcePathData::Relative(path) => path.fmt(f),
+        }
+    }
 }
 
 impl SourcePathData {
@@ -15,6 +23,12 @@ impl SourcePathData {
             Self::Relative(path)
         } else {
             Self::Absolute(path)
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            SourcePathData::Absolute(path) | SourcePathData::Relative(path) => path,
         }
     }
 }

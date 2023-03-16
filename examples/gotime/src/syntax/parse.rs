@@ -229,6 +229,7 @@ spanned_node_wrapper!(TypeId, TypeRange);
 
 /// Signals that an error has occured while parsing, which means the token stream may be in an
 /// unexpected state.
+#[derive(Debug)]
 struct ErrorToken;
 
 type Result<T, E = ErrorToken> = std::result::Result<T, E>;
@@ -382,7 +383,7 @@ impl<'a> Parser<'a> {
             None => format!("unexpected end of file"),
         };
 
-        let range = dbg!(self.unexpected_range());
+        let range = self.unexpected_range();
         let span = Span::new(self.path, range);
 
         Diagnostic::error(message).label(span, format!("expected {expected}"))
@@ -955,7 +956,7 @@ impl<'a> Parser<'a> {
         while !self.peek_is(Token::RParens) {
             if !all_types {
                 idents.push(self.identifier()?);
-                if self.peek_is(Token::Comma) {
+                if self.eat(Token::Comma) {
                     continue;
                 }
             }
@@ -980,6 +981,7 @@ impl<'a> Parser<'a> {
             }
 
             if variadic.is_some() {
+                // no more arguments allowed after `...`
                 break;
             }
         }
@@ -1103,7 +1105,9 @@ impl<'a> Parser<'a> {
         let fields = self.multi(|this| {
             while !this.peek_is(Token::RCurly) {
                 this.push_field_decls()?;
-                this.expect(Token::SemiColon)?;
+                if !this.eat(Token::SemiColon) {
+                    break;
+                }
             }
             Ok(())
         })?;
@@ -1116,8 +1120,8 @@ impl<'a> Parser<'a> {
 
     fn push_field_decls(&mut self) -> Result<()> {
         let pointer = self.try_expect(Token::Times);
-        let mut is_embedded = pointer.is_some();
 
+        let mut is_embedded = pointer.is_some();
         let mut idents = SmallVec::<[Identifier; 4]>::new();
         loop {
             idents.push(self.identifier()?);
@@ -1126,33 +1130,30 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let inner = if is_embedded {
-            // embedded fields already specify their type
-            None
-        } else if idents.len() == 1 {
-            // we might have an embedded field
-            self.try_type()?
-        } else {
-            // we have multiple identifiers, so we require a type
-            Some(self.typ()?)
-        };
-
-        let typ = match inner {
-            Some(typ) => typ,
-            None => {
-                assert_eq!(idents.len(), 1);
+        let mut typ = if idents.len() == 1 {
+            if self.eat(Token::Dot) {
+                let pkg = idents[0];
+                let member = self.identifier()?;
+                idents[0] = member;
                 is_embedded = true;
 
-                // the name of the field is the type
-                let name = idents[0];
-                let mut typ = self.emit_type(Node::Name(name.text), name.span);
-                if let Some(pointer) = pointer {
-                    let span = self.emit_join(pointer, typ);
-                    typ = self.emit_type(Node::Pointer(typ), span);
-                }
-                typ
+                let base = self.emit_node(Node::Name(pkg.text), pkg.span);
+                let span = self.emit_join(pkg.span, member.span);
+                self.emit_type(Node::Selector(base, member), span)
+            } else {
+                self.try_type()?.unwrap_or_else(|| {
+                    let name = idents[0];
+                    self.emit_type(Node::Name(name.text), name.span)
+                })
             }
+        } else {
+            self.typ()?
         };
+
+        if let Some(pointer) = pointer {
+            let span = self.emit_join(pointer, typ);
+            typ = self.emit_type(Node::Pointer(typ), span);
+        }
 
         let tag = self.try_string()?;
 
@@ -1181,7 +1182,9 @@ impl<'a> Parser<'a> {
             while !this.peek_is(Token::RCurly) {
                 let element = this.interface_element()?;
                 this.data.push_indirect(element);
-                this.expect(Token::SemiColon)?;
+                if !this.eat(Token::SemiColon) {
+                    break;
+                }
             }
             Ok(())
         })?;
@@ -1780,16 +1783,16 @@ impl<'a> Parser<'a> {
     }
 
     fn for_post_condition(&mut self) -> Result<Option<StmtId>> {
-        match self.try_pre_block_expression()? {
+        self.pre_block(|this| match this.try_pre_block_expression()? {
             Some(expr) => {
-                if let Some(simple) = self.try_simple_statement(expr)? {
+                if let Some(simple) = this.try_simple_statement(expr)? {
                     Ok(Some(simple))
                 } else {
-                    Ok(Some(self.make_expression_statement(expr)))
+                    Ok(Some(this.make_expression_statement(expr)))
                 }
             }
             None => Ok(None),
-        }
+        })
     }
 
     fn try_simple_statement(&mut self, first: ExprId) -> Result<Option<StmtId>> {
@@ -1905,15 +1908,16 @@ impl<'a> Parser<'a> {
     }
 
     fn pre_block_expression(&mut self) -> Result<ExprId> {
-        let old_depth = std::mem::replace(&mut self.expression_depth, -1);
-        let result = self.expression();
-        self.expression_depth = old_depth;
-        result
+        self.pre_block(|this| this.expression())
     }
 
     fn try_pre_block_expression(&mut self) -> Result<Option<ExprId>> {
+        self.pre_block(|this| this.try_expression())
+    }
+
+    fn pre_block<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let old_depth = std::mem::replace(&mut self.expression_depth, -1);
-        let result = self.try_expression();
+        let result = f(self);
         self.expression_depth = old_depth;
         result
     }
@@ -2112,7 +2116,7 @@ impl<'a> Parser<'a> {
     /// specifying the type (eg. instead of `Point{1,2}` we can write `{1,2}`). Only allowed nested
     /// instide another composite literal.
     fn composite_element(&mut self) -> Result<ExprId> {
-        if self.peek_is(Token::RCurly) {
+        if self.peek_is(Token::LCurly) {
             let (elements, range) = self.composite_literal()?;
             let span = self.emit_span(range);
             Ok(self.emit_expr(Node::CompositeLiteral(elements), span))
@@ -2379,8 +2383,9 @@ impl<'a> Parser<'a> {
 
             let diagnostic = Diagnostic::error("could not decode string");
             let mut range = token.file_range();
-            range.start = NonMaxU32::new(range.start.get() + error.start as u32).unwrap();
-            range.end = NonMaxU32::new(range.start.get() + error.length as u32).unwrap();
+            let offset = range.start.get() + 1;
+            range.start = NonMaxU32::new(offset + error.start as u32).unwrap();
+            range.end = NonMaxU32::new(offset + error.length as u32).unwrap();
             let span = Span::new(self.path, range);
             return Err(self.emit(diagnostic.label(span, error.kind)));
         }
@@ -2491,6 +2496,13 @@ fn decode_escape_sequence(
     let first = bytes[i];
     i += 1;
 
+    let get_escape = |range: std::ops::Range<usize>| {
+        if range.end > bytes.len() {
+            return Err(EscapeErrorKind::InvalidEscape.range(start..bytes.len()));
+        }
+        Ok(&bytes[range])
+    };
+
     match first {
         b'a' => out.push(0x07),
         b'b' => out.push(0x08),
@@ -2504,7 +2516,7 @@ fn decode_escape_sequence(
         b'"' => out.push(b'"'),
 
         b'0'..=b'7' => {
-            let digits = &bytes[i - 1..i + 2];
+            let digits = get_escape(i - 1..i + 2)?;
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 3));
             }
@@ -2516,7 +2528,7 @@ fn decode_escape_sequence(
             i += 2;
         }
         b'x' => {
-            let digits = &bytes[i..i + 2];
+            let digits = get_escape(i..i + 2)?;
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 2));
             }
@@ -2525,7 +2537,7 @@ fn decode_escape_sequence(
             i += 2;
         }
         b'u' => {
-            let digits = &bytes[i..i + 4];
+            let digits = get_escape(i..i + 4)?;
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 4));
             }
@@ -2538,7 +2550,7 @@ fn decode_escape_sequence(
             i += 4;
         }
         b'U' => {
-            let digits = &bytes[i..i + 8];
+            let digits = get_escape(i..i + 8)?;
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 8));
             }
@@ -2764,7 +2776,10 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, NumberError
 
     let bits = match u64::try_from(value) {
         Ok(bits) => IntegerBits::Small(bits),
-        Err(_) => todo!("intern large integers"),
+        Err(_) => {
+            eprintln!("TODO: intern large integers: {}", value);
+            IntegerBits::Small(value as u64)
+        }
     };
 
     Ok(bits)

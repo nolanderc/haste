@@ -1,24 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::Arc};
 
 use crate::{Diagnostic, Result};
 
 #[haste::intern(SourcePath)]
 #[derive(PartialEq, Eq, Hash)]
 pub enum SourcePathData {
-    Absolute(PathBuf),
-    Relative(PathBuf),
+    Absolute(Arc<Path>),
+    Relative(Arc<Path>),
 }
 
-impl std::fmt::Debug for SourcePathData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SourcePathData::Absolute(path) | SourcePathData::Relative(path) => path.fmt(f),
-        }
+impl SourcePath {
+    pub fn new(db: &dyn crate::Db, path: Arc<Path>) -> Self {
+        Self::insert(db, SourcePathData::new(path))
+    }
+
+    pub fn path(self, db: &dyn crate::Db) -> &Arc<Path> {
+        self.lookup(db).path()
     }
 }
 
 impl SourcePathData {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: Arc<Path>) -> Self {
         if path.is_relative() {
             Self::Relative(path)
         } else {
@@ -26,7 +28,7 @@ impl SourcePathData {
         }
     }
 
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &Arc<Path> {
         match self {
             SourcePathData::Absolute(path) | SourcePathData::Relative(path) => path,
         }
@@ -37,8 +39,16 @@ impl std::fmt::Display for SourcePathData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SourcePathData::Absolute(path) | SourcePathData::Relative(path) => {
-                write!(f, "{}", path.display())
+                path.display().fmt(f)
             }
+        }
+    }
+}
+
+impl std::fmt::Debug for SourcePathData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourcePathData::Absolute(path) | SourcePathData::Relative(path) => path.fmt(f),
         }
     }
 }
@@ -46,21 +56,17 @@ impl std::fmt::Display for SourcePathData {
 /// Get the source text for some file.
 #[haste::query]
 #[input]
-pub async fn source_text(db: &dyn crate::Db, path: SourcePath) -> Result<String> {
-    let data = path.get(db);
-    let real_path = match data {
-        SourcePathData::Absolute(path) => path,
-        SourcePathData::Relative(path) => path,
-    };
+pub async fn source_text(db: &dyn crate::Db, source: SourcePath) -> Result<String> {
+    let path = source.path(db);
 
-    match tokio::fs::read_to_string(real_path).await {
+    match tokio::fs::read_to_string(path).await {
         Ok(text) => Ok(text),
         Err(error) => {
             let message = match error.kind() {
                 std::io::ErrorKind::NotFound => {
-                    format!("could not find file `{}`", path)
+                    format!("could not find file `{}`", path.display())
                 }
-                _ => format!("could not read file `{}`: {}", path, error),
+                _ => format!("could not read file `{}`: {}", path.display(), error),
             };
             Err(Diagnostic::error(message))
         }

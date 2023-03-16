@@ -177,6 +177,8 @@ pub struct OutputSlot<Q: Query> {
     pub output: Q::Output,
 }
 
+unsafe impl<Q: Query> Sync for OutputSlot<Q> where Q::Output: Sync {}
+
 /// Refers to a list of dependencies in the query storage.
 ///
 /// We use this over a `Vec` to batch the allocation and reduce the size of the query outputs.

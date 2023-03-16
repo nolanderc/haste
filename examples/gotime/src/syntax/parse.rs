@@ -237,6 +237,9 @@ type Result<T, E = ErrorToken> = std::result::Result<T, E>;
 type ParseFn<T> = fn(&mut Parser) -> Result<T>;
 type ParseTokenFn<T> = fn(&mut Parser<'_>, SpannedToken) -> Result<T>;
 
+/// Marker for a parenthized expression
+struct Parenthized;
+
 impl<'a> Parser<'a> {
     /// Determines if the current expression is followed by a block.
     ///
@@ -253,10 +256,6 @@ impl<'a> Parser<'a> {
     /// if the nesting depth is non-negative.
     fn expects_block(&self) -> bool {
         self.expression_depth <= 0
-    }
-
-    fn prev_token(&self) -> Option<Token> {
-        Some(self.tokens.get(self.current_token.checked_sub(1)?)?.token())
     }
 
     fn advance(&mut self) {
@@ -537,7 +536,7 @@ impl<'a> Parser<'a> {
         }
 
         let file = File {
-            path: self.path,
+            source: self.path,
             package,
             imports: KeyVec::from(imports).into(),
             declarations: KeyVec::from(declarations).into(),
@@ -2004,7 +2003,9 @@ impl<'a> Parser<'a> {
     }
 
     fn try_primary_expr(&mut self) -> Result<Option<ExprId>> {
-        let Some(mut base) = self.try_operand()? else { return Ok(None) };
+        let Some((mut base, parenthized)) = self.try_operand()? else { return Ok(None) };
+
+        let mut is_parenthized = parenthized.is_some();
 
         loop {
             if self.eat(Token::Dot) {
@@ -2018,42 +2019,32 @@ impl<'a> Parser<'a> {
                     let end = self.expect(Token::RParens)?;
                     let span = self.emit_join(base, end);
                     base = self.emit_expr(Node::TypeAssertion(base, typ), span);
-                    continue;
+                } else {
+                    let member = self.identifier()?;
+                    let span = self.emit_join(base, member);
+                    base = self.emit_expr(Node::Selector(base.node, member), span);
                 }
-
-                let member = self.identifier()?;
-                let span = self.emit_join(base, member);
-                base = self.emit_expr(Node::Selector(base.node, member), span);
-                continue;
-            }
-
-            if self.peek_is(Token::LParens) {
+            } else if self.peek_is(Token::LParens) {
                 base = self.call(base)?;
-                continue;
-            }
-
-            if self.peek_is(Token::LBracket) {
+            } else if self.peek_is(Token::LBracket) {
                 base = self.indexing(base)?;
-                continue;
-            }
-
-            if self.peek_is(Token::LCurly) {
+            } else if !is_parenthized && self.peek_is(Token::LCurly) {
                 if let Some(next) = self.try_composite_init(base.node)? {
                     base = next;
-                    continue;
+                } else {
+                    break;
                 }
+            } else {
+                break;
             }
 
-            return Ok(Some(base));
+            is_parenthized = false;
         }
+
+        Ok(Some(base))
     }
 
     fn try_composite_init(&mut self, base: NodeId) -> Result<Option<ExprId>> {
-        // we don't allow parenthized types
-        if self.prev_token() == Some(Token::RParens) {
-            return Ok(None);
-        }
-
         match self.data.node(base) {
             Node::Name(_) | Node::Selector(_, _) if !self.expects_block() => {}
             Node::Struct(_) | Node::Map(_, _) | Node::Array(_, _) | Node::Slice(_) => {}
@@ -2184,19 +2175,21 @@ impl<'a> Parser<'a> {
         Ok(self.emit_expr(Node::Call(base, ExprRange::new(arguments), spread), span))
     }
 
-    fn try_operand(&mut self) -> Result<Option<ExprId>> {
+    fn try_operand(&mut self) -> Result<Option<(ExprId, Option<Parenthized>)>> {
         // fast path for identifiers
         if self.peek_is(Token::Identifier) {
             let ident = self.identifier()?;
-            return Ok(Some(self.emit_expr(Node::Name(ident.text), ident.span)));
+            let expr = self.emit_expr(Node::Name(ident.text), ident.span);
+            return Ok(Some((expr, None)));
         }
 
-        static OPERANDS: LookupTable<ParseTokenFn<ExprId>, 11> = LookupTable::new([
-            (Token::LParens, |this, _| {
-                let inner = this.expression()?;
-                this.expect(Token::RParens)?;
-                Ok(inner)
-            }),
+        if self.eat(Token::LParens) {
+            let inner = self.expression()?;
+            self.expect(Token::RParens)?;
+            return Ok(Some((inner, Some(Parenthized))));
+        }
+
+        static OPERANDS: LookupTable<ParseTokenFn<ExprId>, 10> = LookupTable::new([
             (Token::Integer, |this, token| {
                 this.parse_integer_expr::<10>(token)
             }),
@@ -2240,11 +2233,11 @@ impl<'a> Parser<'a> {
         ]);
 
         if let Some(expr) = self.try_branch_token(&OPERANDS)? {
-            return Ok(Some(expr));
+            return Ok(Some((expr, None)));
         }
 
         if let Some(typ) = self.try_type()? {
-            return Ok(Some(ExprId::new(typ.node)));
+            return Ok(Some((ExprId::new(typ.node), None)));
         }
 
         Ok(None)

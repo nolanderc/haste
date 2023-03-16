@@ -124,7 +124,6 @@ impl Executor {
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-        let worker_count = 0;
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))
@@ -512,9 +511,11 @@ impl LocalScheduler {
     }
 
     fn next_task(&self) -> Option<Task> {
-        if self.shared.state.load(Relaxed) == State::Running {
-            if let Some(task) = self.try_next_task() {
-                return Some(task);
+        for _ in 0..100 {
+            if self.shared.state.load(Relaxed) == State::Running {
+                if let Some(task) = self.try_next_task() {
+                    return Some(task);
+                }
             }
         }
 

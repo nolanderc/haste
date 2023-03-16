@@ -1,10 +1,17 @@
 mod parse;
 mod print;
 
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::{
+    num::{NonZeroU16, NonZeroUsize},
+    sync::Mutex,
+    time::Duration,
+};
 
 use bstr::BStr;
-use haste::non_max::{NonMaxU16, NonMaxU32};
+use haste::{
+    non_max::{NonMaxU16, NonMaxU32},
+    DatabaseExt,
+};
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
@@ -14,10 +21,21 @@ use crate::{
     Text,
 };
 
+static TOTAL_PARSE: Mutex<Duration> = Mutex::new(Duration::from_secs(0));
+
 #[haste::query]
 pub async fn parse_file(db: &dyn crate::Db, path: SourcePath) -> crate::Result<File> {
     let source = crate::source::source_text(db, path).await.as_ref()?;
-    self::parse::parse(db, source, path)
+    let start = std::time::Instant::now();
+    let output = self::parse::parse(db, source, path);
+    let duration = start.elapsed();
+    let total = {
+        let mut total = TOTAL_PARSE.lock().unwrap();
+        *total += duration;
+        *total
+    };
+    eprintln!("parse {:10?} ({:10?}) [{:?}]", duration, total, db.fmt(path));
+    output
 }
 
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;
@@ -25,7 +43,7 @@ pub type KeyList<K, V> = Box<KeySlice<K, V>>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct File {
     /// The path to the source file this represents
-    pub path: SourcePath,
+    pub source: SourcePath,
 
     /// List of all spans that occur in the source file
     pub span_ranges: KeyList<Key<Span>, FileRange>,
@@ -55,7 +73,7 @@ impl File {
             None => id.absolute(),
             Some(decl) => self.declarations[decl].base_span.offset(id.relative()),
         };
-        Span::new(self.path, self.span_ranges[absolute])
+        Span::new(self.source, self.span_ranges[absolute])
     }
 }
 

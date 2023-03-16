@@ -147,7 +147,7 @@ fn getter_fn(input: &syn::DeriveInput, args: &crate::meta::Arguments) -> TokenSt
     let db_path = &args.db;
     quote_spanned! {input.ident.span()=>
         #[allow(unused)]
-        pub fn get(self, db: &dyn #db_path) -> #output_type {
+        pub fn lookup(self, db: &dyn #db_path) -> #output_type {
             #extractor
         }
     }
@@ -194,7 +194,7 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
         impl haste::Intern for #ident {}
 
         impl #ident {
-            pub fn new(db: &dyn #db_path, data: #data_ident) -> Self {
+            pub fn insert(db: &dyn #db_path, data: #data_ident) -> Self {
                 haste::DatabaseExt::insert(db, data)
             }
         }

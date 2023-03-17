@@ -79,7 +79,9 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     path: haste::IngredientPath,
                     f: &mut std::fmt::Formatter<'_>
                 ) -> std::fmt::Result {
-                    self.storage.get_path(self, path.container).fmt(path.resource, f)
+                    haste::fmt::wrap(self, f, |f| {
+                        self.storage.get_path(self, path.container).fmt(path.resource, f)
+                    })
                 }
 
                 fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {

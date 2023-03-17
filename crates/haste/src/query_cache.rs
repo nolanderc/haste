@@ -51,6 +51,10 @@ pub trait QueryCache: DynQueryCache {
     fn remove(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
     where
         Self::Query: crate::Input;
+
+    fn invalidate(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
+    where
+        Self::Query: crate::Input;
 }
 
 pub trait DynQueryCache {
@@ -120,7 +124,7 @@ where
             Err(Some(output)) => {
                 return LastChangeFuture::Ready(Change {
                     changed_at: slot.last_changed(),
-                    transitive: output.transitive,
+                    transitive: output.transitive.unwrap(),
                 })
             }
             Err(None) => {}
@@ -129,7 +133,7 @@ where
                 Err(output) => {
                     return LastChangeFuture::Ready(Change {
                         changed_at: slot.last_changed(),
-                        transitive: output.transitive,
+                        transitive: output.transitive.unwrap(),
                     })
                 }
             },
@@ -181,7 +185,8 @@ where
         let slot = self.storage.slot_mut(id);
 
         if let Some(previous) = slot.get_output_mut() {
-            if previous.output == output && previous.transitive.durability == durability {
+            let old_durability = previous.transitive.as_ref().map(|t| t.durability);
+            if Some(durability) == old_durability && output == previous.output {
                 // no change: the value is still valid
                 slot.set_verified(runtime.current_revision());
                 return;
@@ -197,6 +202,15 @@ where
     {
         if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
             slot.remove_output(runtime);
+        }
+    }
+
+    fn invalidate(&mut self, runtime: &mut Runtime, input: &Q::Input)
+    where
+        Self::Query: crate::Input,
+    {
+        if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
+            slot.invalidate(runtime);
         }
     }
 }
@@ -308,8 +322,8 @@ impl<'a, Q: Query> Future for PendingFuture<'a, Q> {
                 let db = this.db.as_dyn();
                 let runtime = this.db.runtime();
                 if let Some(parent) = runtime.current_query() {
-                    runtime.would_block_on(parent, *this.path, cx.waker(), db);
-                    *this.blocks = Some(parent);
+                    runtime.would_block_on(parent.path, *this.path, cx.waker(), db);
+                    *this.blocks = Some(parent.path);
                 }
             }
             (Poll::Ready(_), Some(parent)) => {

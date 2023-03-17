@@ -1,41 +1,23 @@
 mod parse;
 mod print;
 
-use std::{
-    num::{NonZeroU16, NonZeroUsize},
-    sync::Mutex,
-    time::Duration,
-};
+use std::num::{NonZeroU16, NonZeroUsize};
 
 use bstr::BStr;
-use haste::{
-    non_max::{NonMaxU16, NonMaxU32},
-    DatabaseExt,
-};
+use haste::non_max::{NonMaxU16, NonMaxU32};
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
     source::SourcePath,
     span::{FileRange, Span},
     token::Token,
-    Text,
+    Storage, Text,
 };
-
-static TOTAL_PARSE: Mutex<Duration> = Mutex::new(Duration::from_secs(0));
 
 #[haste::query]
 pub async fn parse_file(db: &dyn crate::Db, path: SourcePath) -> crate::Result<File> {
     let source = crate::source::source_text(db, path).await.as_ref()?;
-    let start = std::time::Instant::now();
-    let output = self::parse::parse(db, source, path);
-    let duration = start.elapsed();
-    let total = {
-        let mut total = TOTAL_PARSE.lock().unwrap();
-        *total += duration;
-        *total
-    };
-    eprintln!("parse {:10?} ({:10?}) [{:?}]", duration, total, db.fmt(path));
-    output
+    self::parse::parse(db, source, path).await
 }
 
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;

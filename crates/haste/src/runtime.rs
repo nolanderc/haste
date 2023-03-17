@@ -13,8 +13,8 @@ use std::{
 use crate::{
     revision::Revision,
     util::{future::UnitFuture, CallOnDrop},
-    ContainerPath, Database, DatabaseFor, Durability, IngredientPath, Query, RevisionRange,
-    TransitiveDependencies,
+    ContainerPath, Database, DatabaseFor, Durability, IngredientPath, Query, QueryResult,
+    RevisionRange, TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
@@ -64,7 +64,7 @@ impl Runtime {
     pub fn update_input(
         &mut self,
         changed_at: Option<Revision>,
-        durability: Option<Durability>,
+        durability: Durability,
     ) -> Revision {
         self.revisions.push_update(changed_at, durability)
     }
@@ -110,9 +110,18 @@ impl std::fmt::Debug for Dependency {
 }
 
 impl Dependency {
+    pub(crate) fn new(ingredient: IngredientPath) -> Self {
+        Self {
+            container: ingredient.container,
+            resource: ingredient.resource,
+            extra: 0,
+        }
+    }
+
     pub fn container(self) -> ContainerPath {
         self.container
     }
+
     pub fn ingredient(self) -> IngredientPath {
         IngredientPath {
             container: self.container,
@@ -124,6 +133,9 @@ impl Dependency {
 /// All data required to execute a task
 #[derive(Debug)]
 struct TaskData {
+    /// Determines if the current query is an input.
+    is_input: bool,
+
     /// An ingredient representing the query of this task
     this: IngredientPath,
 
@@ -135,8 +147,9 @@ struct TaskData {
 }
 
 impl TaskData {
-    fn new(this: IngredientPath, transitive: TransitiveDependencies) -> Self {
+    fn new<Q: Query>(this: IngredientPath, transitive: TransitiveDependencies) -> Self {
         Self {
+            is_input: Q::IS_INPUT,
             this,
             dependencies: Vec::new(),
             transitive,
@@ -149,6 +162,11 @@ struct ActiveData {
     task: Cell<Option<TaskData>>,
 }
 
+pub(crate) struct QueryInfo {
+    pub path: IngredientPath,
+    pub is_input: bool,
+}
+
 impl ActiveData {
     fn new() -> Self {
         Self {
@@ -156,11 +174,14 @@ impl ActiveData {
         }
     }
 
-    fn current_task(&self) -> Option<IngredientPath> {
+    fn current_task(&self) -> Option<QueryInfo> {
         let task = self.task.replace(None)?;
-        let current = task.this;
+        let info = QueryInfo {
+            path: task.this,
+            is_input: task.is_input,
+        };
         self.task.set(Some(task));
-        Some(current)
+        Some(info)
     }
 }
 
@@ -290,7 +311,7 @@ impl Runtime {
         ExecFuture {
             db,
             inner: ExecFutureInner::Eval(Q::execute(db, input)),
-            task: Some(TaskData::new(this, transitive)),
+            task: Some(TaskData::new::<Q>(this, transitive)),
             blocks: None,
         }
     }
@@ -309,7 +330,26 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn current_query(&self) -> Option<IngredientPath> {
+    /// Register a dependency under the currently running query
+    pub(crate) fn register_query_dependency<Q: Query>(
+        &self,
+        container: ContainerPath,
+        result: &QueryResult<Q>,
+    ) {
+        let ingredient = IngredientPath {
+            container,
+            resource: result.id,
+        };
+
+        let transitive = result
+            .slot
+            .transitive
+            .expect("query did not specify transitive dependencies");
+
+        self.register_dependency(Dependency::new(ingredient), transitive)
+    }
+
+    pub(crate) fn current_query(&self) -> Option<QueryInfo> {
         ACTIVE.with(|active| active.current_task())
     }
 

@@ -43,6 +43,13 @@ impl std::fmt::Debug for Id {
     }
 }
 
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.raw)
+    }
+}
+
+
 impl Id {
     pub(crate) fn new(raw: NonMaxU32) -> Self {
         Self { raw }
@@ -235,20 +242,19 @@ pub trait DatabaseExt: Database {
         let cache = storage.container();
         let path = cache.path();
 
+        if let Some(current) = runtime.current_query() {
+            assert!(
+                !current.is_input,
+                "{}: input queries may not invoke other queries",
+                crate::util::fmt::from_fn(|f| db.fmt_index(current.path, f))
+            );
+        }
+
         let future = cache.get_or_evaluate(db, input);
 
         crate::util::future::poll_fn_pin(future, move |future, cx| {
             let result = std::task::ready!(future.poll(cx));
-
-            runtime.register_dependency(
-                Dependency {
-                    container: path,
-                    resource: result.id,
-                    extra: 0,
-                },
-                result.slot.transitive,
-            );
-
+            runtime.register_query_dependency(path, &result);
             std::task::Poll::Ready(&result.slot.output)
         })
     }
@@ -263,6 +269,14 @@ pub trait DatabaseExt: Database {
     {
         let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
+
+        if let Some(current) = runtime.current_query() {
+            assert!(
+                !current.is_input,
+                "{}: input queries may not invoke other queries",
+                crate::util::fmt::from_fn(|f| db.fmt_index(current.path, f))
+            );
+        }
 
         enum SpawnResult<Cached, Pending> {
             Cached(Cached),
@@ -294,14 +308,7 @@ pub trait DatabaseExt: Database {
                 }
             };
 
-            runtime.register_dependency(
-                Dependency {
-                    container: cache.path(),
-                    resource: result.id,
-                    extra: 0,
-                },
-                result.slot.transitive,
-            );
+            runtime.register_query_dependency(cache.path(), &result);
 
             std::task::Poll::Ready(&result.slot.output)
         })
@@ -346,8 +353,23 @@ pub trait DatabaseExt: Database {
         cache.set(runtime, input, output, durability);
     }
 
-    /// Set the value of an input
+    /// Clear the value of an input.
     fn remove<'db, Q>(&'db mut self, input: Q::Input)
+    where
+        Q: Input,
+        Q::Storage: 'static,
+        Q::Container: QueryCache<Query = Q> + 'db,
+        Self: WithStorage<Q::Storage>,
+    {
+        assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
+
+        let (storage, runtime) = self.storage_mut();
+        let cache = storage.container_mut();
+        cache.remove(runtime, &input);
+    }
+
+    /// Mark the query as invalid, forcing it to be re-evaluated in the next revision.
+    fn invalidate<'db, Q>(&'db mut self, input: Q::Input)
     where
         Q: Input,
         Q::Storage: 'static,

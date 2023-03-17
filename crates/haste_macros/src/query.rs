@@ -183,6 +183,13 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
                 ) {
                     haste::DatabaseExt::remove::<Self>(#db_ident, input)
                 }
+
+                #vis fn invalidate(
+                    #db_ident: &mut dyn #db_path,
+                    input: (#(#input_types),*),
+                ) {
+                    haste::DatabaseExt::invalidate::<Self>(#db_ident, input)
+                }
             }
         });
     }

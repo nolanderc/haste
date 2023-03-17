@@ -12,7 +12,7 @@ use crate::{
 
 use super::*;
 
-pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Result<File> {
+pub async fn parse(db: &dyn crate::Db, source: &BStr, path: SourcePath) -> crate::Result<File> {
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -27,7 +27,7 @@ pub fn parse(db: &dyn crate::Db, source: &str, path: SourcePath) -> crate::Resul
         data: Data::default(),
     };
 
-    match parser.file() {
+    match parser.file().await {
         Ok(file) => Ok(file),
         Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics.into_iter())),
     }
@@ -46,7 +46,7 @@ struct Parser<'a> {
     tokens: &'a [SpannedToken],
 
     /// Text from which the tokens were derived
-    source: &'a str,
+    source: &'a BStr,
 
     /// Index of the token at the current position
     current_token: usize,
@@ -427,12 +427,12 @@ impl<'a> Parser<'a> {
     fn snippet(&self, range: Range<usize>) -> Cow<'a, str> {
         let text = &self.source[range];
         if text.len() < 32 {
-            return Cow::Borrowed(text);
+            return text.to_str_lossy();
         }
 
         let mut chars = text.chars();
         for _ in chars.by_ref().take(32).take_while(|ch| !ch.is_whitespace()) {}
-        let rest = chars.as_str().len();
+        let rest = chars.as_bytes().len();
         Cow::Owned(format!("{}...", &text[..text.len() - rest]))
     }
 
@@ -525,9 +525,18 @@ impl<'a> Parser<'a> {
         Ok(range)
     }
 
-    fn file(&mut self) -> Result<File> {
+    async fn file(&mut self) -> Result<File> {
         let package = self.package()?;
         let imports = self.imports()?;
+
+        // prefetch the imports:
+        let path = self.path.path(self.db).clone();
+        if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
+            for import in imports.iter() {
+                crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
+            }
+        }
+
         let declarations = self.declarations()?;
         self.expect_eof()?;
 
@@ -2274,19 +2283,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_float_token<const BASE: u32>(&mut self, token: SpannedToken) -> Result<FloatBits> {
-        let text = &self.source[token.range()];
         if BASE == 10 {
-            match text.parse::<f64>() {
-                Ok(float) => Ok(FloatBits::Small(FloatBits64 {
-                    bits: float.to_bits(),
-                })),
-                Err(error) => {
-                    let span = Span::new(self.path, token.file_range());
-                    Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
-                }
-            }
+            self.parse_float_decimal(token.range())
         } else if BASE == 16 {
-            assert_eq!(BASE, 16);
+            let text = &self.source[token.range()];
             match parse_hex_float(text) {
                 Ok(float) => Ok(float),
                 Err(error) => {
@@ -2301,6 +2301,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_float_decimal(&mut self, range: Range<usize>) -> Result<FloatBits> {
+        let text = &self.source[range.clone()];
+        match fast_float::parse::<f64, _>(text) {
+            Ok(float) => Ok(FloatBits::Small(FloatBits64 {
+                bits: float.to_bits(),
+            })),
+            Err(error) => {
+                let span = Span::new(self.path, FileRange::from(range));
+                Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
+            }
+        }
+    }
+
     fn parse_imaginary_expr(&mut self, token: SpannedToken) -> Result<ExprId> {
         let bits = self.parse_imaginary_token(token)?;
         let span = self.emit_span(token);
@@ -2311,16 +2324,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_imaginary_token(&mut self, token: SpannedToken) -> Result<FloatBits> {
-        let text = &self.source[token.range()];
-        match text[..text.len() - 1].parse::<f64>() {
-            Ok(float) => Ok(FloatBits::Small(FloatBits64 {
-                bits: float.to_bits(),
-            })),
-            Err(error) => {
-                let span = Span::new(self.path, token.file_range());
-                Err(self.emit(Diagnostic::error("invalid number literal").label(span, error)))
-            }
-        }
+        let mut range = token.range();
+        range.end -= 1; // ignore the trailing `i`
+        self.parse_float_decimal(range)
     }
 
     fn parse_rune_token(&mut self, token: SpannedToken) -> Result<(char, SpanId)> {
@@ -2374,11 +2380,11 @@ impl<'a> Parser<'a> {
             // restore the string buffer to the original length
             self.data.pop_string(start);
 
-            let diagnostic = Diagnostic::error("could not decode string");
+            let diagnostic = Diagnostic::error("could not parse string");
             let mut range = token.file_range();
-            let offset = range.start.get() + 1;
-            range.start = NonMaxU32::new(offset + error.start as u32).unwrap();
-            range.end = NonMaxU32::new(offset + error.length as u32).unwrap();
+            let start = range.start.get() + 1 + error.start as u32;
+            range.start = NonMaxU32::new(start).unwrap();
+            range.end = NonMaxU32::new(start + error.length as u32).unwrap();
             let span = Span::new(self.path, range);
             return Err(self.emit(diagnostic.label(span, error.kind)));
         }
@@ -2409,17 +2415,20 @@ impl<'a> Parser<'a> {
         if source == "_" {
             return Identifier { text: None, span };
         }
-        let text = Some(Text::new(self.db, source));
+        let string = source.to_str().expect("identifier was not valid UTF-8");
+        let text = Some(Text::new(self.db, string));
         Identifier { text, span }
     }
 }
 
+#[derive(Debug)]
 struct EscapeError {
     start: usize,
     length: usize,
     kind: EscapeErrorKind,
 }
 
+#[derive(Debug)]
 enum EscapeErrorKind {
     InvalidCodepoint,
     InvalidEscape,
@@ -2433,7 +2442,7 @@ impl std::fmt::Display for EscapeErrorKind {
             EscapeErrorKind::InvalidCodepoint => "invalid codepoint",
             EscapeErrorKind::InvalidEscape => "invalid escape sequence",
             EscapeErrorKind::ValueTooLarge => "value falls outside valid range of a byte",
-            EscapeErrorKind::Newline => "strings may not span multiple lines",
+            EscapeErrorKind::Newline => "strings may not contain raw newline character (`\\n`)",
         };
         f.write_str(message)
     }
@@ -2449,51 +2458,49 @@ impl EscapeErrorKind {
     }
 }
 
-fn decode_string(contents: &str, out: &mut BString) -> Result<(), EscapeError> {
-    let bytes = contents.as_bytes();
+fn decode_string(text: &BStr, out: &mut BString) -> Result<(), EscapeError> {
     let mut i = 0;
     let mut last_flush = 0;
 
-    while i < bytes.len() {
-        if bytes[i] == b'\n' {
+    while i < text.len() {
+        if text[i] == b'\n' {
             return Err(EscapeErrorKind::Newline.range(i..i + 1));
         }
 
-        if bytes[i] != b'\\' {
+        if text[i] != b'\\' {
             i += 1;
             continue;
         }
 
-        out.push_str(&contents[last_flush..i]);
+        out.push_str(&text[last_flush..i]);
 
-        while i < bytes.len() && bytes[i] == b'\\' {
-            i = decode_escape_sequence(contents, i, out)?;
+        while i < text.len() && text[i] == b'\\' {
+            i = decode_escape_sequence(text, i, out)?;
         }
 
         last_flush = i;
     }
 
-    out.push_str(&contents[last_flush..]);
+    out.push_str(&text[last_flush..]);
 
     Ok(())
 }
 
 fn decode_escape_sequence(
-    text: &str,
+    text: &BStr,
     start: usize,
     out: &mut BString,
 ) -> Result<usize, EscapeError> {
-    let bytes = text.as_bytes();
     let mut i = start + 1;
 
-    let first = bytes[i];
+    let first = text[i];
     i += 1;
 
     let get_escape = |range: std::ops::Range<usize>| {
-        if range.end > bytes.len() {
-            return Err(EscapeErrorKind::InvalidEscape.range(start..bytes.len()));
+        if range.end > text.len() {
+            return Err(EscapeErrorKind::InvalidEscape.range(start..text.len()));
         }
-        Ok(&bytes[range])
+        Ok(&text[range])
     };
 
     match first {
@@ -2513,7 +2520,8 @@ fn decode_escape_sequence(
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 3));
             }
-            let value = u16::from_str_radix(&text[i - 1..i + 2], 8).unwrap();
+
+            let value = u32_from_radix(&text[i - 1..i + 2], 8);
             if value > 255 {
                 return Err(EscapeErrorKind::ValueTooLarge.range(start..i + 3));
             }
@@ -2525,8 +2533,8 @@ fn decode_escape_sequence(
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 2));
             }
-            let value = u8::from_str_radix(&text[i..i + 2], 16).unwrap();
-            out.push(value);
+            let value = u32_from_radix(&text[i..i + 2], 16);
+            out.push(value as u8);
             i += 2;
         }
         b'u' => {
@@ -2534,7 +2542,7 @@ fn decode_escape_sequence(
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 4));
             }
-            let value = u32::from_str_radix(&text[i..i + 4], 16).unwrap();
+            let value = u32_from_radix(&text[i..i + 4], 16);
             if let Some(ch) = char::from_u32(value) {
                 out.push_char(ch);
             } else {
@@ -2547,7 +2555,7 @@ fn decode_escape_sequence(
             if !digits.iter().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EscapeErrorKind::InvalidEscape.range(start..i + 8));
             }
-            let value = u32::from_str_radix(&text[i..i + 8], 16).unwrap();
+            let value = u32_from_radix(&text[i..i + 8], 16);
             if let Some(ch) = char::from_u32(value) {
                 out.push_char(ch);
             } else {
@@ -2563,6 +2571,20 @@ fn decode_escape_sequence(
     }
 
     Ok(i)
+}
+
+fn u32_from_radix(text: &BStr, radix: u32) -> u32 {
+    let mut value = 0;
+    for &byte in text.iter() {
+        value *= radix;
+        value += match byte {
+            b'0'..=b'9' => (byte - b'0') as u32,
+            b'a'..=b'f' => (byte - b'a' + 10) as u32,
+            b'A'..=b'F' => (byte - b'A' + 10) as u32,
+            _ => 0,
+        }
+    }
+    value
 }
 
 struct LookupTable<T, const N: usize> {
@@ -2651,7 +2673,7 @@ impl std::fmt::Display for NumberErrorKind {
     }
 }
 
-fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, NumberError> {
+fn parse_integer<const BASE: u32>(text: &BStr) -> Result<IntegerBits, NumberError> {
     let bytes = text.as_bytes();
 
     let mut value = 0u128;
@@ -2778,7 +2800,7 @@ fn parse_integer<const BASE: u32>(text: &str) -> Result<IntegerBits, NumberError
     Ok(bits)
 }
 
-fn parse_hex_float(text: &str) -> Result<FloatBits, NumberError> {
+fn parse_hex_float(text: &BStr) -> Result<FloatBits, NumberError> {
     let bytes = text.as_bytes();
     assert!(bytes.starts_with(b"0x") || bytes.starts_with(b"0X"));
 

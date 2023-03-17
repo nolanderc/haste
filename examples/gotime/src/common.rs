@@ -38,7 +38,7 @@ impl std::fmt::Debug for Text {
             if let Some(db) = db {
                 haste::DatabaseExt::lookup(db, *self).fmt(f)
             } else {
-                write!(f, "Text#{:?}", self.id)
+                write!(f, "Text#{}", self.id)
             }
         })
     }
@@ -50,7 +50,7 @@ impl std::fmt::Display for Text {
             if let Some(db) = db {
                 haste::DatabaseExt::lookup(db, *self).fmt(f)
             } else {
-                write!(f, "Text#{:?}", self.id)
+                write!(f, "Text#{}", self.id)
             }
         })
     }

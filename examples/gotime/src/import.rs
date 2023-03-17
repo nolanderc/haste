@@ -8,26 +8,23 @@ use bstr::{BStr, ByteSlice};
 
 use crate::{
     common::Text,
-    env, error, fs,
+    error, fs, process,
     span::{FileRange, Span},
     syntax,
     util::future::try_join_all,
-    Result, SourcePath,
+    Result, SourcePath, Storage,
 };
 
 #[haste::query]
-#[input]
 #[clone]
 pub async fn resolve(
     db: &dyn crate::Db,
     import_name: Text,
     go_mod: Option<SourcePath>,
 ) -> Result<FileSet> {
-    // TODO: implement build tags so we can resolve import paths ourselves without having to call
-    // into the go compiler
     let name = import_name.get(db);
 
-    let goroot = env::go_var_path(db, "GOROOT").await?;
+    let goroot = process::go_var_path(db, "GOROOT").await?;
 
     let src_import_path: Arc<Path> = goroot.join("src").join(name).into();
     if fs::is_dir(db, src_import_path.clone()).await {
@@ -41,7 +38,6 @@ pub async fn resolve(
         }
     }
 
-    eprintln!("go list {name}");
     resolve_import_go_list(db, name, go_mod).await
 }
 
@@ -51,33 +47,6 @@ async fn resolve_import_go_list(
     name: &str,
     go_mod: Option<SourcePath>,
 ) -> Result<FileSet> {
-    let goroot = env::go_var_path(db, "GOROOT").await?;
-    let mut command = tokio::process::Command::new(goroot.join("bin").join("go"));
-
-    command
-        .args(["list", "-find", "-json", "--", name])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    if let Some(mod_path) = go_mod {
-        if let Some(mod_dir) = mod_path.path(db).parent() {
-            command.current_dir(mod_dir);
-        }
-    }
-
-    let output = command
-        .output()
-        .await
-        .map_err(|error| error!("could not resolve import `{name}` using `go`: {}", error))?;
-
-    if !output.status.success() {
-        return Err(error!(
-            "could not resolve import `{name}`: {}",
-            bstr::BStr::new(output.stderr.trim_end())
-        ));
-    }
-
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct GoListPackage {
@@ -85,7 +54,12 @@ async fn resolve_import_go_list(
         go_files: Vec<PathBuf>,
     }
 
-    let pkg: GoListPackage = serde_json::from_slice(&output.stdout).unwrap();
+    let mod_path = go_mod
+        .and_then(|path| path.path(db).parent())
+        .map(Arc::from);
+
+    let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_path).await?;
+    let pkg: GoListPackage = serde_json::from_slice(output).unwrap();
 
     let files = pkg
         .go_files
@@ -415,8 +389,8 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
 }
 
 async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
-    Ok(env::go_var(db, "GOOS").await.as_ref()? == tag
-        || env::go_var(db, "GOARCH").await.as_ref()? == tag)
+    Ok(process::go_var(db, "GOOS").await.as_ref()? == tag
+        || process::go_var(db, "GOARCH").await.as_ref()? == tag)
 }
 
 /// List of known values for the `GOOS` environment variable.

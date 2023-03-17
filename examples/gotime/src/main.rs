@@ -3,13 +3,16 @@
 #![allow(clippy::useless_format)]
 #![allow(clippy::uninlined_format_args)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use haste::DatabaseExt;
+use notify::Watcher;
 use util::future::try_join_all;
 use util::future::FutureExt;
 
@@ -19,41 +22,19 @@ use crate::source::SourcePath;
 
 mod common;
 mod diagnostic;
-mod env;
 mod fs;
 mod import;
 mod key;
+mod process;
 mod source;
 mod span;
 mod syntax;
 mod token;
 mod util;
 
-#[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
-struct Arguments {
-    /// Path to the directory or files of the package to compile.
-    #[clap(value_parser = parse_arc_path)]
-    package: Vec<Arc<Path>>,
-}
-
-fn parse_arc_path(text: &str) -> Result<Arc<Path>, std::convert::Infallible> {
-    Ok(Arc::from(Path::new(text)))
-}
-
-#[haste::database(Storage)]
-#[derive(Default)]
-pub struct Database {
-    storage: haste::DatabaseStorage<Self>,
-}
-
 #[haste::storage]
 pub struct Storage(
     common::Text,
-    fs::read,
-    fs::read_header,
-    fs::list_dir,
-    fs::metadata,
-    env::go_var,
     source::SourcePath,
     source::source_text,
     source::line_starts,
@@ -64,19 +45,156 @@ pub struct Storage(
     compile_package_files,
 );
 
-pub trait Db: haste::Database + haste::WithStorage<Storage> {}
+#[haste::database(Storage, fs::Storage, process::Storage)]
+pub struct Database {
+    storage: haste::DatabaseStorage<Self>,
+    lines: AtomicUsize,
+    touched_paths: DashSet<Arc<Path>>,
+}
 
-impl Db for Database {}
+impl Database {
+    pub fn new() -> Self {
+        Self {
+            storage: haste::DatabaseStorage::new(),
+            lines: AtomicUsize::new(0),
+            touched_paths: DashSet::new(),
+        }
+    }
+}
+
+pub trait Db:
+    haste::Database
+    + haste::WithStorage<Storage>
+    + haste::WithStorage<fs::Storage>
+    + haste::WithStorage<process::Storage>
+{
+    /// Notifies the database that the filesystem is being accessed.
+    fn touch_path(&self, path: Arc<Path>) {
+        _ = path;
+    }
+
+    fn register_file(&self, path: Arc<Path>, contents: &[u8]) {
+        _ = path;
+        _ = contents;
+    }
+}
+
+impl Db for Database {
+    fn touch_path(&self, path: Arc<Path>) {
+        self.touched_paths.insert(path);
+    }
+
+    fn register_file(&self, path: Arc<Path>, contents: &[u8]) {
+        _ = path;
+        let lines = 1 + contents.iter().filter(|&&byte| byte == b'\n').count();
+        self.lines
+            .fetch_add(lines, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
+struct Arguments {
+    /// Path to the directory or files of the package to compile.
+    #[clap(value_parser = parse_arc_path)]
+    package: Vec<Arc<Path>>,
+
+    #[clap(short, long)]
+    watch: bool,
+}
+
+fn parse_arc_path(text: &str) -> std::io::Result<Arc<Path>> {
+    let path = Path::new(text);
+    let path = path.canonicalize()?;
+    Ok(Arc::from(path))
+}
 
 fn main() {
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .without_time()
+        .with_target(false)
+        .init();
+
     let arguments = <Arguments as clap::Parser>::parse();
 
-    let mut db = Database::default();
+    let mut db = Database::new();
 
-    haste::scope(&mut db, |scope, db| {
-        let start = std::time::Instant::now();
+    if arguments.watch {
+        watch_loop(&mut db, arguments)
+    } else {
+        run(&mut db, arguments);
+    }
+
+    eprintln!("done");
+}
+
+fn watch_loop(db: &mut Database, arguments: Arguments) {
+    fn maybe_changed(kind: notify::EventKind) -> bool {
+        match kind {
+            notify::EventKind::Access(_) => false,
+            notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Other => true,
+        }
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(sender).unwrap();
+
+    let mut changes = HashSet::new();
+
+    loop {
+        run(db, arguments.clone());
+
+        for touched in db.touched_paths.iter() {
+            if let Err(error) = watcher.watch(&touched, notify::RecursiveMode::NonRecursive) {
+                // eprintln!("error: {}", error);
+            }
+        }
+        db.touched_paths.clear();
+
+        eprintln!("waiting for changes...");
+        loop {
+            match dbg!(receiver.recv()) {
+                Ok(Ok(event)) => {
+                    if maybe_changed(event.kind) {
+                        changes.extend(event.paths);
+                        break;
+                    }
+                }
+                Ok(Err(error)) => eprintln!("error: {}", error),
+                Err(_closed) => return,
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // drain the event queue
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                Ok(event) => {
+                    if maybe_changed(event.kind) {
+                        changes.extend(event.paths);
+                    }
+                }
+                Err(error) => eprintln!("error: {}", error),
+            }
+        }
+
+        for path in changes.drain() {
+            eprintln!("invalidate: {}", path.display());
+            fs::invalidate_path(db, Arc::from(path));
+        }
+    }
+}
+
+fn run(db: &mut Database, arguments: Arguments) {
+    let start = std::time::Instant::now();
+
+    haste::scope(db, |scope, db| {
         let result = scope.block_on(compile(db, arguments));
-        eprintln!("time: {:?}", start.elapsed());
 
         match result {
             Ok(output) => {
@@ -92,7 +210,13 @@ fn main() {
         }
     });
 
-    eprintln!("done");
+    let lines = *db.lines.get_mut();
+    eprintln!("time: {:?}", start.elapsed());
+    eprintln!(
+        "lines: {} ({:.1} K/s)",
+        lines,
+        lines as f64 / start.elapsed().as_secs_f64() / 1e3
+    );
 }
 
 /// Compile the program using the given arguments
@@ -137,8 +261,6 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let asts = files.parse(db).await?;
     let package_name = package_name(db, &asts).await?.unwrap();
 
-    let parse = start.elapsed();
-
     let go_mod = import::closest_go_mod(db, asts[0].source.path(db).clone()).await?;
 
     let mut futures = Vec::with_capacity(asts.iter().map(|ast| ast.imports.len()).sum());
@@ -177,7 +299,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     }
 
     // eprintln!(
-    //     "[{}] -- {:?} (parse: {parse:?}) -- {:#?}",
+    //     "[{}] -- {:?} -- {:?}",
     //     db.fmt(package_name),
     //     start.elapsed(),
     //     package_names

@@ -198,7 +198,7 @@ impl<I, O> QueryCell<I, O> {
         let output = self.output.get_mut();
 
         let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(last_change, Some(durability));
+        let current = runtime.update_input(last_change, durability);
 
         let value = make_output(current);
 
@@ -213,20 +213,24 @@ impl<I, O> QueryCell<I, O> {
         self.state.changed_at.set(Some(current));
     }
 
-    pub fn remove_output(&mut self, runtime: &mut Runtime, durability: Option<Durability>) {
+    pub fn remove_output(&mut self, runtime: &mut Runtime, durability: Durability) {
         let state = self.state.addr.get_mut();
         let output = self.output.get_mut();
 
         let Some(last_change) = self.state.changed_at.get() else { return };
+        if (*state & HAS_OUTPUT) == 0 {
+            return;
+        }
 
         let current = runtime.update_input(Some(last_change), durability);
 
+        unsafe { output.assume_init_drop() }
+        *state &= !HAS_OUTPUT;
+
         self.state.changed_at.set(Some(current));
 
-        if (*state & HAS_OUTPUT) != 0 {
-            unsafe { output.assume_init_drop() }
-        }
-        *state &= !HAS_OUTPUT;
+        self.state.verified_at.set(None);
+        self.state.changed_at.set(None);
     }
 
     /// # Safety
@@ -333,7 +337,7 @@ impl<I, O> QueryCell<I, O> {
         // the query was completed while we waited on the lock
         if self.state.verified_at.load(Relaxed) == Some(revision) {
             // SAFETY: the data in the ouput is already synchronized with the writer due to us
-            // holding the lock.
+            // holding the lock so we can use `Relaxed` ordering above.
             return Err(Some(self.output_assume_init()));
         }
 

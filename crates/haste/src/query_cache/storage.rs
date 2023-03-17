@@ -88,7 +88,7 @@ impl<Q: Query> QueryStorage<Q> {
         OutputSlot {
             output: result.output,
             dependencies: DependencyRange::from(start..end),
-            transitive: result.transitive,
+            transitive: Some(result.transitive),
         }
     }
 
@@ -171,7 +171,10 @@ pub struct OutputSlot<Q: Query> {
 
     /// Details about the transitive dependencies of the query. Used to optimize incremental
     /// re-evaluation of queries.
-    pub transitive: TransitiveDependencies,
+    ///
+    /// If `None`, the query has been invalidated and needs to be re-evaluated to find the new
+    /// dependencies.
+    pub transitive: Option<TransitiveDependencies>,
 
     /// The output from a query.
     pub output: Q::Output,
@@ -203,7 +206,7 @@ impl From<std::ops::Range<u32>> for DependencyRange {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransitiveDependencies {
     /// The query only depends on inputs from these revisions.
     pub inputs: Option<RevisionRange>,
@@ -231,7 +234,7 @@ impl TransitiveDependencies {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RevisionRange {
     pub earliest: Revision,
     pub latest: Revision,
@@ -320,13 +323,13 @@ impl<Q: Query> QuerySlot<Q> {
             .set_output(runtime, durability, |current| OutputSlot {
                 output,
                 dependencies: (0..0).into(),
-                transitive: TransitiveDependencies {
+                transitive: Some(TransitiveDependencies {
                     inputs: Some(RevisionRange {
                         earliest: current,
                         latest: current,
                     }),
                     durability,
-                },
+                }),
             });
     }
 
@@ -334,10 +337,24 @@ impl<Q: Query> QuerySlot<Q> {
     where
         Q: crate::Input,
     {
-        let durability = self
-            .get_output_mut()
-            .map(|output| output.transitive.durability);
-        self.cell.remove_output(runtime, durability);
+        if let Some(output) = self.get_output_mut() {
+            if let Some(transitive) = output.transitive {
+                self.cell.remove_output(runtime, transitive.durability);
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self, runtime: &mut Runtime)
+    where
+        Q: crate::Input,
+    {
+        if let Some(output) = self.cell.get_output_mut() {
+            if let Some(transitive) = output.transitive.take() {
+                let durability = transitive.durability;
+                let last_change = self.last_changed();
+                runtime.update_input(last_change, durability);
+            }
+        }
     }
 
     pub fn last_verified(&self) -> Option<Revision> {

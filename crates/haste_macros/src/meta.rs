@@ -14,7 +14,7 @@ impl Default for Arguments {
     fn default() -> Self {
         Arguments {
             db: syn::parse_quote!(crate::Db),
-            storage: syn::parse_quote!(crate::Storage),
+            storage: syn::parse_quote!(Storage),
             clone: false,
             cycle: None,
             input: false,

@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use bstr::{BStr, ByteSlice};
 use haste::DatabaseExt;
 use smallvec::SmallVec;
 
@@ -245,7 +246,7 @@ impl Label {
         let source = &sources[&self.span.path];
         let line = source.line_index(range.start.get());
         let line_range = source.line_range(line);
-        let line_text = source.text[line_range.clone()].trim_end();
+        let line_text = BStr::new(source.text[line_range.clone()].trim_end());
 
         let gutter_width = 1 + (1 + line).ilog10() as usize;
         let gutter = " ".repeat(gutter_width);
@@ -259,6 +260,8 @@ impl Label {
             })
             .collect::<String>();
 
+        dbg!(&self.text);
+        dbg!(range);
         let underline_width = (range.end.get() - range.start.get()) as usize;
         let underline = "^".repeat(underline_width.max(1));
 
@@ -320,7 +323,7 @@ impl std::fmt::Display for Style {
 
 #[derive(Debug)]
 struct SourceFileInfo<'db> {
-    text: &'db str,
+    text: &'db BStr,
     line_starts: &'db [u32],
     display_path: String,
 }
@@ -394,9 +397,8 @@ impl Diagnostic {
         for source in sources {
             let text = source_text(db, source)
                 .await
-                .as_ref()
-                .expect("span pointed to path that did not exist")
-                .as_str();
+                .as_deref()
+                .expect("span pointed to path that did not exist");
             let line_starts = line_starts(db, source).await.as_ref().unwrap().as_slice();
 
             let display_path = db.fmt(source).to_string();

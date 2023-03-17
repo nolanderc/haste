@@ -53,6 +53,15 @@ where
     }
 }
 
+pub fn wrap(
+    db: &dyn Database,
+    f: &mut std::fmt::Formatter<'_>,
+    func: impl Fn(&mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+) -> std::fmt::Result {
+    let adapter = Adapter::new(db, crate::util::fmt::from_fn(func));
+    Display::fmt(&adapter, f)
+}
+
 pub struct FmtDatabase<'db, S> {
     raw: &'db dyn Database,
     storage: &'db S,

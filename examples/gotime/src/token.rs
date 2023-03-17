@@ -13,6 +13,7 @@
 
 use std::num::NonZeroU32;
 
+use bstr::{BStr, ByteSlice};
 use haste::non_max::NonMaxU32;
 
 use crate::span::FileRange;
@@ -156,16 +157,15 @@ define_tokens! {
     }
 }
 
-pub fn tokenize(text: &str) -> Vec<SpannedToken> {
+pub fn tokenize(text: &BStr) -> Vec<SpannedToken> {
     assert!(text.len() < u32::MAX as usize);
 
     let mut tokens = Vec::with_capacity(text.len() / 8);
 
-    let bytes = text.as_bytes();
     let mut offset = 0;
 
     loop {
-        let whitespace = strip_whitespace(&bytes[offset..]);
+        let whitespace = strip_whitespace(&text[offset..]);
         if whitespace.error {
             tokens.push(SpannedToken::new(
                 Token::Error,
@@ -180,7 +180,7 @@ pub fn tokenize(text: &str) -> Vec<SpannedToken> {
         }
 
         offset += whitespace.len;
-        if offset == bytes.len() {
+        if offset == text.len() {
             break;
         }
 
@@ -286,13 +286,17 @@ fn byte(bytes: &[u8], index: usize) -> u8 {
 }
 
 impl Token {
-    pub fn strip(text: &str) -> (Token, usize) {
-        let bytes = text.as_bytes();
-        let first = bytes[0];
-        let second = byte(bytes, 1);
-        let third = byte(bytes, 2);
+    pub fn strip(text: &BStr) -> (Token, usize) {
+        let first = text[0];
+        let second = byte(text, 1);
+        let third = byte(text, 2);
 
         match first {
+            // fast path if ASCII identifier:
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => Self::strip_identifier(text),
+
+            b'0'..=b'9' => Self::strip_number(text),
+
             b'(' => (Token::LParens, 1),
             b')' => (Token::RParens, 1),
             b'{' => (Token::LCurly, 1),
@@ -382,20 +386,15 @@ impl Token {
             },
             b'~' => (Token::Tilde, 1),
 
-            b'0'..=b'9' => Self::strip_number(text),
-
             b'\'' => Self::strip_rune(text),
             b'\"' => Self::strip_string(text),
             b'`' => Self::strip_raw_string(text),
-
-            // fast path if ASCII identifier:
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => Self::strip_identifier(text),
 
             _ => {
                 // slow path if arbitrary unicode:
                 let mut chars = text.chars();
                 let char = chars.next().unwrap();
-                let rest = chars.as_str();
+                let rest = chars.as_bytes();
                 if is_unicode_letter(char) {
                     return Self::strip_identifier(text);
                 }
@@ -407,80 +406,75 @@ impl Token {
     }
 
     #[inline]
-    fn strip_identifier(text: &str) -> (Token, usize) {
-        let mut chars = text.chars();
-        let first = chars.next();
+    fn strip_identifier(text: &BStr) -> (Token, usize) {
+        let mut i = 0;
+        let (first, len) = bstr::decode_utf8(&text[i..]);
+        i += len;
         debug_assert!(is_unicode_letter(first.unwrap()));
 
-        let mut remaining;
-        loop {
-            remaining = chars.as_str().len();
-            if let Some(next) = chars.next() {
-                if is_unicode_letter(next) || is_unicode_digit(next) {
-                    continue;
-                }
+        while let (Some(next), len) = bstr::decode_utf8(&text[i..]) {
+            if is_unicode_letter(next) || is_unicode_digit(next) {
+                i += len;
+            } else {
+                break;
             }
-            break;
         }
 
-        let len = text.len() - remaining;
-        let identifier = &text[..len];
-
+        let identifier = &text[..i];
         let token = Self::get_keyword(identifier).unwrap_or(Token::Identifier);
-        (token, len)
+        (token, i)
     }
 
     #[inline]
-    fn get_keyword(identifier: &str) -> Option<Token> {
-        match identifier {
-            "break" => Some(Token::Break),
-            "case" => Some(Token::Case),
-            "chan" => Some(Token::Chan),
-            "const" => Some(Token::Const),
-            "continue" => Some(Token::Continue),
-            "default" => Some(Token::Default),
-            "defer" => Some(Token::Defer),
-            "else" => Some(Token::Else),
-            "fallthrough" => Some(Token::Fallthrough),
-            "for" => Some(Token::For),
-            "func" => Some(Token::Func),
-            "go" => Some(Token::Go),
-            "goto" => Some(Token::Goto),
-            "if" => Some(Token::If),
-            "import" => Some(Token::Import),
-            "interface" => Some(Token::Interface),
-            "map" => Some(Token::Map),
-            "package" => Some(Token::Package),
-            "range" => Some(Token::Range),
-            "return" => Some(Token::Return),
-            "select" => Some(Token::Select),
-            "struct" => Some(Token::Struct),
-            "switch" => Some(Token::Switch),
-            "type" => Some(Token::Type),
-            "var" => Some(Token::Var),
+    fn get_keyword(identifier: &BStr) -> Option<Token> {
+        match &**identifier {
+            b"break" => Some(Token::Break),
+            b"case" => Some(Token::Case),
+            b"chan" => Some(Token::Chan),
+            b"const" => Some(Token::Const),
+            b"continue" => Some(Token::Continue),
+            b"default" => Some(Token::Default),
+            b"defer" => Some(Token::Defer),
+            b"else" => Some(Token::Else),
+            b"fallthrough" => Some(Token::Fallthrough),
+            b"for" => Some(Token::For),
+            b"func" => Some(Token::Func),
+            b"go" => Some(Token::Go),
+            b"goto" => Some(Token::Goto),
+            b"if" => Some(Token::If),
+            b"import" => Some(Token::Import),
+            b"interface" => Some(Token::Interface),
+            b"map" => Some(Token::Map),
+            b"package" => Some(Token::Package),
+            b"range" => Some(Token::Range),
+            b"return" => Some(Token::Return),
+            b"select" => Some(Token::Select),
+            b"struct" => Some(Token::Struct),
+            b"switch" => Some(Token::Switch),
+            b"type" => Some(Token::Type),
+            b"var" => Some(Token::Var),
             _ => None,
         }
     }
 
     #[inline]
-    fn strip_number(text: &str) -> (Token, usize) {
+    fn strip_number(text: &BStr) -> (Token, usize) {
         let mut binary = false;
         let mut octal = false;
         let mut hex = false;
         let mut float = false;
 
-        let bytes = text.as_bytes();
         let mut len = 0;
 
-        if bytes[0] == b'0' {
-            let second = byte(bytes, 1);
+        if text[0] == b'0' {
+            let second = byte(text, 1);
             binary |= matches!(second, b'b' | b'B');
             hex |= matches!(second, b'x' | b'X');
             octal |= matches!(second, b'o' | b'O' | b'_' | b'0'..=b'9');
         }
 
-        while len < bytes.len() {
-            let ch = bytes[len];
+        while len < text.len() {
+            let ch = text[len];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
                 len += 1;
             } else {
@@ -495,14 +489,14 @@ impl Token {
 
             if is_exponent | is_hexponent {
                 // + and - are allowed after an exponent
-                let next = byte(bytes, len);
+                let next = byte(text, len);
                 if next == b'+' || next == b'-' {
                     len += 1;
                 }
             }
         }
 
-        let imaginary = byte(bytes, len - 1) == b'i';
+        let imaginary = byte(text, len - 1) == b'i';
 
         let kind = match {} {
             _ if imaginary => Token::Imaginary,
@@ -517,26 +511,25 @@ impl Token {
         (kind, len)
     }
 
-    fn strip_rune(text: &str) -> (Token, usize) {
+    fn strip_rune(text: &BStr) -> (Token, usize) {
         match Self::strip_character_literal::<b'\''>(text) {
             Ok(len) => (Token::Rune, len),
             Err(len) => (Token::Error, len),
         }
     }
 
-    fn strip_string(text: &str) -> (Token, usize) {
+    fn strip_string(text: &BStr) -> (Token, usize) {
         match Self::strip_character_literal::<b'\"'>(text) {
             Ok(len) => (Token::String, len),
             Err(len) => (Token::Error, len),
         }
     }
 
-    fn strip_character_literal<const QUOTE: u8>(text: &str) -> Result<usize, usize> {
-        let bytes = text.as_bytes();
+    fn strip_character_literal<const QUOTE: u8>(text: &BStr) -> Result<usize, usize> {
         let mut len = 1;
 
-        while len < bytes.len() {
-            let first = bytes[len];
+        while len < text.len() {
+            let first = text[len];
 
             if first == b'\\' {
                 len += 2;
@@ -553,12 +546,11 @@ impl Token {
         Err(text.len())
     }
 
-    fn strip_raw_string(text: &str) -> (Token, usize) {
-        let bytes = text.as_bytes();
+    fn strip_raw_string(text: &BStr) -> (Token, usize) {
         let mut len = 1;
 
-        while len < bytes.len() {
-            let first = bytes[len];
+        while len < text.len() {
+            let first = text[len];
             len += 1;
             if first == b'`' {
                 return (Token::String, len);
@@ -728,7 +720,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn tokens(text: &str) -> Vec<(Token, &str)> {
-        tokenize(text)
+        tokenize(text.into())
             .into_iter()
             .map(|token| {
                 let start = token.offset() as usize;

@@ -206,7 +206,7 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
                         let value = haste::DatabaseExt::lookup(db, *self);
                         std::fmt::Debug::fmt(value, f)
                     } else {
-                        write!(f, concat!(#ident_text, "#{:?}"), self.0)
+                        write!(f, concat!(#ident_text, "#{}"), self.0)
                     }
                 })
             }
@@ -219,7 +219,7 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
                         let value = haste::DatabaseExt::lookup(db, *self);
                         std::fmt::Display::fmt(value, f)
                     } else {
-                        write!(f, concat!(#ident_text, "#{:?}"), self.0)
+                        write!(f, concat!(#ident_text, "#{}"), self.0)
                     }
                 })
             }

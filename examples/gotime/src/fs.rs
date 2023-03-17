@@ -4,17 +4,42 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::{error, Result};
 
+#[haste::storage]
+pub struct Storage(read, list_dir, metadata, read_header);
+
+/// Invalidates the given path, forcing re-evaluation if it is needed.
+pub fn invalidate_path(db: &mut dyn crate::Db, path: Arc<Path>) {
+    read::invalidate(db, path.clone());
+    list_dir::invalidate(db, path.clone());
+    metadata::invalidate(db, path.clone());
+    read_header::invalidate(db, path);
+}
+
 #[haste::query]
+#[clone]
 #[input]
-pub async fn read(_db: &dyn crate::Db, path: Arc<Path>) -> Result<Vec<u8>> {
-    tokio::fs::read(&*path)
+pub async fn read(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[u8]>> {
+    db.touch_path(path.clone());
+
+    let bytes = tokio::fs::read(&*path)
         .await
-        .map_err(|error| error!("could not read `{}`: {}", path.display(), error))
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                error!("file not found: `{}`", path.display())
+            }
+            _ => error!("could not read file `{}`: {}", path.display(), error),
+        })?;
+
+    db.register_file(path, &bytes);
+
+    Ok(Arc::from(bytes))
 }
 
 #[haste::query]
 #[input]
-pub async fn list_dir(_db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[Arc<Path>]>> {
+pub async fn list_dir(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[Arc<Path>]>> {
+    db.touch_path(path.clone());
+
     async fn read_dir(path: Arc<Path>) -> std::io::Result<Arc<[Arc<Path>]>> {
         let mut dir = tokio::fs::read_dir(path).await?;
 
@@ -62,7 +87,9 @@ impl Metadata {
 #[haste::query]
 #[input]
 #[clone]
-pub async fn metadata(_db: &dyn crate::Db, path: Arc<Path>) -> Result<Metadata> {
+pub async fn metadata(db: &dyn crate::Db, path: Arc<Path>) -> Result<Metadata> {
+    db.touch_path(path.clone());
+
     let meta = tokio::fs::metadata(&*path)
         .await
         .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;
@@ -89,7 +116,9 @@ pub async fn is_dir(db: &dyn crate::Db, path: Arc<Path>) -> bool {
 /// Reads all bytes in a file up until the first token that is neither whitespace nor a comment.
 #[haste::query]
 #[input]
-pub async fn read_header(_db: &dyn crate::Db, path: Arc<Path>) -> Result<String> {
+pub async fn read_header(db: &dyn crate::Db, path: Arc<Path>) -> Result<String> {
+    db.touch_path(path.clone());
+
     let file = tokio::fs::File::open(&*path)
         .await
         .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;

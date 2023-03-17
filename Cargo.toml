@@ -1,22 +1,20 @@
 [workspace]
 members = ["crates/*", "examples/*"]
 
-
-[profile.dev.package."*"]
-opt-level = 1
-
-[profile.dev.build-override]
-opt-level = 2
-
-[profile.dev.package.haste]
-opt-level = 2
-
+# [profile.dev.package."*"]
+# opt-level = 1
+# [profile.dev.package.haste]
+# opt-level = 2
 
 [profile.release]
 debug = true
-
 [profile.release.package."*"]
 opt-level = 3
 
+
+# Always build proc-macros and build scripts with optimizations:
 [profile.release.build-override]
 opt-level = 2
+[profile.dev.build-override]
+opt-level = 2
+

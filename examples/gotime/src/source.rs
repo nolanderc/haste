@@ -1,6 +1,8 @@
 use std::{path::Path, sync::Arc};
 
-use crate::{Diagnostic, Result};
+use bstr::BStr;
+
+use crate::{fs, Result, Storage};
 
 #[haste::intern(SourcePath)]
 #[derive(PartialEq, Eq, Hash)]
@@ -55,32 +57,24 @@ impl std::fmt::Debug for SourcePathData {
 
 /// Get the source text for some file.
 #[haste::query]
-#[input]
-pub async fn source_text(db: &dyn crate::Db, source: SourcePath) -> Result<String> {
-    let path = source.path(db);
+pub async fn source_text(db: &dyn crate::Db, source: SourcePath) -> Result<Arc<BStr>> {
+    let bytes = fs::read(db, source.path(db).clone()).await?;
+    let ptr: *const [u8] = Arc::into_raw(bytes);
+    let ptr: *const BStr = ptr as *const BStr;
 
-    match tokio::fs::read_to_string(path).await {
-        Ok(text) => Ok(text),
-        Err(error) => {
-            let message = match error.kind() {
-                std::io::ErrorKind::NotFound => {
-                    format!("could not find file `{}`", path.display())
-                }
-                _ => format!("could not read file `{}`: {}", path.display(), error),
-            };
-            Err(Diagnostic::error(message))
-        }
-    }
+    // SAFETY: `BStr` is a `#[repr(transparent)]` wrapper around a `[u8]`, so they have the same
+    // memory layout, which makes this transmute safe.
+    unsafe { Ok(Arc::from_raw(ptr)) }
 }
 
 /// Get the indices where each line starts in a file.
 #[haste::query]
 pub async fn line_starts(db: &dyn crate::Db, path: SourcePath) -> Result<Vec<u32>> {
-    let text = source_text(db, path).await.as_ref()?;
+    let text = source_text(db, path).await.as_deref()?;
 
     // lines are separated by line-endings, so there is always at least one line
     let mut line_count = 1;
-    for byte in text.bytes() {
+    for &byte in text.iter() {
         line_count += (byte == b'\n') as usize;
     }
 
@@ -89,7 +83,7 @@ pub async fn line_starts(db: &dyn crate::Db, path: SourcePath) -> Result<Vec<u32
     // the first line always starts at index 0
     starts.push(0);
 
-    for (index, byte) in text.bytes().enumerate() {
+    for (index, &byte) in text.iter().enumerate() {
         if byte == b'\n' {
             starts.push(1 + index as u32);
         }

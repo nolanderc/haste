@@ -45,6 +45,8 @@ impl ChangeHistory {
         let new =
             Revision::new(self.histories[0].len() as u32 + 1).expect("exhausted revision IDs");
 
+        tracing::debug!("update {last_changed:?} -> {new:?} [{durability:?}]");
+
         let durability_level = durability.index() + 1;
         let (lower, higher) = self.histories.split_at_mut(durability_level);
 
@@ -152,21 +154,26 @@ impl RevisionSet {
 
                     let (left_bits, right_bits) = small.split_at_raw(first_in_next_segment);
 
-                    tree.insert(segment, left_bits);
-
+                    if !left_bits.is_empty() {
+                        tree.insert(segment, left_bits);
+                    }
                     if !right_bits.is_empty() {
                         tree.insert(next_segment, right_bits);
                     }
 
+                    Self::insert_tree(&mut tree, index);
+
                     *self = RevisionSet::Tree(tree);
                 }
             }
-            RevisionSet::Tree(tree) => {
-                tree.entry(segment(index))
-                    .or_insert(BitSet::new())
-                    .insert(segment_index(index));
-            }
+            RevisionSet::Tree(tree) => Self::insert_tree(tree, index),
         }
+    }
+
+    fn insert_tree(tree: &mut BTreeMap<u32, BitSet>, index: u32) {
+        tree.entry(segment(index))
+            .or_insert(BitSet::new())
+            .insert(segment_index(index));
     }
 
     fn contains_range(&self, range: RevisionRange) -> bool {

@@ -371,9 +371,11 @@ impl<Q: Query> QuerySlot<Q> {
 
     pub fn wait_for_change(&self, revision: Revision) -> ChangeFuture<'_> {
         unsafe {
-            self.cell.wait_for_change(revision, |output| {
-                std::ptr::addr_of!((*output.cast::<OutputSlot<Q>>()).transitive).cast()
-            })
+            self.cell
+                .wait_for_change(revision, self as *const _ as *const (), |data| {
+                    let this: &Self = &*data.cast();
+                    this.output_unchecked().transitive.unwrap()
+                })
         }
     }
 
@@ -440,5 +442,9 @@ impl<'a, Q: Query> ClaimedSlot<'a, Q> {
 
     pub fn last_verified(&self) -> Option<Revision> {
         self.slot.cell.last_verified()
+    }
+
+    pub fn last_changed(&self) -> Option<Revision> {
+        self.slot.cell.last_changed()
     }
 }

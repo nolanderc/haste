@@ -120,6 +120,13 @@ where
         let slot = self.storage.slot(id);
         let current = self.storage.current_revision();
 
+        let _guard = tracing::debug_span!(
+            parent: None,
+            "last_change",
+            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
+        )
+        .entered();
+
         match self.claim(slot) {
             Err(Some(output)) => {
                 return LastChangeFuture::Ready(Change {
@@ -356,7 +363,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         id: Id,
         slot: &'a QuerySlot<Q>,
     ) -> EvalResult<'a, Q> {
-        let span = tracing::trace_span!(
+        let span = tracing::debug_span!(
             "get_or_evaluate",
             query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
         );
@@ -461,6 +468,9 @@ enum TaskState<'a, Q: Query> {
 impl<'a, Q: Query> TaskState<'a, Q> {
     fn execute(path: IngredientPath, data: VerifyData<'a, Q>) -> Self {
         let VerifyData { db, slot, storage } = data;
+
+        tracing::trace!("execute");
+
         let input = slot.input().clone();
         let inner = db.runtime().execute_query(db, input, path);
         TaskState::Exec(ExecTaskFuture {
@@ -535,20 +545,34 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let id = this.inner.query().resource;
 
         let result = std::task::ready!(this.inner.poll(cx));
-        let new = this.storage.create_output(result);
+        tracing::trace!("output ready");
 
+        let new = this.storage.create_output(result);
         let mut slot = this.slot.take().unwrap();
 
-        if let Some(previous) = slot.get_output() {
-            if new.output == previous.output {
-                // backdate the result (verify the output, but keep the revision it was last
-                // changed)
-                tracing::debug!(reason = "output unchanged", "backdating");
-                previous.dependencies = new.dependencies;
-                previous.transitive = new.transitive;
-                let slot = slot.backdate();
-                return Poll::Ready(QueryResult { id, slot });
+        if let Some(last_changed) = slot.last_changed() {
+            if let Some(previous) = slot.get_output() {
+                if new.output == previous.output {
+                    // backdate the result (verify the output, but keep the revision it was last
+                    // changed)
+                    previous.dependencies = new.dependencies;
+                    previous.transitive = new.transitive;
+
+                    if Q::IS_INPUT {
+                        previous.transitive.as_mut().unwrap().inputs = Some(RevisionRange {
+                            earliest: last_changed,
+                            latest: last_changed,
+                        });
+                    }
+
+                    tracing::debug!(reason = "output unchanged", "backdating");
+
+                    let slot = slot.backdate();
+                    return Poll::Ready(QueryResult { id, slot });
+                }
             }
+
+            tracing::trace!("output changed");
         }
 
         let slot = slot.finish(new);

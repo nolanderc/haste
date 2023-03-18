@@ -36,7 +36,6 @@ mod util;
 pub struct Storage(
     common::Text,
     source::SourcePath,
-    source::source_text,
     source::line_starts,
     syntax::parse_file,
     import::resolve,
@@ -129,7 +128,7 @@ fn main() {
 }
 
 fn watch_loop(db: &mut Database, arguments: Arguments) {
-    fn maybe_changed(kind: notify::EventKind) -> bool {
+    fn maybe_changed(kind: &notify::EventKind) -> bool {
         match kind {
             notify::EventKind::Access(_) => false,
             notify::EventKind::Any
@@ -140,51 +139,70 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
         }
     }
 
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let mut watcher = notify::recommended_watcher(sender).unwrap();
+    let cwd = std::env::current_dir().unwrap();
 
+    let (sender, receiver) = std::sync::mpsc::sync_channel(128);
+    let mut watcher =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Err(error) => tracing::error!("{}", error),
+            Ok(event) => {
+                if event.need_rescan() {
+                    tracing::warn!("file watcher needs rescan");
+                }
+                if maybe_changed(&event.kind) {
+                    _ = sender.send(event.paths);
+                }
+            }
+        })
+        .unwrap();
+
+    let mut watched = HashSet::new();
     let mut changes = HashSet::new();
 
     loop {
         run(db, arguments.clone());
 
         for touched in db.touched_paths.iter() {
+            if !touched.starts_with(&cwd) {
+                continue;
+            }
+
+            if !watched.insert(touched.clone()) {
+                continue;
+            }
+
             if let Err(error) = watcher.watch(&touched, notify::RecursiveMode::NonRecursive) {
-                // eprintln!("error: {}", error);
+                match &error.kind {
+                    notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                        continue
+                    }
+                    _ => {}
+                }
+
+                tracing::error!(path = ?*touched, error = ?error.kind, "could not watch path");
+            } else {
+                tracing::info!(path = ?*touched, "watching");
             }
         }
         db.touched_paths.clear();
 
-        eprintln!("waiting for changes...");
-        loop {
-            match dbg!(receiver.recv()) {
-                Ok(Ok(event)) => {
-                    if maybe_changed(event.kind) {
-                        changes.extend(event.paths);
-                        break;
-                    }
-                }
-                Ok(Err(error)) => eprintln!("error: {}", error),
-                Err(_closed) => return,
-            }
-        }
+        eprintln!("[waiting for changes...]");
+        let Ok(paths) = receiver.recv() else { return };
+        changes.extend(paths);
 
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         // drain the event queue
-        while let Ok(event) = receiver.try_recv() {
-            match event {
-                Ok(event) => {
-                    if maybe_changed(event.kind) {
-                        changes.extend(event.paths);
-                    }
-                }
-                Err(error) => eprintln!("error: {}", error),
-            }
+        while let Ok(paths) = receiver.try_recv() {
+            changes.extend(paths);
         }
 
         for path in changes.drain() {
-            eprintln!("invalidate: {}", path.display());
+            // Work around an issue on WSL where removing the file causes the watcher to stop
+            // working for that file. This is especially noticeable when saving in `vim`: it first
+            // removes the file before writing a new one it its place.
+            _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);
+
             fs::invalidate_path(db, Arc::from(path));
         }
     }
@@ -256,33 +274,34 @@ impl std::fmt::Debug for Package {
 #[haste::query]
 #[clone]
 async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Result<Arc<Package>> {
-    let start = std::time::Instant::now();
-
     let asts = files.parse(db).await?;
     let package_name = package_name(db, &asts).await?.unwrap();
 
-    let go_mod = import::closest_go_mod(db, asts[0].source.path(db).clone()).await?;
+    let import_count = asts.iter().map(|ast| ast.imports.len()).sum();
+    let mut futures = Vec::with_capacity(import_count);
 
-    let mut futures = Vec::with_capacity(asts.iter().map(|ast| ast.imports.len()).sum());
-    for ast in asts.iter() {
-        for import in ast.imports.iter() {
-            futures.push(
-                import::resolve(db, import.path.text, go_mod).with_context(|error| {
-                    error.label(
-                        ast.span(None, import.path.span),
-                        "could not resolve the import",
-                    )
-                }),
-            );
+    if import_count > 0 {
+        let go_mod = import::closest_go_mod(db, asts[0].source.path(db).clone()).await?;
+        for ast in asts.iter() {
+            for import in ast.imports.iter() {
+                let resolved =
+                    import::resolve(db, import.path.text, go_mod).with_context(|error| {
+                        error.label(
+                            ast.span(None, import.path.span),
+                            "could not resolve the import",
+                        )
+                    });
+                futures.push(async move { Ok((resolved.await?, ast, import.path)) });
+            }
         }
     }
 
     let resolved = try_join_all(futures).await?;
-    let packages = try_join_all(
-        resolved
-            .into_iter()
-            .map(|resolved| compile_package_files(db, resolved)),
-    )
+    let packages = try_join_all(resolved.into_iter().map(|(resolved, ast, path)| {
+        compile_package_files(db, resolved).with_context(move |error| {
+            error.label(ast.span(None, path.span), "while compiling this import")
+        })
+    }))
     .await?;
 
     let mut package_names = Vec::with_capacity(packages.len());

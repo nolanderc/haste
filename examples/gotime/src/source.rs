@@ -56,7 +56,6 @@ impl std::fmt::Debug for SourcePathData {
 }
 
 /// Get the source text for some file.
-#[haste::query]
 pub async fn source_text(db: &dyn crate::Db, source: SourcePath) -> Result<Arc<BStr>> {
     let bytes = fs::read(db, source.path(db).clone()).await?;
     let ptr: *const [u8] = Arc::into_raw(bytes);
@@ -70,7 +69,7 @@ pub async fn source_text(db: &dyn crate::Db, source: SourcePath) -> Result<Arc<B
 /// Get the indices where each line starts in a file.
 #[haste::query]
 pub async fn line_starts(db: &dyn crate::Db, path: SourcePath) -> Result<Vec<u32>> {
-    let text = source_text(db, path).await.as_deref()?;
+    let text = source_text(db, path).await?;
 
     // lines are separated by line-endings, so there is always at least one line
     let mut line_count = 1;

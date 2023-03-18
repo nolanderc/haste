@@ -1,7 +1,7 @@
+pub mod arc;
 pub mod fmt;
 pub mod future;
 mod signal;
-pub mod arc;
 
 pub use signal::{DropSignal, Signal, WaitSignal};
 
@@ -48,4 +48,8 @@ pub fn debug_size_val<T: Sized>(_val: &T) {
         std::any::type_name::<T>(),
         std::mem::size_of::<T>()
     );
+}
+
+pub unsafe fn bytes_of<T>(data: &T) -> &[u8] {
+    std::slice::from_raw_parts(data as *const T as *const u8, std::mem::size_of::<T>())
 }

@@ -228,9 +228,6 @@ impl<I, O> QueryCell<I, O> {
         *state &= !HAS_OUTPUT;
 
         self.state.changed_at.set(Some(current));
-
-        self.state.verified_at.set(None);
-        self.state.changed_at.set(None);
     }
 
     /// # Safety
@@ -375,12 +372,10 @@ impl<I, O> QueryCell<I, O> {
     pub unsafe fn wait_for_change(
         &self,
         revision: Revision,
-        get_deps: impl FnOnce(
-            *const UnsafeCell<MaybeUninit<O>>,
-        ) -> *const UnsafeCell<MaybeUninit<TransitiveDependencies>>,
+        data: *const (),
+        get_transitive: unsafe fn(*const ()) -> TransitiveDependencies,
     ) -> ChangeFuture {
-        let deps_ptr = get_deps(&self.output.0);
-        self.state.wait_for_change(revision, deps_ptr)
+        self.state.wait_for_change(revision, data, get_transitive)
     }
 
     pub fn set_cycle(&self, cycle: Cycle) -> Result<(), Cycle> {
@@ -522,19 +517,14 @@ impl State {
     fn wait_for_change(
         &self,
         revision: Revision,
-        transitive: *const UnsafeCell<MaybeUninit<TransitiveDependencies>>,
+        data_ptr: *const (),
+        get_transitive: unsafe fn(*const ()) -> TransitiveDependencies,
     ) -> ChangeFuture {
         let future = self.wait(revision);
-        let transitive = crate::util::SendWrapper(transitive);
-
-        crate::util::future::map(future, move |()| {
-            let transitive = unsafe { (*UnsafeCell::raw_get(*transitive)).assume_init_read() };
-            let changed_at = self.changed_at.load(Relaxed);
-
-            Change {
-                changed_at,
-                transitive,
-            }
+        let data_ptr = crate::util::SendWrapper(data_ptr);
+        crate::util::future::map(future, move |()| Change {
+            changed_at: self.changed_at.load(Relaxed),
+            transitive: unsafe { get_transitive(*data_ptr) },
         })
     }
 

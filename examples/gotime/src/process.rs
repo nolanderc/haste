@@ -54,15 +54,15 @@ pub async fn go(
 
 #[haste::query]
 #[input]
-pub async fn env_var(db: &dyn crate::Db, name: &'static str) -> Option<OsString> {
+pub async fn env_var(_db: &dyn crate::Db, name: &'static str) -> Option<OsString> {
     std::env::var_os(name)
 }
 
 #[haste::query]
 pub async fn go_var(db: &dyn crate::Db, name: &'static str) -> Result<OsString> {
     // check if the default has been overriden:
-    if let Some(var) = std::env::var_os(name) {
-        return Ok(var);
+    if let Some(var) = env_var(db, name).await {
+        return Ok(var.clone());
     }
 
     // fast path for common variables:

@@ -2,6 +2,12 @@ package main
 
 import (
     "fmt"
+    "go/ast"
+    "go/build"
+    "go/build/constraint"
+    "go/constant"
+    "go/doc"
+    "go/importer"
 )
 
 func main() {

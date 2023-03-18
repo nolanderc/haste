@@ -164,10 +164,7 @@ pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: Arc<Path>) -> Resul
     }
 
     if sources.is_empty() {
-        return Err(error!(
-            "no go source files found in `{}`",
-            dir_path.display()
-        ));
+        return Err(error!("no source files found in `{}`", dir_path.display()));
     }
 
     Ok(FileSet {
@@ -389,8 +386,21 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
 }
 
 async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
-    Ok(process::go_var(db, "GOOS").await.as_ref()? == tag
-        || process::go_var(db, "GOARCH").await.as_ref()? == tag)
+    if tag == "gc" {
+        return Ok(true);
+    }
+
+    let goos = process::go_var(db, "GOOS").await.as_ref()?;
+    if tag == goos {
+        return Ok(true);
+    }
+
+    let goarch = process::go_var(db, "GOARCH").await.as_ref()?;
+    if tag == goarch {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// List of known values for the `GOOS` environment variable.

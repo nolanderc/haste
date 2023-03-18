@@ -16,9 +16,17 @@ pub struct VerifyData<'a, Q: Query> {
 
 pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, VerifyFuture<Q>> {
     let mut data = data;
-    let Some(last_verified) = data.slot.last_verified() else { return Ok(Err(data)) };
-    let Some(previous) = data.slot.get_output() else { return Ok(Err(data)) };
-    let Some(transitive) = previous.transitive else { return Ok(Err(data)) };
+    let Some(last_verified) = data.slot.last_verified() else { 
+        return Ok(Err(data))
+    };
+    let Some(previous) = data.slot.get_output() else { 
+        tracing::trace!("never finished executing");
+        return Ok(Err(data))
+    };
+    let Some(transitive) = previous.transitive else { 
+        tracing::trace!("invalidated");
+        return Ok(Err(data))
+    };
 
     if previous.dependencies.is_empty() {
         // the query does not depend on any side-effects, so is trivially verified.
@@ -31,7 +39,7 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
     let inputs = transitive.inputs;
     let durability = transitive.durability;
     if inputs_unchanged(runtime, last_verified, inputs, durability) {
-        tracing::debug!(reason = "inputs unchanged", "backdating");
+        tracing::debug!(reason = "inputs unchanged", ?inputs, ?durability, "backdating");
         return Ok(Ok(data.slot.backdate()));
     }
 
@@ -63,7 +71,7 @@ fn verify_deep<'a, Q: Query>(
         move |unchanged| match unchanged {
             None => Err(data),
             Some(transitive) => {
-                tracing::debug!(reason = "dependencies unchanged", "backdating");
+                tracing::debug!(reason = "dependencies unchanged", ?transitive, "backdating");
                 if let Some(previous) = data.slot.get_output() {
                     previous.transitive = Some(transitive);
                 }
@@ -129,6 +137,8 @@ impl Future for CheckDeepFuture<'_> {
                 );
                 return Poll::Ready(None);
             }
+
+            tracing::debug!("change: {:?}", change.transitive);
 
             self.transitive.extend(change.transitive);
         }

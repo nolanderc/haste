@@ -95,42 +95,36 @@ impl RangeBitSet {
     /// Attempts to insert an index into the bitset, returning `Err` if the index does not fit.
     pub fn insert(&mut self, index: u32) -> Result<(), BitSetFull> {
         if self.bits == 0 {
+            // the set is empty, so we can just insert
             self.first = index;
             self.bits = 1;
             return Ok(());
         }
 
-        if index >= self.first {
-            let i = index - self.first;
-            if i >= Self::BITS as u32 {
-                // the range spanned by the bitset is too small
-                return Err(BitSetFull);
-            }
-
+        // if `index >= first`;
+        let i = index.wrapping_sub(self.first);
+        if i < Self::BITS as u32 {
             // set the appropriate bit
             self.bits |= 1 << i;
+            return Ok(());
+        }
 
-            Ok(())
-        } else {
-            // attempt to shift the bits such that we make can set `first = index`
-
-            let diff = self.first - index;
-            if diff >= Self::BITS as u32 {
-                // the shift would erase all set bits
-                return Err(BitSetFull);
-            }
-
-            let rotated_bits = self.bits >> diff;
-
-            if self.bits != rotated_bits << diff {
+        // if `index < first`;
+        let i = self.first.wrapping_sub(index);
+        if i < Self::BITS as u32 {
+            // move the other bits up so that we can fit the new index
+            let rotated_bits = self.bits << i;
+            if self.bits != rotated_bits >> i {
                 // could not shift without losing information
                 return Err(BitSetFull);
             }
 
             self.first = index;
             self.bits = 1 | rotated_bits;
-            Ok(())
+            return Ok(());
         }
+
+        Err(BitSetFull)
     }
 
     pub fn contains(&self, index: u32) -> bool {
@@ -183,11 +177,17 @@ impl RangeBitSet {
     /// Creates two bit sets such that the first ends right before `mid`, and the second starts
     /// with `mid`.
     pub(crate) fn split_at_raw(&self, mid: u32) -> (BitSet, BitSet) {
-        let i = self.first - mid;
+        // i: 9 8 7 6 5 4 3 2 1 0
+        //          ^-mid       ^-first
+        let i = mid.wrapping_sub(self.first);
         debug_assert!(i <= Self::BITS as u32);
 
+        // we may not shift by 64, so treat special cases here:
         if i == 0 {
-            return (BitSet::new(), BitSet { bits: self.bits });
+            return (BitSet { bits: 0 }, BitSet { bits: self.bits });
+        }
+        if i == Self::BITS as u32 {
+            return (BitSet { bits: self.bits }, BitSet { bits: 0 });
         }
 
         let left_bits = self.bits << (Self::BITS as u32 - i);

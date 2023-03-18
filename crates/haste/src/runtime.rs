@@ -301,7 +301,7 @@ impl Runtime {
                     earliest: current,
                     latest: current,
                 }),
-                durability: Durability::MEDIUM,
+                durability: Durability::DEFAULT,
             }
         } else {
             // initially derived queries don't depend on anything, so can be considered constants
@@ -314,6 +314,20 @@ impl Runtime {
             task: Some(TaskData::new::<Q>(this, transitive)),
             blocks: None,
         }
+    }
+
+    /// Sets the durability of the currently running query.
+    ///
+    /// # Panics
+    ///
+    /// Must only be called from within an `#[input]` query.
+    pub fn set_durability(&self, durability: Durability) {
+        ACTIVE.with(|active| {
+            let Some(mut task) = active.task.take() else { return };
+            assert!(task.is_input, "can only set durability of input queries");
+            task.transitive.durability = durability;
+            active.task.set(Some(task));
+        })
     }
 
     /// Register a dependency under the currently running query

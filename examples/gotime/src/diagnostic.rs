@@ -149,7 +149,6 @@ type FmtResult<T> = Result<T, std::fmt::Error>;
 #[derive(Default)]
 struct VisitedSet {
     formatted: HashSet<*const Inner>,
-    delta: Vec<*const Inner>,
 }
 
 impl Diagnostic {
@@ -170,6 +169,10 @@ impl Diagnostic {
         out: &mut impl Write,
         visited: &mut VisitedSet,
     ) -> FmtResult<()> {
+        if !visited.formatted.insert(Arc::as_ptr(&self.inner)) {
+            return Ok(());
+        }
+
         match &*self.inner {
             Inner::Message(message) => {
                 let severity_text = match message.severity {
@@ -185,7 +188,7 @@ impl Diagnostic {
                 )?;
 
                 let self_attachments = message.attachments.iter();
-                let other_attachments = attachments.iter().copied();
+                let other_attachments = attachments.iter().copied().rev();
                 for attachment in self_attachments.chain(other_attachments) {
                     attachment.format(message.severity, sources, out)?;
                 }
@@ -196,25 +199,13 @@ impl Diagnostic {
             }
             Inner::Attachment(parent, new_attachments) => {
                 attachments.extend(new_attachments.iter());
-
-                let delta_start = visited.delta.len();
-
                 parent.format(sources, attachments, out, visited)?;
-
-                for delta in visited.delta.drain(delta_start..) {
-                    visited.formatted.remove(&delta);
-                }
-
                 attachments.truncate(attachments.len() - new_attachments.len());
-
                 Ok(())
             }
             Inner::Combine(combined) => {
                 for diagnostic in combined {
-                    if visited.formatted.insert(Arc::as_ptr(&diagnostic.inner)) {
-                        visited.delta.push(Arc::as_ptr(&diagnostic.inner));
-                        diagnostic.format(sources, attachments, out, visited)?;
-                    }
+                    diagnostic.format(sources, attachments, out, visited)?;
                 }
                 Ok(())
             }
@@ -260,8 +251,6 @@ impl Label {
             })
             .collect::<String>();
 
-        dbg!(&self.text);
-        dbg!(range);
         let underline_width = (range.end.get() - range.start.get()) as usize;
         let underline = "^".repeat(underline_width.max(1));
 
@@ -323,7 +312,7 @@ impl std::fmt::Display for Style {
 
 #[derive(Debug)]
 struct SourceFileInfo<'db> {
-    text: &'db BStr,
+    text: Arc<BStr>,
     line_starts: &'db [u32],
     display_path: String,
 }
@@ -397,7 +386,6 @@ impl Diagnostic {
         for source in sources {
             let text = source_text(db, source)
                 .await
-                .as_deref()
                 .expect("span pointed to path that did not exist");
             let line_starts = line_starts(db, source).await.as_ref().unwrap().as_slice();
 

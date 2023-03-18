@@ -380,7 +380,7 @@ pub trait DatabaseExt: Database {
 
         let (storage, runtime) = self.storage_mut();
         let cache = storage.container_mut();
-        cache.remove(runtime, &input);
+        cache.invalidate(runtime, &input);
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T

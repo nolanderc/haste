@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use tokio::io::AsyncBufReadExt;
+use std::io::BufRead;
 
 use crate::{error, Result};
 
@@ -21,14 +21,12 @@ pub fn invalidate_path(db: &mut dyn crate::Db, path: Arc<Path>) {
 pub async fn read(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[u8]>> {
     db.touch_path(path.clone());
 
-    let bytes = tokio::fs::read(&*path)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                error!("file not found: `{}`", path.display())
-            }
-            _ => error!("could not read file `{}`: {}", path.display(), error),
-        })?;
+    let bytes = std::fs::read(&*path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            error!("file not found: `{}`", path.display())
+        }
+        _ => error!("could not read file `{}`: {}", path.display(), error),
+    })?;
 
     db.register_file(path, &bytes);
 
@@ -41,12 +39,10 @@ pub async fn list_dir(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[Arc<Pa
     db.touch_path(path.clone());
 
     async fn read_dir(path: Arc<Path>) -> std::io::Result<Arc<[Arc<Path>]>> {
-        let mut dir = tokio::fs::read_dir(path).await?;
-
         let mut sources = Vec::with_capacity(8);
 
-        while let Some(entry) = dir.next_entry().await? {
-            sources.push(Arc::from(entry.path()));
+        for entry in std::fs::read_dir(path)? {
+            sources.push(Arc::from(entry?.path()));
         }
 
         sources.sort();
@@ -90,8 +86,7 @@ impl Metadata {
 pub async fn metadata(db: &dyn crate::Db, path: Arc<Path>) -> Result<Metadata> {
     db.touch_path(path.clone());
 
-    let meta = tokio::fs::metadata(&*path)
-        .await
+    let meta = std::fs::metadata(&*path)
         .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;
 
     Ok(Metadata {
@@ -119,11 +114,10 @@ pub async fn is_dir(db: &dyn crate::Db, path: Arc<Path>) -> bool {
 pub async fn read_header(db: &dyn crate::Db, path: Arc<Path>) -> Result<String> {
     db.touch_path(path.clone());
 
-    let file = tokio::fs::File::open(&*path)
-        .await
+    let file = std::fs::File::open(&*path)
         .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;
 
-    let mut reader = tokio::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file);
 
     let mut text = String::with_capacity(1024);
     let mut in_block_comment = false;
@@ -133,7 +127,6 @@ pub async fn read_header(db: &dyn crate::Db, path: Arc<Path>) -> Result<String> 
 
         let count = reader
             .read_line(&mut text)
-            .await
             .map_err(|error| error!("could not read `{}`: {}", path.display(), error))?;
 
         if count == 0 {

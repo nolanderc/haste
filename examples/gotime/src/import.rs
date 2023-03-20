@@ -5,13 +5,14 @@ use std::{
 };
 
 use bstr::{BStr, ByteSlice};
+use futures::StreamExt as _;
 
 use crate::{
     common::Text,
     error, fs, process,
     span::{FileRange, Span},
     syntax,
-    util::future::try_join_all,
+    util::future::{IteratorExt, StreamExt},
     Result, SourcePath, Storage,
 };
 
@@ -117,7 +118,11 @@ impl FileSet {
     }
 
     pub async fn parse<'db>(&self, db: &'db dyn crate::Db) -> Result<Vec<&'db syntax::File>> {
-        try_join_all(self.iter().map(|path| syntax::parse_file(db, path))).await
+        self.iter()
+            .map(|path| syntax::parse_file(db, path))
+            .start_all()
+            .try_join_all()
+            .await
     }
 }
 
@@ -148,28 +153,48 @@ pub async fn file_set(db: &dyn crate::Db, mut files: Vec<Arc<Path>>) -> Result<F
 pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: Arc<Path>) -> Result<FileSet> {
     let entries = fs::list_dir(db, dir_path.clone()).await.as_deref()?;
 
-    let mut sources = Vec::with_capacity(entries.len());
-
-    for path in entries {
-        if !is_go_source_file(db, path.clone()).await {
-            continue;
-        }
-
-        let source = SourcePath::new(db, path.clone());
-        if !is_source_enabled(db, path.clone(), source).await? {
-            continue;
-        }
-
-        sources.push(source);
-    }
+    let sources = entries
+        .iter()
+        .map(|path| is_enabled_source_file(db, path.clone()))
+        .start_all()
+        .filter_map(|result| async move {
+            match result {
+                Ok(None) => None,
+                Ok(Some(source)) => Some(Ok(source)),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .try_join_all()
+        .await?;
 
     if sources.is_empty() {
-        return Err(error!("no source files found in `{}`", dir_path.display()));
+        return Err(error!(
+            "no applicable source files found in `{}`",
+            dir_path.display()
+        ));
     }
 
     Ok(FileSet {
         sources: Arc::from(sources),
     })
+}
+
+#[haste::query]
+#[clone]
+pub async fn is_enabled_source_file(
+    db: &dyn crate::Db,
+    path: Arc<Path>,
+) -> Result<Option<SourcePath>> {
+    if !is_go_source_file(db, path.clone()).await {
+        return Ok(None);
+    }
+
+    let source = SourcePath::new(db, path.clone());
+    if !is_source_enabled(db, path, source).await? {
+        return Ok(None);
+    }
+
+    Ok(Some(source))
 }
 
 async fn is_go_source_file(db: &dyn crate::Db, path: Arc<Path>) -> bool {
@@ -387,11 +412,16 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
 
 async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
     if tag == "gc" {
+        // we pretend to be the reference Go Compiler (GC)
         return Ok(true);
     }
 
     let goos = process::go_var(db, "GOOS").await.as_ref()?;
-    if tag == goos {
+    if tag == goos
+        || (tag == "linux" && goos == "android")
+        || (tag == "solaris" && goos == "illumos")
+        || (tag == "darwin" && goos == "ios")
+    {
         return Ok(true);
     }
 

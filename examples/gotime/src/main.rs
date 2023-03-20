@@ -4,17 +4,18 @@
 #![allow(clippy::uninlined_format_args)]
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
-use haste::DatabaseExt;
+use haste::{DatabaseExt, Durability};
 use notify::Watcher;
-use util::future::try_join_all;
 use util::future::FutureExt;
+use util::future::{IteratorExt, StreamExt as _};
 
 use crate::common::Text;
 use crate::diagnostic::error;
@@ -22,6 +23,7 @@ use crate::source::SourcePath;
 
 mod common;
 mod diagnostic;
+mod env;
 mod fs;
 mod import;
 mod key;
@@ -40,6 +42,7 @@ pub struct Storage(
     syntax::parse_file,
     import::resolve,
     import::file_set,
+    import::is_enabled_source_file,
     compile,
     compile_package_files,
 );
@@ -47,17 +50,29 @@ pub struct Storage(
 #[haste::database(Storage, fs::Storage, process::Storage)]
 pub struct Database {
     storage: haste::DatabaseStorage<Self>,
+    bytes: AtomicUsize,
     lines: AtomicUsize,
+    files: AtomicUsize,
     touched_paths: DashSet<Arc<Path>>,
+    cwd: Option<PathBuf>,
 }
 
 impl Database {
     pub fn new() -> Self {
         Self {
             storage: haste::DatabaseStorage::new(),
+            bytes: AtomicUsize::new(0),
             lines: AtomicUsize::new(0),
+            files: AtomicUsize::new(0),
             touched_paths: DashSet::new(),
+            cwd: std::env::current_dir().ok(),
         }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -69,17 +84,28 @@ pub trait Db:
 {
     /// Notifies the database that the filesystem is being accessed.
     fn touch_path(&self, path: Arc<Path>) {
-        _ = path;
+        let durability = self.path_durability_untracked(&path);
+        self.runtime().set_durability(durability);
     }
 
+    /// Used to cellect metrics about the accessed files.
     fn register_file(&self, path: Arc<Path>, contents: &[u8]) {
         _ = path;
         _ = contents;
+    }
+
+    /// Get the durability of the given path.
+    fn path_durability_untracked(&self, path: &Path) -> Durability {
+        _ = path;
+        Durability::MEDIUM
     }
 }
 
 impl Db for Database {
     fn touch_path(&self, path: Arc<Path>) {
+        let durability = self.path_durability_untracked(&path);
+        self.storage.runtime().set_durability(durability);
+
         self.touched_paths.insert(path);
     }
 
@@ -88,17 +114,48 @@ impl Db for Database {
         let lines = 1 + contents.iter().filter(|&&byte| byte == b'\n').count();
         self.lines
             .fetch_add(lines, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .fetch_add(contents.len(), std::sync::atomic::Ordering::Relaxed);
+        self.files
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn path_durability_untracked(&self, path: &Path) -> Durability {
+        if let Some(goroot) = crate::env::default::GOROOT {
+            if path.starts_with(goroot) {
+                return Durability::HIGH;
+            }
+        }
+
+        if let Some(cwd) = &self.cwd {
+            if path.starts_with(cwd) {
+                if path.extension() == Some(OsStr::new("go")) {
+                    return Durability::LOW;
+                } else {
+                    return Durability::MEDIUM;
+                }
+            }
+        }
+
+        Durability::DEFAULT
     }
 }
 
 #[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
 struct Arguments {
-    /// Path to the directory or files of the package to compile.
-    #[clap(value_parser = parse_arc_path)]
-    package: Vec<Arc<Path>>,
-
+    /// Watch files for changes and automatically rebuild the files using incremental compilation.
     #[clap(short, long)]
     watch: bool,
+
+    #[clap(flatten)]
+    config: CompileConfig,
+}
+
+#[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
+struct CompileConfig {
+    /// List of files or a directory which contains the main package.
+    #[clap(value_parser = parse_arc_path)]
+    package: Vec<Arc<Path>>,
 }
 
 fn parse_arc_path(text: &str) -> std::io::Result<Arc<Path>> {
@@ -210,9 +267,15 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
 
 fn run(db: &mut Database, arguments: Arguments) {
     let start = std::time::Instant::now();
+    let process = cpu_time::ProcessTime::now();
 
     haste::scope(db, |scope, db| {
-        let result = scope.block_on(compile(db, arguments));
+        process::go_var::prefetch(db, "GOROOT");
+        process::go_var::prefetch(db, "GOPATH");
+        process::go_var::prefetch(db, "GOOS");
+        process::go_var::prefetch(db, "GOARCH");
+
+        let result = scope.block_on(compile(db, arguments.config));
 
         match result {
             Ok(output) => {
@@ -228,20 +291,38 @@ fn run(db: &mut Database, arguments: Arguments) {
         }
     });
 
-    let lines = *db.lines.get_mut();
-    eprintln!("time: {:?}", start.elapsed());
+    let real = start.elapsed();
+    let cpu = process.elapsed();
+    eprintln!("real: {:?} (cpu: {:?})", real, cpu);
+
+    let bytes = std::mem::take(db.bytes.get_mut());
+    let lines = std::mem::take(db.lines.get_mut());
+    let files = std::mem::take(db.files.get_mut());
+
+    eprintln!(
+        "bytes: {} ({:.1} MB/s)",
+        bytes,
+        bytes as f64 / real.as_secs_f64() / 1e6
+    );
     eprintln!(
         "lines: {} ({:.1} K/s)",
         lines,
-        lines as f64 / start.elapsed().as_secs_f64() / 1e3
+        lines as f64 / real.as_secs_f64() / 1e3
     );
+
+    let mut time_per_file = format!("{:.1?}", real / files as u32);
+    let unit_start = time_per_file
+        .find(|ch: char| ch != '.' && !ch.is_ascii_digit())
+        .unwrap();
+    time_per_file.insert(unit_start, ' ');
+    eprintln!("files: {} ({}/file)", files, time_per_file);
 }
 
 /// Compile the program using the given arguments
 #[haste::query]
 #[clone]
-async fn compile(db: &dyn crate::Db, arguments: Arguments) -> Result<Arc<Package>> {
-    let files = import::file_set(db, arguments.package).await?;
+async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<Arc<Package>> {
+    let files = import::file_set(db, config.package).await?;
     compile_package_files(db, files).await
 }
 
@@ -286,23 +367,26 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
             for import in ast.imports.iter() {
                 let resolved =
                     import::resolve(db, import.path.text, go_mod).with_context(|error| {
-                        error.label(
-                            ast.span(None, import.path.span),
-                            "could not resolve the import",
-                        )
+                        let span = ast.span(None, import.path.span);
+                        error.label(span, "could not resolve the import")
                     });
-                futures.push(async move { Ok((resolved.await?, ast, import.path)) });
+
+                futures.push(async move {
+                    Ok(
+                        compile_package_files(db, resolved.await?).with_context(move |error| {
+                            let span = ast.span(None, import.path.span);
+                            error
+                                .note(format!("imported from `{}`", db.fmt(package_name)))
+                                .label(span, "while compiling this package")
+                        }),
+                    )
+                })
             }
         }
     }
 
-    let resolved = try_join_all(futures).await?;
-    let packages = try_join_all(resolved.into_iter().map(|(resolved, ast, path)| {
-        compile_package_files(db, resolved).with_context(move |error| {
-            error.label(ast.span(None, path.span), "while compiling this import")
-        })
-    }))
-    .await?;
+    let resolved = futures.start_all().try_join_all().await?;
+    let packages = resolved.start_all().try_join_all().await?;
 
     let mut package_names = Vec::with_capacity(packages.len());
     for package in packages.iter() {
@@ -316,13 +400,6 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     for ast in asts.iter() {
         imports.push(packages.by_ref().take(ast.imports.len()).collect());
     }
-
-    // eprintln!(
-    //     "[{}] -- {:?} -- {:?}",
-    //     db.fmt(package_name),
-    //     start.elapsed(),
-    //     package_names
-    // );
 
     Ok(Arc::new(Package {
         name: package_name,

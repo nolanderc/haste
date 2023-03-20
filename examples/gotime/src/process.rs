@@ -15,7 +15,16 @@ pub async fn command(
     args: Arc<[Arc<str>]>,
     cwd: Option<Arc<Path>>,
 ) -> Result<std::process::Output, String> {
-    let mut command = tokio::process::Command::new(&*command);
+    eprintln!(
+        "command: {:?} {}",
+        command,
+        args.iter()
+            .map(|arg| format!("{:?}", arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut command = std::process::Command::new(&*command);
     command.args(args.iter().map(|arg| &**arg));
 
     if let Some(cwd) = cwd {
@@ -23,7 +32,9 @@ pub async fn command(
     }
 
     command.stdin(std::process::Stdio::null());
-    command.output().await.map_err(|error| error.to_string())
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.output().map_err(|error| error.to_string())
 }
 
 pub async fn go(
@@ -66,25 +77,19 @@ pub async fn go_var(db: &dyn crate::Db, name: &'static str) -> Result<OsString> 
     }
 
     // fast path for common variables:
-    #[cfg(target_family = "unix")]
-    match name {
-        "GOROOT" => return Ok("/usr/local/go".into()),
-        "GOPATH" => {
-            if let Some(mut home) = std::env::var_os("HOME") {
-                if !home.is_empty() {
-                    home.push("/go");
-                    return Ok(home);
-                }
-            }
-        }
-        _ => {}
+    if let Some(default) = crate::env::default::get(name) {
+        return Ok(default);
     }
 
-    let output = go(db, ["env", name], None)
+    // otherwise we rely on the reference go compiler:
+    let result = go(db, ["env", name], None)
         .await
-        .map_err(|_| error!("the environment variable `{name}` is not set"))?;
+        .map(|output| output.trim());
 
-    Ok(output.to_os_str_lossy().into())
+    match result {
+        Ok(output) if !output.is_empty() => Ok(output.to_os_str_lossy().into()),
+        _ => Err(error!("the environment variable `{name}` is not set")),
+    }
 }
 
 pub async fn go_var_path<'db>(db: &'db dyn crate::Db, name: &'static str) -> Result<&'db Path> {

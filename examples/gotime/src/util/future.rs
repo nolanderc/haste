@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin, task::Poll};
 
+use futures::Stream;
+
 use crate::Diagnostic;
 
 use super::Fallible;
@@ -40,28 +42,129 @@ where
     }
 }
 
-pub async fn try_join_all<F>(
-    items: impl IntoIterator<Item = F>,
-) -> crate::Result<Vec<<F::Output as Fallible>::Success>>
+pub trait IteratorExt: IntoIterator {
+    fn start_all(self) -> StartAllStream<Self::Item>
+    where
+        Self: Sized,
+    {
+        StartAllStream::new(self)
+    }
+}
+
+impl<T> IteratorExt for T where T: IntoIterator {}
+
+#[pin_project::pin_project]
+pub struct StartAllStream<T> {
+    items: std::vec::IntoIter<T>,
+    #[pin]
+    curr: Option<T>,
+}
+
+impl<T> StartAllStream<T> {
+    pub fn new(iterator: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            items: Vec::from_iter(iterator).into_iter(),
+            curr: None,
+        }
+    }
+}
+
+impl<T> Stream for StartAllStream<T>
 where
-    F: std::future::Future,
-    F::Output: Fallible,
+    T: Future,
 {
-    let futures = Vec::from_iter(items);
+    type Item = T::Output;
 
-    let mut outputs = Vec::with_capacity(futures.len());
-    let mut errors = Vec::new();
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
 
-    for future in futures {
-        match future.await.into_result() {
-            Ok(output) => outputs.push(output),
-            Err(error) => errors.push(error),
+        if this.curr.is_none() {
+            this.curr.set(this.items.next());
+        }
+
+        match this.curr.as_mut().as_pin_mut() {
+            None => Poll::Ready(None),
+            Some(item) => {
+                let value = std::task::ready!(item.poll(cx));
+                this.curr.set(None);
+                Poll::Ready(Some(value))
+            }
         }
     }
 
-    if errors.is_empty() {
-        Ok(outputs)
-    } else {
-        Err(crate::Diagnostic::combine(errors.into_iter()))
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.items.len() + self.curr.is_some() as usize;
+        (len, Some(len))
+    }
+}
+
+pub trait StreamExt: Stream {
+    fn try_join_all(self) -> TryJoinAll<Self>
+    where
+        Self: Sized,
+        Self::Item: Fallible,
+    {
+        TryJoinAll::new(self)
+    }
+}
+
+impl<T> StreamExt for T where T: Stream {}
+
+#[pin_project::pin_project]
+pub struct TryJoinAll<S>
+where
+    S: Stream,
+    S::Item: Fallible,
+{
+    #[pin]
+    stream: S,
+    errors: Vec<crate::Diagnostic>,
+    values: Vec<<S::Item as Fallible>::Success>,
+}
+
+impl<S> TryJoinAll<S>
+where
+    S: Stream,
+    S::Item: Fallible,
+{
+    pub fn new(stream: S) -> Self {
+        let len = match stream.size_hint() {
+            (min, Some(max)) if 2 * min >= max || max <= 32 => max,
+            (min, _) => min,
+        };
+        Self {
+            stream,
+            errors: Vec::new(),
+            values: Vec::with_capacity(len),
+        }
+    }
+}
+
+impl<S> Future for TryJoinAll<S>
+where
+    S: Stream,
+    S::Item: Fallible,
+{
+    type Output = crate::Result<Vec<<S::Item as Fallible>::Success>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        while let Some(result) = std::task::ready!(this.stream.as_mut().poll_next(cx)) {
+            match result.into_result() {
+                Ok(value) => this.values.push(value),
+                Err(error) => this.errors.push(error),
+            }
+        }
+
+        if this.errors.is_empty() {
+            Poll::Ready(Ok(std::mem::take(this.values)))
+        } else {
+            let errors = std::mem::take(this.errors);
+            Poll::Ready(Err(crate::Diagnostic::combine(errors.into_iter())))
+        }
     }
 }

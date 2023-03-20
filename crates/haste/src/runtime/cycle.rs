@@ -51,8 +51,11 @@ impl CycleGraph {
         if let Some(previous) = self.vertices.insert(source, vertex) {
             panic!(
                 concat!(
-                    "the query `{:?}` is blocked on two queries at once (`{:?}` and `{:?}`)",
-                    "\nhelp: use `spawn` or `prefetch` to evaluate queries concurrently"
+                    "a query is blocked on two queries at once",
+                    "\nhelp: use `spawn` or `prefetch` to evaluate queries concurrently",
+                    "\n- query: {:?}",
+                    "\n    - blocked on: {:?}",
+                    "\n    - blocked on: {:?}",
                 ),
                 crate::util::fmt::ingredient(db, source),
                 crate::util::fmt::ingredient(db, previous.blocked_on),

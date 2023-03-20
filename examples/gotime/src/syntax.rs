@@ -1,4 +1,4 @@
-mod parse;
+pub mod parse;
 mod print;
 
 use std::num::{NonZeroU16, NonZeroUsize};

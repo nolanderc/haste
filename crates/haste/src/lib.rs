@@ -22,6 +22,7 @@ use futures_lite::FutureExt;
 pub use haste_macros::*;
 pub use query_cache::*;
 pub use revision::Revision;
+use runtime::QueryMetrics;
 pub use runtime::{Cycle, CycleStrategy, Dependency, Runtime};
 pub use storage::*;
 
@@ -48,7 +49,6 @@ impl std::fmt::Display for Id {
         write!(f, "{}", self.raw)
     }
 }
-
 
 impl Id {
     pub(crate) fn new(raw: NonMaxU32) -> Self {
@@ -81,6 +81,13 @@ pub trait Database: Sync {
 
     /// Get a type-erased pointer to a storage of the given type.
     fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any>;
+
+    /// Called when a query finishes executing. Allows the database to instrument how long
+    /// different queries take to execute.
+    fn register_metrics(&self, path: IngredientPath, metrics: QueryMetrics) {
+        _ = path;
+        _ = metrics;
+    }
 }
 
 impl dyn Database {
@@ -139,8 +146,8 @@ where
 pub trait Query: Ingredient {
     type Input: Eq + Clone + Send + Sync + 'static;
     type Output: Eq + Send + Sync + 'static;
-    type Future<'db>: Future<Output = Self::Output> + Send;
-    type RecoverFuture<'db>: Future<Output = Self::Output> + Send;
+    type Future<'db>: Future<Output = Self::Output> + Send + 'db;
+    type RecoverFuture<'db>: Future<Output = Self::Output> + Send + 'db;
 
     /// Determines if this is an input query.
     ///

@@ -529,15 +529,15 @@ impl<'a> Parser<'a> {
         let package = self.package()?;
         let imports = self.imports()?;
 
-        if !imports.is_empty() {
-            // prefetch the imports:
-            let path = self.path.path(self.db).clone();
-            if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
-                for import in imports.iter() {
-                    crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
-                }
-            }
-        }
+        // if !imports.is_empty() {
+        //     // prefetch the imports:
+        //     let path = self.path.path(self.db).clone();
+        //     if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
+        //         for import in imports.iter() {
+        //             crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
+        //         }
+        //     }
+        // }
 
         let declarations = self.declarations()?;
         self.expect_eof()?;

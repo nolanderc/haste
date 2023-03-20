@@ -123,7 +123,8 @@ impl Executor {
     pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(8);
+            .unwrap_or(8)
+            .saturating_sub(1);
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))

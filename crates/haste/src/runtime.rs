@@ -7,7 +7,7 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    task::{Poll, Waker},
+    task::{Poll, Waker}, time::Duration,
 };
 
 use crate::{
@@ -200,6 +200,11 @@ pub(crate) struct ExecFuture<'db, Q: Query> {
     inner: ExecFutureInner<'db, Q>,
     /// The query is currently blocking this query.
     blocks: Option<IngredientPath>,
+
+    /// Amount of time spent polling the query.
+    duration: std::time::Duration,
+    /// When the task was first polled.
+    start: Option<std::time::Instant>,
 }
 
 #[pin_project::pin_project(project = ExecFutureInnerProj)]
@@ -246,11 +251,18 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
 
             let restore_guard = CallOnDrop(|| *this.task = active.task.replace(old_task.take()));
 
+            let start = std::time::Instant::now();
+            if this.start.is_none() {
+                *this.start = Some(start);
+            }
+
             // poll the query for completion
             let poll_inner = match this.inner.project() {
                 ExecFutureInnerProj::Eval(eval) => eval.poll(cx),
                 ExecFutureInnerProj::Recover(recover) => recover.poll(cx),
             };
+
+            *this.duration += start.elapsed();
 
             // restore the previous task
             drop(restore_guard);
@@ -275,8 +287,13 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
 
             // if the query completed, we can return it
             let output = std::task::ready!(poll_inner);
-
             let data = this.task.take().unwrap();
+
+            let metrics = QueryMetrics {
+                poll_duration: *this.duration,
+                total_duration: this.start.unwrap().elapsed(),
+            };
+            this.db.register_metrics(data.this, metrics);
 
             Poll::Ready(ExecutionResult {
                 output,
@@ -313,6 +330,8 @@ impl Runtime {
             inner: ExecFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new::<Q>(this, transitive)),
             blocks: None,
+            duration: std::time::Duration::ZERO,
+            start: None,
         }
     }
 
@@ -474,4 +493,13 @@ impl Runtime {
         // cancel all running tasks and wait for shutdown
         assert!(self.executor.stop(), "could not stop runtime scheduler");
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryMetrics {
+    /// Amount of spent polling the query for completion.
+    pub poll_duration: Duration,
+
+    /// Total amonut of time from when the query was first polled and when it was completed.
+    pub total_duration: Duration,
 }

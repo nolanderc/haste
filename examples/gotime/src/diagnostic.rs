@@ -37,7 +37,7 @@ enum Inner {
     Message(Message),
     /// Some additional information attached to some other diagnostic
     Attachment(Diagnostic, SmallVec<[Attachment; 1]>),
-    /// Multiple diagnostics combined into one
+    /// Multiple diagnostics combined into one.
     Combine(Vec<Diagnostic>),
 }
 
@@ -68,6 +68,7 @@ impl Severity {
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum Attachment {
     Label(Label),
+    Note(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -116,15 +117,6 @@ impl Diagnostic {
         Self::new(Inner::Combine(others))
     }
 
-    /// Attach a label to the diagnostic
-    pub fn label(self, span: Span, text: impl ToString) -> Self {
-        self.attach(Attachment::Label(Label {
-            severity: None,
-            span,
-            text: text.to_string(),
-        }))
-    }
-
     fn attach(mut self, attachment: Attachment) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             match inner {
@@ -141,6 +133,19 @@ impl Diagnostic {
         }
 
         Diagnostic::new(Inner::Attachment(self, [attachment].into()))
+    }
+
+    /// Attach a label to the diagnostic
+    pub fn label(self, span: Span, text: impl ToString) -> Self {
+        self.attach(Attachment::Label(Label {
+            severity: None,
+            span,
+            text: text.to_string(),
+        }))
+    }
+
+    pub fn note(self, note: impl ToString) -> Self {
+        self.attach(Attachment::Note(note.to_string()))
     }
 }
 
@@ -168,9 +173,11 @@ impl Diagnostic {
         attachments: &mut Vec<&'a Attachment>,
         out: &mut impl Write,
         visited: &mut VisitedSet,
-    ) -> FmtResult<()> {
+    ) -> FmtResult<bool> {
+        let mut formatted = false;
+
         if !visited.formatted.insert(Arc::as_ptr(&self.inner)) {
-            return Ok(());
+            return Ok(formatted);
         }
 
         match &*self.inner {
@@ -189,27 +196,30 @@ impl Diagnostic {
 
                 let self_attachments = message.attachments.iter();
                 let other_attachments = attachments.iter().copied().rev();
-                for attachment in self_attachments.chain(other_attachments) {
-                    attachment.format(message.severity, sources, out)?;
+
+                let last_message = (message.attachments.len() + attachments.len()).wrapping_sub(1);
+                for (i, attachment) in self_attachments.chain(other_attachments).enumerate() {
+                    let last = last_message == i;
+                    attachment.format(message.severity, sources, last, out)?;
                 }
 
-                writeln!(out)?;
-
-                Ok(())
+                formatted = true;
             }
             Inner::Attachment(parent, new_attachments) => {
-                attachments.extend(new_attachments.iter());
-                parent.format(sources, attachments, out, visited)?;
+                attachments.extend(new_attachments.iter().rev());
+                formatted = parent.format(sources, attachments, out, visited)?;
                 attachments.truncate(attachments.len() - new_attachments.len());
-                Ok(())
             }
             Inner::Combine(combined) => {
                 for diagnostic in combined {
-                    diagnostic.format(sources, attachments, out, visited)?;
+                    if diagnostic.format(sources, attachments, out, visited)? {
+                        writeln!(out)?;
+                        formatted = true;
+                    }
                 }
-                Ok(())
             }
         }
+        Ok(formatted)
     }
 }
 
@@ -218,10 +228,15 @@ impl Attachment {
         &self,
         parent_severity: Severity,
         sources: &HashMap<SourcePath, SourceFileInfo>,
+        last: bool,
         out: &mut impl Write,
     ) -> FmtResult<()> {
+        use Style::*;
         match self {
-            Attachment::Label(label) => label.format(parent_severity, sources, out),
+            Attachment::Label(label) => label.format(parent_severity, sources, last, out),
+            Attachment::Note(note) => {
+                writeln!(out, "{Bold}{Green}note: {Default}{Bold}{note}{Default}")
+            }
         }
     }
 }
@@ -231,8 +246,11 @@ impl Label {
         &self,
         parent_severity: Severity,
         sources: &HashMap<SourcePath, SourceFileInfo>,
+        last: bool,
         out: &mut impl Write,
     ) -> FmtResult<()> {
+        use Style::*;
+
         let range = self.span.range;
         let source = &sources[&self.span.path];
         let line = source.line_index(range.start.get());
@@ -254,22 +272,18 @@ impl Label {
         let underline_width = (range.end.get() - range.start.get()) as usize;
         let underline = "^".repeat(underline_width.max(1));
 
-        let reset = Style::Default;
-        let blue = Style::Blue;
-        let italic = Style::Italic;
-        let bold = Style::Bold;
         let severity = parent_severity.style();
 
         writeln!(
             out,
-            "{bold}{blue}{}-->{reset} {italic}{blue}{}{reset}",
-            gutter, source.display_path
+            "{Bold}{Blue}{}-->{Default} {Italic}{Underline}{Dim}{}:{}{Default}",
+            gutter, source.display_path, line + 1
         )?;
-        writeln!(out, "{bold}{blue}{} |{reset}", gutter)?;
-        writeln!(out, "{bold}{blue}{} |{reset} {}", line + 1, line_text)?;
+        writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
+        writeln!(out, "{Bold}{Blue}{} |{Default} {}", line + 1, line_text)?;
         write!(
             out,
-            "{bold}{blue}{} |{reset} {severity}{}{}",
+            "{Bold}{Blue}{} |{Default} {severity}{}{}",
             gutter, underline_offset, underline
         )?;
         if self.text.is_empty() {
@@ -277,7 +291,11 @@ impl Label {
         } else {
             writeln!(out, " {}", self.text)?;
         }
-        write!(out, "{reset}")?;
+        write!(out, "{Default}")?;
+
+        if !last {
+            writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
+        }
 
         Ok(())
     }
@@ -286,13 +304,18 @@ impl Label {
 #[allow(dead_code)]
 enum Style {
     Default,
+
     Red,
     Yellow,
     Blue,
     Cyan,
     Gray,
+    Green,
+
     Bold,
     Italic,
+    Underline,
+    Dim,
 }
 
 impl std::fmt::Display for Style {
@@ -300,12 +323,15 @@ impl std::fmt::Display for Style {
         match self {
             Style::Default => write!(f, "\x1b[m"),
             Style::Red => write!(f, "\x1b[31m"),
+            Style::Green => write!(f, "\x1b[32m"),
             Style::Yellow => write!(f, "\x1b[33m"),
             Style::Blue => write!(f, "\x1b[34m"),
             Style::Cyan => write!(f, "\x1b[36m"),
             Style::Gray => write!(f, "\x1b[37m"),
             Style::Bold => write!(f, "\x1b[1m"),
             Style::Italic => write!(f, "\x1b[3m"),
+            Style::Underline => write!(f, "\x1b[4m"),
+            Style::Dim => write!(f, "\x1b[2m"),
         }
     }
 }
@@ -373,6 +399,7 @@ impl Diagnostic {
             for attachment in attachments {
                 let path = match attachment {
                     Attachment::Label(label) => label.span.path,
+                    Attachment::Note(_) => continue,
                 };
 
                 if sources.insert(path) {

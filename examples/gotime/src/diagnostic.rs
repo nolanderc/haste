@@ -3,12 +3,9 @@ mod macros;
 
 pub(crate) use self::macros::*;
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write,
-    sync::Arc,
-};
+use std::{fmt::Write, sync::Arc};
 
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use bstr::{BStr, ByteSlice};
 use haste::DatabaseExt;
 use smallvec::SmallVec;
@@ -109,11 +106,11 @@ impl Diagnostic {
     }
 
     pub fn push(&mut self, other: Diagnostic) {
-        if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
-            list.push(other);
-            return;
-        }
-
+        // if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
+        //     list.push(other);
+        //     return;
+        // }
+        //
         *self = Self::combine([self.clone(), other])
     }
 
@@ -164,10 +161,6 @@ impl Diagnostic {
         let mut visited = VisitedSet::default();
         self.format(&sources, &mut Vec::new(), out, &mut visited)?;
 
-        if matches!(&*self.inner, Inner::Message(_)) {
-            writeln!(out)?;
-        }
-
         Ok(())
     }
 
@@ -194,7 +187,7 @@ impl Diagnostic {
                 let reset = Style::Default;
                 writeln!(
                     out,
-                    "{bold}{severity_style}{}:{reset} {bold}{}",
+                    "{bold}{severity_style}{}:{reset} {bold}{}{reset}",
                     severity_text, message.text
                 )?;
 
@@ -217,7 +210,6 @@ impl Diagnostic {
             Inner::Combine(combined) => {
                 for diagnostic in combined {
                     if diagnostic.format(sources, attachments, out, visited)? {
-                        writeln!(out)?;
                         formatted = true;
                     }
                 }
@@ -301,6 +293,8 @@ impl Label {
 
         if !last {
             writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
+        } else {
+            writeln!(out)?;
         }
 
         Ok(())
@@ -380,11 +374,18 @@ type SourceSet<'db> = HashMap<SourcePath, SourceFileInfo<'db>>;
 
 impl Diagnostic {
     async fn get_source_infos<'db>(&self, db: &'db dyn crate::Db) -> SourceSet<'db> {
-        let mut sources = HashSet::new();
+        let mut sources = HashSet::default();
+
+        let mut visited = HashSet::default();
 
         let mut diagnostic_stack = Vec::new();
         let mut next = Some(self);
         while let Some(current) = next.take() {
+            if !visited.insert(Arc::as_ptr(&current.inner)) {
+                next = diagnostic_stack.pop();
+                continue;
+            }
+
             let attachments = match &*current.inner {
                 Inner::Message(message) => {
                     next = diagnostic_stack.pop();
@@ -395,8 +396,8 @@ impl Diagnostic {
                     attachments.as_slice()
                 }
                 Inner::Combine(children) => {
-                    let mut children = children.iter();
-                    next = children.next_back();
+                    let mut children = children.iter().rev();
+                    next = children.next();
                     diagnostic_stack.extend(children);
                     continue;
                 }
@@ -414,7 +415,8 @@ impl Diagnostic {
             }
         }
 
-        let mut infos = SourceSet::with_capacity(sources.len());
+        let mut infos = SourceSet::default();
+        infos.reserve(sources.len());
 
         for source in sources {
             let text = source_text(db, source)

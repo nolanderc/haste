@@ -12,6 +12,12 @@ pub struct IndexMap<K, V> {
     entries: Vec<(K, V)>,
 }
 
+impl<K, V> Default for IndexMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K, V> IndexMap<K, V> {
     pub const fn new() -> Self {
         Self {
@@ -37,11 +43,19 @@ impl<K, V> IndexMap<K, V> {
             return Some(std::mem::replace(&mut self.entries[index], (key, value)));
         }
 
+        self.insert_no_check(hash, key, value);
+        None
+    }
+
+    fn insert_no_check(&mut self, hash: u64, key: K, value: V) -> usize
+    where
+        K: Hash,
+    {
         let index = self.entries.len();
         self.entries.push((key, value));
         self.lookup
             .insert(hash, index as u32, Self::hash_fn(&self.entries));
-        None
+        index
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -67,6 +81,18 @@ impl<K, V> IndexMap<K, V> {
 
     pub fn get_index<Q>(&self, index: usize) -> &V {
         &self.entries[index].1
+    }
+
+    pub fn get_or_insert_with(&mut self, key: K, init: impl FnOnce() -> V) -> &mut V
+    where
+        K: Hash + Eq,
+    {
+        let hash = hash64(&key);
+        let index = match self.find(hash, &key) {
+            Some(index) => index,
+            None => self.insert_no_check(hash, key, init()),
+        };
+        &mut self.entries[index].1
     }
 
     fn find<'a>(&'a self, hash: u64, key: &'a K) -> Option<usize>
@@ -109,6 +135,15 @@ impl<K, V> IndexMap<K, V> {
 
     pub fn values(&self) -> impl Iterator<Item = &'_ V> {
         self.entries.iter().map(|(_, value)| value)
+    }
+}
+
+impl<K, V> IntoIterator for IndexMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::vec::IntoIter<(K, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
     }
 }
 

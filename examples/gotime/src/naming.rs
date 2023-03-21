@@ -6,6 +6,7 @@ use crate::{
     common::Text,
     error,
     import::{self, FileSet},
+    index_map::IndexMap,
     key::{Key, KeyOps},
     source::SourcePath,
     span::Span,
@@ -190,7 +191,10 @@ pub async fn file_scope(db: &dyn crate::Db, path: SourcePath) -> Result<HashMap<
     for (import, &package) in ast.imports.iter().zip(resolved_imports.iter()) {
         let name = match import.name {
             syntax::PackageName::Inherit => package_name(db, package).await?,
-            syntax::PackageName::Name(ident) => ident.text.unwrap(),
+            syntax::PackageName::Name(ident) => {
+                let Some(name) = ident.text else { continue };
+                name
+            }
             syntax::PackageName::Implicit => {
                 let exported = exported_decls(db, package).await.as_ref()?;
                 for &name in exported.iter() {
@@ -228,14 +232,12 @@ pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<Te
 /// Get all names defined within a single package.
 #[haste::query]
 pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap<Text, DeclPath>> {
-    for source in files.iter(db) {
-        file_scope::prefetch(db, source);
-    }
-
     let asts = files.lookup(db).parse(db).await?;
 
     let mut scope = HashMap::default();
-    let mut conflicts = HashMap::default();
+    let mut conflicts = IndexMap::default();
+
+    let init_name = Text::new(db, "init");
 
     for ast in asts {
         let mut register = |name: Text, index, sub| {
@@ -243,8 +245,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
             let decl = DeclPath { source, index, sub };
             if let Some(previous) = scope.insert(name, decl) {
                 conflicts
-                    .entry(name)
-                    .or_insert_with(|| vec![previous])
+                    .get_or_insert_with(name, || vec![previous])
                     .push(decl);
             }
         };
@@ -289,6 +290,11 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                 }
                 DeclKind::Function(func) => {
                     if let Some(name) = func.name.text {
+                        if name == init_name {
+                            // TODO: keep track of `init` function
+                            continue;
+                        }
+
                         let sub = SubIndex { row: 0, col: 0 };
                         register(name, index, sub);
                     }
@@ -362,6 +368,87 @@ pub enum Symbol {
     Decl(DeclId),
     /// Refers to a symbol defined in the local scope.
     Local(Local),
+    /// Refers to a builtin identifier (eg. `int`, `bool`, `true`, `len`, `iota`, etc.).
+    Builtin(Builtin),
+}
+
+macro_rules! define_builtin {
+    ($(
+        $ident:ident = $string:literal
+    ),* $(,)?) => {
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Builtin {
+            $($ident),*
+        }
+
+        impl std::fmt::Display for Builtin {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.ident().fmt(f)
+            }
+        }
+
+        impl Builtin {
+            const IDENTS: &[&'static str] = &[ $($string),* ];
+
+            pub fn ident(self) -> &'static str {
+                let index = self as u8 as usize;
+                Self::IDENTS[index]
+            }
+
+            const LOOKUP: &phf::Map<&'static str, Builtin> = &phf::phf_map! {
+                $( $string => Self::$ident ),*
+            };
+
+            pub fn lookup(name: &str) -> Option<Self> {
+                Self::LOOKUP.get(name).copied()
+            }
+        }
+    }
+}
+
+define_builtin! {
+    Bool = "bool",
+    Byte = "byte",
+    Complex64 = "complex64",
+    Complex128 = "complex128",
+    Error = "error",
+    Float32 = "float32",
+    Float64 = "float64",
+    Int = "int",
+    Int8 = "int8",
+    Int16 = "int16",
+    Int32 = "int32",
+    Int64 = "int64",
+    Uint = "uint",
+    Uint8 = "uint8",
+    Uint16 = "uint16",
+    Uint32 = "uint32",
+    Uint64 = "uint64",
+    Uintptr = "uintptr",
+    Rune = "rune",
+    String = "string",
+    True = "true",
+
+    False = "false",
+    Iota = "iota",
+    Nil = "nil",
+
+    Append = "append",
+    Cap = "cap",
+    Close = "close",
+    Complex = "complex",
+    Copy = "copy",
+    Delete = "delete",
+    Imag = "imag",
+    Len = "len",
+    Make = "make",
+    New = "new",
+    Panic = "panic",
+    Print = "print",
+    Println = "println",
+    Real = "real",
+    Recover = "recover",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

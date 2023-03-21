@@ -418,12 +418,31 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    if let Some(first) = first {
-        if GOOS_LIST.contains(&first) && GOARCH_LIST.contains(&last) {
-            return Ok(build_tag_enabled(db, first).await? && build_tag_enabled(db, last).await?);
-        }
-    } else if GOOS_LIST.contains(&last) || GOARCH_LIST.contains(&last) {
+    // we match any of: 
+    //  (1)   {name}_$GOOS.go
+    //  (2)   {name}_$GOARCH.go
+    //  (3)   {name}_$GOOS_$GOARCH.go
+
+    if GOOS_LIST.contains(&last) {
+        // must be case (1)
         return build_tag_enabled(db, last).await;
+    }
+
+    if !GOARCH_LIST.contains(&last) {
+        // we already did case (1), and cannot be case (2) or (3)
+        return Ok(true);
+    }
+
+    if !build_tag_enabled(db, last).await? {
+        // case (2) and (3): the ARCH is not enabled
+        return Ok(false);
+    }
+
+    if let Some(first) = first {
+        if GOOS_LIST.contains(&first) {
+            // check case (3)
+            return build_tag_enabled(db, first).await;
+        }
     }
 
     Ok(true)

@@ -15,8 +15,8 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use haste::Durability;
 use notify::Watcher;
-use util::future::FutureExt;
 use util::future::IteratorExt;
+use util::future::{FutureExt, StreamExt};
 
 use crate::common::Text;
 use crate::diagnostic::error;
@@ -309,7 +309,7 @@ fn run(db: &mut Database, arguments: Arguments) {
         lines as f64 / real.as_secs_f64() / 1e3
     );
 
-    let mut time_per_file = format!("{:.1?}", real / files as u32);
+    let mut time_per_file = format!("{:.1?}", real / files.max(1) as u32);
     let unit_start = time_per_file
         .find(|ch: char| ch != '.' && !ch.is_ascii_digit())
         .unwrap();
@@ -320,15 +320,12 @@ fn run(db: &mut Database, arguments: Arguments) {
 /// Compile the program using the given arguments
 #[haste::query]
 #[clone]
-async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<()> {
+async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<Arc<Package>> {
     let package = import::file_set(db, config.package).await?;
-    let main_id = naming::DeclId::new(package, Text::new(db, "main"));
-    dbg!(naming::decl_symbols(db, main_id).await.as_ref()?);
-    // compile_package_files(db, package).await
-    Ok(())
+    compile_package_files(db, package).await
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct Package {
     /// Name of the package.
     name: Text,
@@ -337,30 +334,7 @@ struct Package {
     files: import::FileSet,
 
     // For each file, the list of packages it imports.
-    imports: Vec<Vec<Arc<Package>>>,
-}
-
-impl std::fmt::Debug for Package {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut strukt = f.debug_struct(std::any::type_name::<Self>());
-        strukt.field("name", &self.name).field("files", &self.files);
-
-        haste::fmt::with_storage(|db| {
-            if let Some(db) = db {
-                let mut import_names = Vec::new();
-
-                for (file, imports) in self.files.lookup(db).iter().zip(self.imports.iter()) {
-                    let names = imports.iter().map(|import| import.name).collect::<Vec<_>>();
-                    import_names.push((file, names));
-                }
-
-                strukt.field("imports", &import_names);
-            }
-            Ok(())
-        })?;
-
-        strukt.finish()
-    }
+    import_names: Vec<Vec<Text>>,
 }
 
 #[haste::query]
@@ -370,51 +344,52 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let package_name = naming::package_name(db, files).await?;
 
     let import_count = asts.iter().map(|ast| ast.imports.len()).sum();
-    let mut futures = Vec::with_capacity(import_count);
+    let mut resolved = Vec::with_capacity(import_count);
 
     if import_count > 0 {
         let go_mod = import::closest_go_mod(db, asts[0].source.path(db).clone()).await?;
         for ast in asts.iter() {
             for import in ast.imports.iter() {
-                let resolved =
-                    import::resolve(db, import.path.text, go_mod).with_context(|error| {
+                resolved.push(import::resolve(db, import.path.text, go_mod).with_context(
+                    |error| {
                         let span = ast.span(None, import.path.span);
                         error.label(span, "could not resolve the import")
-                    });
-
-                futures.push(async move {
-                    Ok(
-                        compile_package_files(db, resolved.await?).with_context(move |error| {
-                            let span = ast.span(None, import.path.span);
-                            error
-                                .note(format!("imported from `{}`", package_name))
-                                .label(span, "while compiling this package")
-                        }),
-                    )
-                })
+                    },
+                ));
             }
         }
     }
 
-    let resolved = futures.try_join_all().await?;
-    let packages = resolved.try_join_all().await?;
+    let resolved = resolved.try_join_all().await?;
+    let packages = resolved
+        .iter()
+        .map(|&package| compile_package_files(db, package))
+        .start_all();
 
-    let mut package_names = Vec::with_capacity(packages.len());
-    for package in packages.iter() {
-        package_names.push(package.name.get(db));
-    }
-    package_names.sort();
-    package_names.dedup();
+    let package_names = resolved
+        .iter()
+        .map(|&package| naming::package_name(db, package))
+        .try_join_all()
+        .await?;
 
-    let mut packages = packages.into_iter();
-    let mut imports = Vec::with_capacity(asts.len());
+    let mut package_names = package_names.into_iter();
+    let mut import_names = Vec::with_capacity(asts.len());
     for ast in asts.iter() {
-        imports.push(packages.by_ref().take(ast.imports.len()).collect());
+        import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
+
+    let package_scope = naming::package_scope(db, files).await.as_ref()?;
+    let decls = package_scope
+        .keys()
+        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(files, name)))
+        .try_join_all()
+        .await?;
+
+    packages.try_join_all().await?;
 
     Ok(Arc::new(Package {
         name: package_name,
         files,
-        imports,
+        import_names,
     }))
 }

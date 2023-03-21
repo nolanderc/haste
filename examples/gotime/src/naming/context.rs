@@ -8,7 +8,7 @@ use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
 use crate::{error, Diagnostic, Result};
 
-use super::{DeclId, DeclPath, FileMember, Local, Symbol};
+use super::{Builtin, DeclId, DeclPath, FileMember, Local, Symbol};
 
 pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
@@ -58,6 +58,10 @@ impl<'db> NamingContext<'db> {
     }
 
     pub fn finish(mut self) -> Result<HashMap<NodeId, Symbol>> {
+        if let Some(diagnostic) = self.diagnostics {
+            return Err(diagnostic);
+        }
+
         self.resolved.shrink_to_fit();
         Ok(self.resolved)
     }
@@ -201,17 +205,9 @@ impl<'db> NamingContext<'db> {
             }
             Node::Composite(typ, composite) => {
                 self.resolve_type(typ);
-                self.resolve_range(match composite {
-                    syntax::CompositeRange::Value(nodes)
-                    | syntax::CompositeRange::KeyValue(nodes) => nodes,
-                });
+                self.resolve_composite(composite);
             }
-            Node::CompositeLiteral(composite) => {
-                self.resolve_range(match composite {
-                    syntax::CompositeRange::Value(nodes)
-                    | syntax::CompositeRange::KeyValue(nodes) => nodes,
-                });
-            }
+            Node::CompositeLiteral(composite) => self.resolve_composite(composite),
             Node::TypeAssertion(expr, typ) => {
                 self.resolve_expr(expr);
                 if let Some(typ) = typ {
@@ -269,7 +265,7 @@ impl<'db> NamingContext<'db> {
                     self.resolve_range(exprs);
                 }
                 for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(name) = self.nodes.kinds[node] else { 
+                    let Node::Name(name) = self.nodes.kinds[node] else {
                         self.emit(error!("variable declaration must bind to an identifier")
                             .label(self.node_span(node), "expected an identifier"));
                         continue;
@@ -325,6 +321,7 @@ impl<'db> NamingContext<'db> {
             }
 
             Node::If(init, cond, block, els) => {
+                self.local_scope.enter();
                 if let Some(init) = init {
                     self.resolve_stmt(init);
                 }
@@ -333,6 +330,7 @@ impl<'db> NamingContext<'db> {
                 if let Some(els) = els {
                     self.resolve_stmt(els);
                 }
+                self.local_scope.exit();
             }
 
             Node::Select(cases) => self.resolve_range(cases),
@@ -363,8 +361,12 @@ impl<'db> NamingContext<'db> {
 
                         self.local_scope.enter();
 
-                        if let Some(value) = value { self.local_scope.insert_local(value, node, 0) }
-                        if let Some(success) = success { self.local_scope.insert_local(success, node, 1) }
+                        if let Some(value) = value {
+                            self.local_scope.insert_local(value, node, 0)
+                        }
+                        if let Some(success) = success {
+                            self.local_scope.insert_local(success, node, 1)
+                        }
                         self.resolve_block(block);
 
                         self.local_scope.exit();
@@ -406,6 +408,7 @@ impl<'db> NamingContext<'db> {
             Node::Fallthrough => {}
 
             Node::For(init, cond, post, block) => {
+                self.local_scope.enter();
                 if let Some(init) = init {
                     self.resolve_stmt(init);
                 }
@@ -416,6 +419,7 @@ impl<'db> NamingContext<'db> {
                     self.resolve_stmt(post);
                 }
                 self.resolve_block(block);
+                self.local_scope.exit();
             }
             Node::ForRangePlain(list, block) => {
                 self.resolve_expr(list);
@@ -441,8 +445,12 @@ impl<'db> NamingContext<'db> {
                     let value = value.and_then(get_name);
 
                     self.local_scope.enter();
-                    if let Some(name) = index { self.local_scope.insert_local(name, node, 0) }
-                    if let Some(name) = value { self.local_scope.insert_local(name, node, 1) }
+                    if let Some(name) = index {
+                        self.local_scope.insert_local(name, node, 0)
+                    }
+                    if let Some(name) = value {
+                        self.local_scope.insert_local(name, node, 1)
+                    }
                     self.resolve_block(block);
                     self.local_scope.exit();
                 } else {
@@ -451,6 +459,22 @@ impl<'db> NamingContext<'db> {
                         self.resolve_expr(success);
                     }
                     self.resolve_block(block);
+                }
+            }
+        }
+    }
+
+    fn resolve_composite(&mut self, composite: syntax::CompositeRange) {
+        match composite {
+            syntax::CompositeRange::Value(values) => self.resolve_range(values),
+            syntax::CompositeRange::KeyValue(pairs) => {
+                let indirect = self.nodes.indirect(pairs);
+                for pair in indirect.chunks_exact(2) {
+                    let &[key, value] = pair else { unreachable!() };
+                    if !matches!(self.nodes.kinds[key.node], Node::Name(_)) {
+                        self.resolve_expr(key);
+                    }
+                    self.resolve_expr(value);
                 }
             }
         }
@@ -474,6 +498,10 @@ impl<'db> NamingContext<'db> {
                 package: self.package,
                 name,
             }));
+        }
+
+        if let Some(builtin) = Builtin::lookup(name.get(self.db)) {
+            return Some(Symbol::Builtin(builtin));
         }
 
         None
@@ -557,10 +585,8 @@ impl LocalScope {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let slot = entry.get_mut();
                 let old = std::mem::replace(slot, new);
-                if old.scope < scope {
-                    // the old slot could come back into scope
-                    slot.shadowed = Some(Box::new(old));
-                }
+                // the old slot could come back into scope:
+                slot.shadowed = Some(Box::new(old));
             }
         }
     }

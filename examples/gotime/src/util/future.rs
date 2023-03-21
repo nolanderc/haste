@@ -43,11 +43,28 @@ where
 }
 
 pub trait IteratorExt: IntoIterator {
+    /// Consume the `self` iterator, forcing evaluation of all its items, then returns a stream of
+    /// the futures' values.
+    ///
+    /// This can be used to spawn queries in the `haste` runtime, scheduling them for execution,
+    /// and then awaiting their results in parallel.
     fn start_all(self) -> StartAllStream<Self::Item>
     where
         Self: Sized,
+        Self::Item: Future,
     {
         StartAllStream::new(self)
+    }
+
+    /// Starts all futures in `self` in parallel, and returns a future which evaluates to their
+    /// results.
+    fn try_join_all(self) -> TryJoinAll<StartAllStream<Self::Item>>
+    where
+        Self: Sized,
+        Self::Item: Future,
+        <Self::Item as Future>::Output: Fallible,
+    {
+        TryJoinAll::new(StartAllStream::new(self))
     }
 }
 

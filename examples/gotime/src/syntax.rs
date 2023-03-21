@@ -118,11 +118,11 @@ pub struct Decl {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeclKind {
-    /// Points to either `TypeDef` or `TypeAlias`
+    /// Points to either `TypeDef`, `TypeAlias` or `TypeList`
     Type(NodeId),
-    /// Points to a `ConstDecl`
+    /// Points to a `ConstDecl` or `ConstList`
     Const(NodeId),
-    /// Points to a `VarDecl`
+    /// Points to a `VarDecl` or `VarList`
     Var(NodeId),
     /// A function
     Function(FuncDecl),
@@ -148,7 +148,7 @@ pub struct FunctionBody {
     /// List of all statements in the block.
     pub block: Block,
     /// List of all labels defined in the function.
-    pub labels: NodeRange,
+    pub labels: StmtRange,
 }
 
 /// Points to a sequence of nodes representing the parameters of a function.
@@ -204,6 +204,12 @@ impl Signature {
         let length = NonMaxU16::new(self.outputs).unwrap();
         NodeRange { start, length }
     }
+
+    pub fn inputs_and_outputs(&self) -> NodeRange {
+        let start = self.start;
+        let length = NonMaxU16::new(self.inputs.unsigned_abs() + self.outputs).unwrap();
+        NodeRange { start, length }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -237,9 +243,14 @@ pub struct NodeStorage {
     pub string_buffer: Box<BStr>,
 }
 
+pub trait IndirectRange {
+    type Output;
+    fn extract(self, indirect: &[NodeId]) -> &[Self::Output];
+}
+
 impl NodeStorage {
-    pub fn indirect(&self, range: NodeRange) -> &[NodeId] {
-        &self.indirect[range.indices()]
+    pub fn indirect<R: IndirectRange>(&self, range: R) -> &[R::Output] {
+        range.extract(&self.indirect)
     }
 
     pub fn parameter(&self, node: NodeId) -> Parameter {
@@ -247,6 +258,10 @@ impl NodeStorage {
             Node::Parameter(parameter) => parameter,
             kind => unreachable!("expected a parameter but found {kind:?}"),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.kinds.len()
     }
 }
 
@@ -289,8 +304,20 @@ impl NodeRange {
         start..end
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.length.get() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.length.get() as usize
+    }
+}
+
+impl IndirectRange for NodeRange {
+    type Output = NodeId;
+
+    fn extract(self, indirect: &[NodeId]) -> &[Self::Output] {
+        &indirect[self.indices()]
     }
 }
 
@@ -320,8 +347,14 @@ macro_rules! node_id_wrapper {
 
         #[allow(unused)]
         impl $id {
-            fn new(node: NodeId) -> Self {
+            pub fn new(node: NodeId) -> Self {
                 Self { node }
+            }
+        }
+
+        impl From<$id> for NodeId {
+            fn from(id: $id) -> NodeId {
+                id.node
             }
         }
 
@@ -340,6 +373,24 @@ macro_rules! node_id_wrapper {
         impl $range {
             fn new(nodes: NodeRange) -> Self {
                 Self { nodes }
+            }
+
+            pub fn len(&self) -> usize {
+                self.nodes.length.get() as usize
+            }
+        }
+
+        impl From<$range> for NodeRange {
+            fn from(range: $range) -> NodeRange {
+                range.nodes
+            }
+        }
+
+        impl IndirectRange for $range {
+            type Output = $id;
+            fn extract(self, indirect: &[NodeId]) -> &[Self::Output] {
+                let nodes = self.nodes.extract(indirect);
+                unsafe { std::slice::from_raw_parts(nodes.as_ptr().cast(), nodes.len()) }
             }
         }
     };
@@ -576,6 +627,16 @@ pub struct Block {
 pub enum AssignOrDefine {
     Assign,
     Define,
+}
+
+impl AssignOrDefine {
+    /// Returns `true` if the assign or define is [`Define`].
+    ///
+    /// [`Define`]: AssignOrDefine::Define
+    #[must_use]
+    pub fn is_define(&self) -> bool {
+        matches!(self, Self::Define)
+    }
 }
 
 /// A channel may be send-only, receive-only or bidirectional

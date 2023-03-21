@@ -202,14 +202,9 @@ impl Executor {
     where
         F: Future<Output = ()> + Send,
     {
-        assert_eq!(
-            self.shared.state.load(Relaxed),
-            State::Running,
-            concat!(
-                "can only spawn tasks on a running executor",
-                "\nhelp: call `haste::scope` to start the task executor"
-            )
-        );
+        if self.shared.state.load(Relaxed) != State::Running {
+            return;
+        }
 
         let task = Task::from_raw(task);
         self.shared.schedule(task);

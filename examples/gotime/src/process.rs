@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::Path, sync::Arc};
 
 use bstr::{BStr, ByteSlice};
+use haste::Durability;
 
 use crate::{error, Result};
 
@@ -15,15 +16,6 @@ pub async fn command(
     args: Arc<[Arc<str>]>,
     cwd: Option<Arc<Path>>,
 ) -> Result<std::process::Output, String> {
-    eprintln!(
-        "command: {:?} {}",
-        command,
-        args.iter()
-            .map(|arg| format!("{:?}", arg))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-
     let mut command = std::process::Command::new(&*command);
     command.args(args.iter().map(|arg| &**arg));
 
@@ -65,7 +57,9 @@ pub async fn go(
 
 #[haste::query]
 #[input]
-pub async fn env_var(_db: &dyn crate::Db, name: &'static str) -> Option<OsString> {
+pub async fn env_var(db: &dyn crate::Db, name: &'static str) -> Option<OsString> {
+    // enviroment variables should never change:
+    db.runtime().set_durability(Durability::CONSTANT);
     std::env::var_os(name)
 }
 

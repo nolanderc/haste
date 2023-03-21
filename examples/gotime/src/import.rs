@@ -5,16 +5,30 @@ use std::{
 };
 
 use bstr::{BStr, ByteSlice};
-use futures::StreamExt as _;
+use futures::Future;
 
 use crate::{
     common::Text,
     error, fs, process,
     span::{FileRange, Span},
     syntax,
-    util::future::{IteratorExt, StreamExt},
+    util::future::{FutureExt, IteratorExt},
     Result, SourcePath, Storage,
 };
+
+pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<Vec<FileSet>> {
+    let mut resolved = Vec::with_capacity(ast.imports.len());
+
+    let go_mod = closest_go_mod(db, ast.source.path(db).clone()).await?;
+    for import in ast.imports.iter() {
+        resolved.push(resolve(db, import.path.text, go_mod).with_context(|error| {
+            let span = ast.span(None, import.path.span);
+            error.label(span, "could not resolve the import")
+        }));
+    }
+
+    resolved.try_join_all().await
+}
 
 #[haste::query]
 #[clone]
@@ -93,18 +107,19 @@ pub async fn closest_go_mod(db: &dyn crate::Db, mut path: Arc<Path>) -> Result<O
 }
 
 /// A set of files which together represent an entire package.
+#[haste::intern(FileSet)]
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FileSet {
-    sources: Arc<[SourcePath]>,
+pub struct FileSetData {
+    pub sources: Arc<[SourcePath]>,
 }
 
-impl std::fmt::Debug for FileSet {
+impl std::fmt::Debug for FileSetData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl FileSet {
+impl FileSetData {
     pub fn iter(&self) -> impl Iterator<Item = SourcePath> + ExactSizeIterator + '_ {
         self.sources.iter().copied()
     }
@@ -117,12 +132,22 @@ impl FileSet {
         self.len() == 0
     }
 
-    pub async fn parse<'db>(&self, db: &'db dyn crate::Db) -> Result<Vec<&'db syntax::File>> {
+    pub fn parse<'db>(
+        &self,
+        db: &'db dyn crate::Db,
+    ) -> impl Future<Output = Result<Vec<&'db syntax::File>>> {
         self.iter()
             .map(|path| syntax::parse_file(db, path))
-            .start_all()
             .try_join_all()
-            .await
+    }
+}
+
+impl FileSet {
+    pub fn iter(
+        self,
+        db: &dyn crate::Db,
+    ) -> impl Iterator<Item = SourcePath> + ExactSizeIterator + '_ {
+        self.lookup(db).sources.iter().copied()
     }
 }
 
@@ -145,27 +170,25 @@ pub async fn file_set(db: &dyn crate::Db, mut files: Vec<Arc<Path>>) -> Result<F
         sources.push(SourcePath::new(db, file));
     }
 
-    Ok(FileSet {
-        sources: Arc::from(sources),
-    })
+    Ok(FileSet::insert(
+        db,
+        FileSetData {
+            sources: Arc::from(sources),
+        },
+    ))
 }
 
 pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: Arc<Path>) -> Result<FileSet> {
     let entries = fs::list_dir(db, dir_path.clone()).await.as_deref()?;
 
-    let sources = entries
+    let sources: Arc<[_]> = entries
         .iter()
         .map(|path| is_enabled_source_file(db, path.clone()))
-        .start_all()
-        .filter_map(|result| async move {
-            match result {
-                Ok(None) => None,
-                Ok(Some(source)) => Some(Ok(source)),
-                Err(error) => Some(Err(error)),
-            }
-        })
         .try_join_all()
-        .await?;
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
 
     if sources.is_empty() {
         return Err(error!(
@@ -174,13 +197,9 @@ pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: Arc<Path>) -> Resul
         ));
     }
 
-    Ok(FileSet {
-        sources: Arc::from(sources),
-    })
+    Ok(FileSet::insert(db, FileSetData { sources }))
 }
 
-#[haste::query]
-#[clone]
 pub async fn is_enabled_source_file(
     db: &dyn crate::Db,
     path: Arc<Path>,

@@ -95,7 +95,12 @@ impl Diagnostic {
     }
 
     /// Combine multiple diagnostics into one
-    pub fn combine(mut diagnostics: impl Iterator<Item = Diagnostic> + ExactSizeIterator) -> Self {
+    pub fn combine<I>(diagnostics: I) -> Self
+    where
+        I: IntoIterator<Item = Diagnostic>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut diagnostics = diagnostics.into_iter();
         if diagnostics.len() == 1 {
             diagnostics.next().unwrap()
         } else {
@@ -103,18 +108,13 @@ impl Diagnostic {
         }
     }
 
-    pub fn merge(mut self, mut others: Vec<Diagnostic>) -> Self {
-        if others.is_empty() {
-            return self;
-        }
-
+    pub fn push(&mut self, other: Diagnostic) {
         if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
-            list.append(&mut others);
-            return self;
+            list.push(other);
+            return;
         }
 
-        others.push(self);
-        Self::new(Inner::Combine(others))
+        *self = Self::combine([self.clone(), other])
     }
 
     fn attach(mut self, attachment: Attachment) -> Self {
@@ -163,6 +163,10 @@ impl Diagnostic {
 
         let mut visited = VisitedSet::default();
         self.format(&sources, &mut Vec::new(), out, &mut visited)?;
+
+        if matches!(&*self.inner, Inner::Message(_)) {
+            writeln!(out)?;
+        }
 
         Ok(())
     }
@@ -277,7 +281,9 @@ impl Label {
         writeln!(
             out,
             "{Bold}{Blue}{}-->{Default} {Italic}{Underline}{Dim}{}:{}{Default}",
-            gutter, source.display_path, line + 1
+            gutter,
+            source.display_path,
+            line + 1
         )?;
         writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
         writeln!(out, "{Bold}{Blue}{} |{Default} {}", line + 1, line_text)?;

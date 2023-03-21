@@ -7,7 +7,8 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    task::{Poll, Waker}, time::Duration,
+    task::{Poll, Waker},
+    time::Duration,
 };
 
 use crate::{
@@ -257,10 +258,10 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
             }
 
             // poll the query for completion
-            let poll_inner = match this.inner.project() {
+            let poll_inner = crate::fmt::scope(this.db.as_dyn(), || match this.inner.project() {
                 ExecFutureInnerProj::Eval(eval) => eval.poll(cx),
                 ExecFutureInnerProj::Recover(recover) => recover.poll(cx),
-            };
+            });
 
             *this.duration += start.elapsed();
 

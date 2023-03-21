@@ -79,7 +79,7 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     path: haste::IngredientPath,
                     f: &mut std::fmt::Formatter<'_>
                 ) -> std::fmt::Result {
-                    haste::fmt::wrap(self, f, |f| {
+                    haste::fmt::scope(self, || {
                         self.storage.get_path(self, path.container).fmt(path.resource, f)
                     })
                 }
@@ -91,7 +91,6 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                             return Some(&list.#storage_indices);
                         }
                     )*
-
                     None
                 }
             }

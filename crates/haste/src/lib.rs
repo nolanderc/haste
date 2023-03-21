@@ -480,7 +480,7 @@ where
             runtime,
             _phantom: PhantomData,
         };
-        f(scope, db)
+        crate::fmt::scope(db, || f(scope, db))
     };
 
     db.database_storage_mut().list_mut().0.end();

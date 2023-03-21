@@ -29,7 +29,7 @@ pub async fn parse(db: &dyn crate::Db, source: &BStr, path: SourcePath) -> crate
 
     match parser.file().await {
         Ok(file) => Ok(file),
-        Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics.into_iter())),
+        Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics)),
     }
 }
 
@@ -529,15 +529,15 @@ impl<'a> Parser<'a> {
         let package = self.package()?;
         let imports = self.imports()?;
 
-        // if !imports.is_empty() {
-        //     // prefetch the imports:
-        //     let path = self.path.path(self.db).clone();
-        //     if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
-        //         for import in imports.iter() {
-        //             crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
-        //         }
-        //     }
-        // }
+        if !imports.is_empty() {
+            // prefetch the imports:
+            let path = self.path.path(self.db).clone();
+            if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
+                for import in imports.iter() {
+                    crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
+                }
+            }
+        }
 
         let declarations = self.declarations()?;
         self.expect_eof()?;
@@ -1362,6 +1362,7 @@ impl<'a> Parser<'a> {
             this.data.node.indirect_stack.extend(nodes);
             Ok(())
         })?;
+        let labels = StmtRange::new(labels);
 
         Ok((FunctionBody { block, labels }, file_range))
     }
@@ -2794,7 +2795,7 @@ fn parse_integer<const BASE: u32>(text: &BStr) -> Result<IntegerBits, NumberErro
     let bits = match u64::try_from(value) {
         Ok(bits) => IntegerBits::Small(bits),
         Err(_) => {
-            eprintln!("TODO: intern large integers: {}", value);
+            tracing::warn!("TODO: intern large integers: {}", value);
             IntegerBits::Small(value as u64)
         }
     };

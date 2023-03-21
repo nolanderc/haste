@@ -144,10 +144,11 @@ fn getter_fn(input: &syn::DeriveInput, args: &crate::meta::Arguments) -> TokenSt
         output_type = syn::parse_quote! { &#output_type };
     }
 
-    let db_path = &args.db;
+    let storage_path = &args.storage;
+
     quote_spanned! {input.ident.span()=>
         #[allow(unused)]
-        pub fn lookup(self, db: &dyn #db_path) -> #output_type {
+        pub fn lookup(self, db: &(impl haste::WithStorage<#storage_path> + ?Sized)) -> #output_type {
             #extractor
         }
     }

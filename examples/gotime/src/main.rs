@@ -1,9 +1,10 @@
 #![feature(type_alias_impl_trait)]
+#![feature(trivial_bounds)]
 #![allow(clippy::manual_is_ascii_check)]
 #![allow(clippy::useless_format)]
 #![allow(clippy::uninlined_format_args)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -12,10 +13,10 @@ use std::sync::Arc;
 
 use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
-use haste::{DatabaseExt, Durability};
+use haste::Durability;
 use notify::Watcher;
 use util::future::FutureExt;
-use util::future::{IteratorExt, StreamExt as _};
+use util::future::IteratorExt;
 
 use crate::common::Text;
 use crate::diagnostic::error;
@@ -26,7 +27,9 @@ mod diagnostic;
 mod env;
 mod fs;
 mod import;
+mod index_map;
 mod key;
+mod naming;
 mod process;
 mod source;
 mod span;
@@ -41,13 +44,13 @@ pub struct Storage(
     source::line_starts,
     syntax::parse_file,
     import::resolve,
+    import::FileSet,
     import::file_set,
-    import::is_enabled_source_file,
     compile,
     compile_package_files,
 );
 
-#[haste::database(Storage, fs::Storage, process::Storage)]
+#[haste::database(Storage, fs::Storage, process::Storage, naming::Storage)]
 pub struct Database {
     storage: haste::DatabaseStorage<Self>,
     bytes: AtomicUsize,
@@ -81,6 +84,7 @@ pub trait Db:
     + haste::WithStorage<Storage>
     + haste::WithStorage<fs::Storage>
     + haste::WithStorage<process::Storage>
+    + haste::WithStorage<naming::Storage>
 {
     /// Notifies the database that the filesystem is being accessed.
     fn touch_path(&self, path: Arc<Path>) {
@@ -270,16 +274,11 @@ fn run(db: &mut Database, arguments: Arguments) {
     let process = cpu_time::ProcessTime::now();
 
     haste::scope(db, |scope, db| {
-        process::go_var::prefetch(db, "GOROOT");
-        process::go_var::prefetch(db, "GOPATH");
-        process::go_var::prefetch(db, "GOOS");
-        process::go_var::prefetch(db, "GOARCH");
-
         let result = scope.block_on(compile(db, arguments.config));
 
         match result {
             Ok(output) => {
-                dbg!(db.fmt(output));
+                eprintln!("output: {:#?}", output);
             }
             Err(diagnostic) => {
                 let mut string = String::with_capacity(4096);
@@ -321,42 +320,54 @@ fn run(db: &mut Database, arguments: Arguments) {
 /// Compile the program using the given arguments
 #[haste::query]
 #[clone]
-async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<Arc<Package>> {
-    let files = import::file_set(db, config.package).await?;
-    compile_package_files(db, files).await
+async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<()> {
+    let package = import::file_set(db, config.package).await?;
+    let main_id = naming::DeclId::new(package, Text::new(db, "main"));
+    dbg!(naming::decl_symbols(db, main_id).await.as_ref()?);
+    // compile_package_files(db, package).await
+    Ok(())
 }
 
 #[derive(PartialEq, Eq, Hash)]
 struct Package {
+    /// Name of the package.
     name: Text,
+
+    /// List of all files which are part of the package.
     files: import::FileSet,
 
-    // For each file, the list of packages it imports
+    // For each file, the list of packages it imports.
     imports: Vec<Vec<Arc<Package>>>,
 }
 
 impl std::fmt::Debug for Package {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut import_names = HashMap::new();
+        let mut strukt = f.debug_struct(std::any::type_name::<Self>());
+        strukt.field("name", &self.name).field("files", &self.files);
 
-        for (file, imports) in self.files.iter().zip(self.imports.iter()) {
-            let names = imports.iter().map(|import| import.name).collect::<Vec<_>>();
-            import_names.insert(file, names);
-        }
+        haste::fmt::with_storage(|db| {
+            if let Some(db) = db {
+                let mut import_names = Vec::new();
 
-        f.debug_struct(std::any::type_name::<Self>())
-            .field("name", &self.name)
-            .field("files", &self.files)
-            .field("imports", &import_names)
-            .finish()
+                for (file, imports) in self.files.lookup(db).iter().zip(self.imports.iter()) {
+                    let names = imports.iter().map(|import| import.name).collect::<Vec<_>>();
+                    import_names.push((file, names));
+                }
+
+                strukt.field("imports", &import_names);
+            }
+            Ok(())
+        })?;
+
+        strukt.finish()
     }
 }
 
 #[haste::query]
 #[clone]
 async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Result<Arc<Package>> {
-    let asts = files.parse(db).await?;
-    let package_name = package_name(db, &asts).await?.unwrap();
+    let asts = files.lookup(db).parse(db).await?;
+    let package_name = naming::package_name(db, files).await?;
 
     let import_count = asts.iter().map(|ast| ast.imports.len()).sum();
     let mut futures = Vec::with_capacity(import_count);
@@ -376,7 +387,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
                         compile_package_files(db, resolved.await?).with_context(move |error| {
                             let span = ast.span(None, import.path.span);
                             error
-                                .note(format!("imported from `{}`", db.fmt(package_name)))
+                                .note(format!("imported from `{}`", package_name))
                                 .label(span, "while compiling this package")
                         }),
                     )
@@ -385,8 +396,8 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         }
     }
 
-    let resolved = futures.start_all().try_join_all().await?;
-    let packages = resolved.start_all().try_join_all().await?;
+    let resolved = futures.try_join_all().await?;
+    let packages = resolved.try_join_all().await?;
 
     let mut package_names = Vec::with_capacity(packages.len());
     for package in packages.iter() {
@@ -406,39 +417,4 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         files,
         imports,
     }))
-}
-
-async fn package_name(db: &dyn crate::Db, asts: &[&syntax::File]) -> Result<Option<Text>> {
-    if asts.is_empty() {
-        return Ok(None);
-    }
-
-    let package_name = asts[0].package_name();
-
-    // make sure all files are part of the same package:
-    for i in 1..asts.len() {
-        if asts[i].package_name() != package_name {
-            return Err(error!(
-                "files `{}` and `{}` are part of different packages",
-                db.fmt(asts[0].source),
-                db.fmt(asts[i].source),
-            )
-            .label(
-                asts[0].package_span(),
-                format!(
-                    "this is part of the `{}` package",
-                    db.fmt(asts[0].package_name())
-                ),
-            )
-            .label(
-                asts[i].package_span(),
-                format!(
-                    "this is part of the `{}` package",
-                    db.fmt(asts[i].package_name())
-                ),
-            ));
-        }
-    }
-
-    Ok(Some(package_name))
 }

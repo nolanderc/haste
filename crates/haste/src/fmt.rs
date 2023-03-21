@@ -16,22 +16,27 @@ thread_local! {
     static FMT_DATABASE: Cell<Option<NonNull<dyn Database>>> = Cell::new(None);
 }
 
+/// Enter a scope within which it is possible access the database through `with_storage`
+pub fn scope<T>(db: &dyn Database, f: impl FnOnce() -> T) -> T {
+    // temporarily extend the lifetime of the database
+    //
+    // SAFETY: we make sure that the reference does not outlive this function.
+    let dyn_db: &(dyn Database + 'static) = unsafe { std::mem::transmute(db) };
+
+    FMT_DATABASE.with(|db| {
+        let previous = db.replace(Some(NonNull::from(dyn_db)));
+        let _restore_guard = CallOnDrop(|| db.set(previous));
+        f()
+    })
+}
+
 impl<'db, T> Adapter<'db, T> {
     pub fn new(db: &'db dyn Database, inner: T) -> Self {
         Self { db, inner }
     }
 
     fn enter(&self, f: impl FnOnce() -> std::fmt::Result) -> std::fmt::Result {
-        let dyn_db: &dyn Database = self.db;
-
-        // temporarily extend the lifetime of `self.db`:
-        let dyn_db: &(dyn Database + 'static) = unsafe { std::mem::transmute(dyn_db) };
-
-        FMT_DATABASE.with(|db| {
-            let previous = db.replace(Some(NonNull::from(dyn_db)));
-            let _restore_guard = CallOnDrop(|| db.set(previous));
-            f()
-        })
+        scope(self.db, f)
     }
 }
 

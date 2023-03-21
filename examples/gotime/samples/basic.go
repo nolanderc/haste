@@ -1,10 +1,7 @@
 package main
 
 import (
-    "io"
-    "io/fs"
-    "net"
-    "net/http"
+    "fmt"
 )
 
 func main() {

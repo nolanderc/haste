@@ -188,7 +188,6 @@ pub trait KeyOps {
     fn index(self) -> usize;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key<T> {
     raw: NonMaxU32,
     _phantom: PhantomData<*const T>,
@@ -196,6 +195,29 @@ pub struct Key<T> {
 
 unsafe impl<T> Send for Key<T> {}
 unsafe impl<T> Sync for Key<T> {}
+
+impl<T> Copy for Key<T> {}
+impl<T> Clone for Key<T> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> PartialEq for Key<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+impl<T> Eq for Key<T> {}
+
+impl<T> std::hash::Hash for Key<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw.hash(state)
+    }
+}
 
 impl<T> std::fmt::Debug for Key<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

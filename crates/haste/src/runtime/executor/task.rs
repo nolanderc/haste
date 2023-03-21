@@ -36,7 +36,9 @@ impl Drop for Task {
 
             // drop the inner future
             let ptr = header.future_ptr();
-            (header.vtable.drop)(ptr);
+            if header.state.try_drop() {
+                (header.vtable.drop)(ptr);
+            }
 
             // drop the header, and free the task's memory
             let layout = header.size_align.layout();
@@ -79,6 +81,7 @@ impl Task {
             let future = header.future_ptr();
             match (header.vtable.poll)(future, &mut cx) {
                 Poll::Ready(()) => {
+                    (header.vtable.drop)(future);
                     header.state.end_poll_ready();
                 }
                 Poll::Pending => {
@@ -349,6 +352,12 @@ impl TaskState {
         // - if it is finished it does not need to be rescheduled
         // - if it is already scheduled we don't have to do it again
         old & (IDLE | FINISHED | SCHEDULED) == IDLE
+    }
+
+    /// Attempt to drop the task.
+    fn try_drop(&mut self) -> bool {
+        let bits = *self.bits.get_mut();
+        bits & FINISHED == 0
     }
 }
 

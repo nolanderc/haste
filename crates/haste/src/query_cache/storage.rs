@@ -84,7 +84,6 @@ impl<Q: Query> QueryStorage<Q> {
         let end = u32::try_from(range.end).unwrap();
         let start = range.start as u32;
 
-        // TODO: compute the correct revisions
         OutputSlot {
             output: result.output,
             dependencies: DependencyRange::from(start..end),
@@ -212,20 +211,29 @@ pub struct TransitiveDependencies {
     pub inputs: Option<RevisionRange>,
 
     /// Durability of the inputs the query depends on.
-    pub durability: Durability,
+    pub input_durability: Durability,
+
+    /// If an input: this is the durability that was set during its execution (otherwise, `CONSTANT`).
+    pub set_durability: Durability,
 }
 
 impl TransitiveDependencies {
     /// Used by queries which don't depend on any inputs (ie. they are constant).
     pub const CONSTANT: Self = Self {
         inputs: None,
-        durability: Durability::CONSTANT,
+        input_durability: Durability::CONSTANT,
+        set_durability: Durability::CONSTANT,
     };
+
+    pub fn durability(self) -> Durability {
+        self.input_durability.min(self.set_durability)
+    }
 
     pub fn combine(self, other: Self) -> Self {
         Self {
             inputs: RevisionRange::join(self.inputs, other.inputs),
-            durability: std::cmp::min(self.durability, other.durability),
+            input_durability: std::cmp::min(self.input_durability, other.durability()),
+            set_durability: self.set_durability,
         }
     }
 
@@ -241,6 +249,11 @@ impl TransitiveDependencies {
                 latest: revision,
             }),
         );
+    }
+
+    pub(crate) fn update_inputs(&mut self, other: TransitiveDependencies) {
+        self.inputs = other.inputs;
+        self.input_durability = other.input_durability;
     }
 }
 
@@ -338,7 +351,8 @@ impl<Q: Query> QuerySlot<Q> {
                         earliest: current,
                         latest: current,
                     }),
-                    durability,
+                    input_durability: Durability::CONSTANT,
+                    set_durability: durability,
                 }),
             });
     }
@@ -349,7 +363,7 @@ impl<Q: Query> QuerySlot<Q> {
     {
         if let Some(output) = self.get_output_mut() {
             if let Some(transitive) = output.transitive {
-                self.cell.remove_output(runtime, transitive.durability);
+                self.cell.remove_output(runtime, transitive.durability());
             }
         }
     }
@@ -360,7 +374,7 @@ impl<Q: Query> QuerySlot<Q> {
     {
         if let Some(output) = self.cell.get_output_mut() {
             if let Some(transitive) = output.transitive.take() {
-                let durability = transitive.durability;
+                let durability = transitive.durability();
                 let last_change = self.last_changed();
                 runtime.update_input(last_change, durability);
             }
@@ -401,7 +415,7 @@ pub struct ClaimedSlot<'a, Q: Query> {
 
 impl<Q: Query> Drop for ClaimedSlot<'_, Q> {
     fn drop(&mut self) {
-        unsafe { self.slot.cell.release_claim() }
+        unsafe { self.slot.cell.cancel_claim() }
     }
 }
 

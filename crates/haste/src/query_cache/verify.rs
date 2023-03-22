@@ -16,14 +16,14 @@ pub struct VerifyData<'a, Q: Query> {
 
 pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, VerifyFuture<Q>> {
     let mut data = data;
-    let Some(last_verified) = data.slot.last_verified() else { 
+    let Some(last_verified) = data.slot.last_verified() else {
         return Ok(Err(data))
     };
-    let Some(previous) = data.slot.get_output() else { 
+    let Some(previous) = data.slot.get_output() else {
         tracing::trace!("never finished executing");
         return Ok(Err(data))
     };
-    let Some(transitive) = previous.transitive else { 
+    let Some(transitive) = previous.transitive else {
         tracing::trace!("invalidated");
         return Ok(Err(data))
     };
@@ -37,9 +37,14 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
     let runtime = data.db.runtime();
 
     let inputs = transitive.inputs;
-    let durability = transitive.durability;
+    let durability = transitive.durability();
     if inputs_unchanged(runtime, last_verified, inputs, durability) {
-        tracing::debug!(reason = "inputs unchanged", ?inputs, ?durability, "backdating");
+        tracing::debug!(
+            reason = "inputs unchanged",
+            ?inputs,
+            ?durability,
+            "backdating"
+        );
         return Ok(Ok(data.slot.backdate()));
     }
 
@@ -70,11 +75,13 @@ fn verify_deep<'a, Q: Query>(
         CheckDeepFuture::new(data.db.as_dyn(), last_verified, dependencies),
         move |unchanged| match unchanged {
             None => Err(data),
-            Some(transitive) => {
+            Some(new_transitive) => {
+                let previous = data.slot.get_output().unwrap();
+                let transitive = previous.transitive.as_mut().unwrap();
+                transitive.update_inputs(new_transitive);
+
                 tracing::debug!(reason = "dependencies unchanged", ?transitive, "backdating");
-                if let Some(previous) = data.slot.get_output() {
-                    previous.transitive = Some(transitive);
-                }
+
                 return Ok(data.slot.backdate());
             }
         },
@@ -138,7 +145,11 @@ impl Future for CheckDeepFuture<'_> {
                 return Poll::Ready(None);
             }
 
-            tracing::debug!("change: {:?}", change.transitive);
+            tracing::debug!(
+                dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
+                "change: {:?}",
+                change.transitive
+            );
 
             self.transitive.extend(change.transitive);
         }

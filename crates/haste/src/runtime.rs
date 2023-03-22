@@ -315,7 +315,8 @@ impl Runtime {
         let transitive = if Q::IS_INPUT {
             TransitiveDependencies {
                 inputs: None,
-                durability: Durability::DEFAULT,
+                input_durability: Durability::CONSTANT,
+                set_durability: Durability::DEFAULT,
             }
         } else {
             // initially derived queries don't depend on anything, so can be considered constants
@@ -341,7 +342,7 @@ impl Runtime {
         ACTIVE.with(|active| {
             let Some(mut task) = active.task.take() else { return };
             assert!(task.is_input, "can only set durability of input queries");
-            task.transitive.durability = durability;
+            task.transitive.set_durability = durability;
             active.task.set(Some(task));
         })
     }
@@ -390,6 +391,10 @@ impl Runtime {
         waker: &Waker,
         db: &dyn Database,
     ) {
+        if self.executor.stopped() {
+            return;
+        }
+
         tracing::trace!(
             child = %crate::util::fmt::ingredient(db, child),
             ?parent,
@@ -399,6 +404,10 @@ impl Runtime {
     }
 
     pub(crate) fn unblock(&self, parent: IngredientPath) {
+        if self.executor.stopped() {
+            return;
+        }
+
         tracing::trace!(?parent, "unblocked");
         self.graph.remove(parent);
     }
@@ -430,6 +439,13 @@ pub trait QueryTask {
 
 pub struct BoxedQueryTask<T> {
     raw: Box<RawTask<UnitFuture<T>>>,
+}
+
+impl<T> std::fmt::Pointer for BoxedQueryTask<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ptr: *const RawTask<_> = &*self.raw as *const _;
+        std::fmt::Pointer::fmt(&ptr, f)
+    }
 }
 
 impl<T> QueryTask for BoxedQueryTask<T>
@@ -489,6 +505,10 @@ impl Runtime {
     pub(crate) fn exit(&self) {
         // cancel all running tasks and wait for shutdown
         assert!(self.executor.stop(), "could not stop runtime scheduler");
+
+        // make sure that all blocked tasks are woken (and then dropped, since task cannot be
+        // scheduled on a stopped executor)
+        self.graph.clear();
     }
 }
 

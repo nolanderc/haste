@@ -353,10 +353,18 @@ impl<I, O> QueryCell<I, O> {
     /// # Safety
     ///
     /// The caller must have a claim on the query.
-    pub unsafe fn release_claim(&self) {
+    pub unsafe fn cancel_claim(&self) {
         let lock = self.state.lock();
         debug_assert!((lock.addr & CLAIMED) != 0);
-        lock.unlock_set_and_clear(0, CLAIMED);
+        let old = lock.unlock_set_and_clear(0, CLAIMED | ADDR_MASK);
+
+        let ptr = (old & ADDR_MASK) as *mut BlockedState;
+        if ptr.is_null() {
+            return;
+        }
+
+        // drop the state, dropping any blocked tasks.
+        drop(Box::from_raw(ptr));
     }
 
     /// Waits until the output value has been set
@@ -429,7 +437,7 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut this = &mut *self;
+        let this = &mut *self;
         let state = this.state.as_state();
         let revision = this.revision;
 
@@ -445,6 +453,15 @@ where
         if state.verified_at.load(Relaxed) == Some(revision) {
             // SAFETY: since we grabbed the lock, we are synchronized with the write
             return std::task::Poll::Ready(());
+        }
+
+        if lock.addr & CLAIMED == 0 {
+            // We are blocked on query cell which is not claimed. This *should* only happen if a
+            // task has been dropped, causing the claim to be released. Since a task should only be
+            // dropped when the executor is shutting down (ie. the computation is done) this task
+            // is also going to be dropped momentarily. Thus, we just return `Pending` to allow the
+            // current thread to return to the executor and drop this task.
+            return std::task::Poll::Pending;
         }
 
         let blocked = lock.get_or_init();

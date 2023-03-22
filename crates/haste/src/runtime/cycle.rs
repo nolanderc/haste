@@ -34,6 +34,10 @@ struct Vertex {
 }
 
 impl CycleGraph {
+    pub fn clear(&self) {
+        self.vertices.clear();
+    }
+
     pub fn insert(
         &self,
         source: IngredientPath,

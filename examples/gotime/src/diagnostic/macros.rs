@@ -7,4 +7,4 @@ mod exported {
     }
 }
 
-pub(crate) use error as error;
+pub(crate) use error;

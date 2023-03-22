@@ -192,7 +192,7 @@ where
         let slot = self.storage.slot_mut(id);
 
         if let Some(previous) = slot.get_output_mut() {
-            let old_durability = previous.transitive.as_ref().map(|t| t.durability);
+            let old_durability = previous.transitive.as_ref().map(|t| t.durability());
             if Some(durability) == old_durability && output == previous.output {
                 // no change: the value is still valid
                 slot.set_verified(runtime.current_revision());
@@ -577,6 +577,8 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
             let current = this.inner.database().runtime().current_revision();
             new.transitive.as_mut().unwrap().add_input(current);
         }
+
+        tracing::debug!(durability = ?new.transitive.unwrap().durability(), "computed output");
 
         let slot = slot.finish(new);
         Poll::Ready(QueryResult { id, slot })

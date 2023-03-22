@@ -20,6 +20,7 @@ tracing = { version = "0.1.37" }
 dashmap = { version = "5.4.0", features = ["raw-api"] }
 fastrand = "1.9.0"
 st3 = "0.4.1"
+crossbeam-utils = "0.8.15"
 
 [dependencies.haste_macros]
 path = "../haste_macros"

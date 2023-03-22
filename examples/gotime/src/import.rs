@@ -4,8 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use arrayvec::ArrayVec;
 use bstr::{BStr, ByteSlice};
-use futures::Future;
+use std::future::Future;
 
 use crate::{
     common::Text,
@@ -41,11 +42,21 @@ pub async fn resolve(
 ) -> Result<FileSet> {
     let name = import_name.get(db);
 
-    let candidates = [
-        NormalPathData::GoPath(Path::new("src").join(name).into()),
-        NormalPathData::GoRoot(Path::new("src").join(name).into()),
-        NormalPathData::GoRoot(Path::new("src/vendor").join(name).into()),
-    ];
+    let mut candidates = ArrayVec::<_, 4>::new();
+
+    let from_goroot = matches!(
+        go_mod.map(|path| path.lookup(db)),
+        Some(NormalPathData::GoRoot(_))
+    );
+
+    if !from_goroot {
+        candidates.push(NormalPathData::GoPath(Path::new("src").join(name).into()));
+    }
+
+    candidates.push(NormalPathData::GoRoot(Path::new("src").join(name).into()));
+    candidates.push(NormalPathData::GoRoot(
+        Path::new("src/vendor").join(name).into(),
+    ));
 
     for path in candidates {
         let path = NormalPath::insert(db, path);

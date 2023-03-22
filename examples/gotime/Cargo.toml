@@ -20,6 +20,7 @@ cpu-time = "1.0.0"
 hashbrown = { version = "0.13.2", features = ["raw"] }
 fxhash = "0.2.1"
 phf = { version = "0.11.1", features = ["macros"] }
+arrayvec = "0.7.2"
 
 [dependencies.bstr]
 version = "1.2.0"

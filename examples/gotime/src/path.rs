@@ -47,7 +47,6 @@ impl NormalPath {
         self.suffix(db).file_stem()
     }
 
-
     pub fn join(self, db: &dyn crate::Db, suffix: impl AsRef<Path>) -> Option<Self> {
         let inner = self.lookup(db).join(suffix)?;
         Some(Self::insert(db, inner))

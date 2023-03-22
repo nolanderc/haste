@@ -1,5 +1,6 @@
 #![feature(type_alias_impl_trait)]
 #![feature(trivial_bounds)]
+#![feature(waker_getters)]
 #![allow(clippy::uninlined_format_args)]
 
 mod arena;
@@ -369,6 +370,14 @@ pub trait DatabaseExt: Database {
     {
         assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
 
+        let _guard = tracing::debug_span!(
+            "invalidate",
+            query = %crate::util::fmt::from_fn(|f| {
+                crate::fmt::wrap(self.as_dyn(), f, |f| Q::fmt(&input, f))
+            }),
+        )
+        .entered();
+
         let (storage, runtime) = self.storage_mut();
         let cache = storage.container_mut();
         cache.invalidate(runtime, &input);
@@ -454,18 +463,19 @@ where
     unsafe { storage.runtime.enter() };
 
     let current = storage.runtime.current_revision();
+
     storage.list_mut().0.begin(current);
 
     let runtime = db.runtime();
 
-    let result = {
+    let result = crate::fmt::scope(db, || {
         let _guard = CallOnDrop(|| runtime.exit());
         let scope = Scope {
             runtime,
             _phantom: PhantomData,
         };
-        crate::fmt::scope(db, || f(scope, db))
-    };
+        f(scope, db)
+    });
 
     db.database_storage_mut().list_mut().0.end();
 

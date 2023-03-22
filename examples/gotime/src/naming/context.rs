@@ -165,6 +165,7 @@ impl<'db> NamingContext<'db> {
             Node::Parameter(param) => {
                 if let Some(name) = param.name {
                     if let Some(name) = name.text {
+                        // bind the name to the function scope
                         self.local_scope.insert_local(name, node, 0);
                     }
                 }
@@ -242,10 +243,12 @@ impl<'db> NamingContext<'db> {
                 self.resolve_expr(cap);
             }
             Node::TypeDef(spec) | Node::TypeAlias(spec) => {
+                self.local_scope.enter();
                 if let Some(name) = spec.name.text {
                     self.local_scope.insert_local(name, node, 0);
                 }
                 self.resolve_type(spec.inner);
+                self.local_scope.exit();
             }
             Node::ConstDecl(names, typ, exprs) => {
                 if let Some(typ) = typ {
@@ -383,6 +386,7 @@ impl<'db> NamingContext<'db> {
             Node::SelectDefault(block) => self.resolve_block(block),
 
             Node::Switch(init, expr, cases) => {
+                self.local_scope.enter();
                 if let Some(init) = init {
                     self.resolve_stmt(init);
                 }
@@ -390,11 +394,13 @@ impl<'db> NamingContext<'db> {
                     self.resolve_expr(expr);
                 }
                 self.resolve_range(cases);
+                self.local_scope.exit();
             }
             Node::TypeSwitch(name, expr) => {
                 self.resolve_expr(expr);
                 if let Some(name) = name {
                     if let Some(text) = name.text {
+                        // this will insert the binding into the parent switch's scope
                         self.local_scope.insert_local(text, node, 0);
                     }
                 }

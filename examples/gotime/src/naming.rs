@@ -49,10 +49,7 @@ impl DeclId {
             Some(path) => Ok(path),
             None => {
                 let package = package_name(db, self.package).await?;
-                Err(error!(
-                    "could not find `{}` in the package `{}`",
-                    self.name, package
-                ))
+                Err(error!("`{}` is not a member of `{}`", self.name, package))
             }
         }
     }
@@ -464,7 +461,7 @@ pub struct Local {
     index: u16,
 }
 
-/// For each identifier in the given decl, the symbol it maps to.
+/// For each node in the given decl, the symbol it references.
 pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<HashMap<NodeId, Symbol>> {
     let path = id.path(db).await?;
     let ast = syntax::parse_file(db, path.source).await.as_ref()?;

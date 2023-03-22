@@ -17,6 +17,8 @@ use std::{
     thread::JoinHandle,
 };
 
+use crossbeam_utils::CachePadded;
+
 use crate::util::CallOnDrop;
 
 use self::{injector::Injector, task::Task};
@@ -64,7 +66,10 @@ struct Shared {
 }
 
 struct SharedState {
-    variant: AtomicU32,
+    // We expect this to be loaded by multiple threads continuously and rarely be written to. In
+    // order to avoid accidental cache invalidation by neighbouring writes (false sharing) we make
+    // sure it is padded to the length of a cache line.
+    variant: CachePadded<AtomicU32>,
 }
 
 #[repr(u32)]
@@ -78,7 +83,7 @@ enum State {
 impl SharedState {
     fn new(variant: State) -> Self {
         Self {
-            variant: AtomicU32::new(variant as u32),
+            variant: AtomicU32::new(variant as u32).into(),
         }
     }
 
@@ -184,6 +189,7 @@ impl Executor {
             .expect("cannot run two tasks on the executor simultaneously");
 
         let local = local_slot.take().unwrap();
+
         let (local, output) = local.run_future(future);
 
         *local_slot = Some(local);
@@ -202,12 +208,18 @@ impl Executor {
     where
         F: Future<Output = ()> + Send,
     {
+        let task = Task::from_raw(task);
+
         if self.shared.state.load(Relaxed) != State::Running {
             return;
         }
 
-        let task = Task::from_raw(task);
         self.shared.schedule(task);
+    }
+
+    /// Returns `true` if the executor is shutdown and does not accept new tasks.
+    pub fn stopped(&self) -> bool {
+        self.shared.state.load(Relaxed) != State::Running
     }
 
     pub fn start(&self) -> bool {
@@ -239,6 +251,11 @@ impl Executor {
         {
             let _guard = shared.idle_mutex.lock().unwrap();
             shared.wake_condition.notify_all();
+        }
+
+        // if the local scheduler has any pending tasks we need to drop them:
+        if let Some(local) = self.local.lock().unwrap().as_ref() {
+            local.drain();
         }
 
         // wait until all workers are suspended:

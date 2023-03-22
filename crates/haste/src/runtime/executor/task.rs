@@ -250,12 +250,26 @@ impl Header {
         }
     }
 
-    // increases the refcount, returning `true` if the task needs to be dropped
+    // Increases the refcount, returning `true` if the task needs to be dropped
+    //
+    // # Returns
+    //
+    // `true` if the task needs to be dropped.
+    //
+    // # Safety
+    //
+    // The caller ensures that they own one reference and will not use it after this point.
     unsafe fn decrease_refcount(&self) -> bool {
+        // SAFETY: use relaese ordering so that all pending operations on the task are completed
+        // before it is dropped.
         if self.refcount.fetch_sub(1, Release) != 1 {
             return false;
         }
+
+        // SAFETY: this `Acquire` synchronizes with the above `Release` to ensure that all pending
+        // operations are complete before we drop the task.
         self.refcount.load(Acquire);
+
         true
     }
 
@@ -368,7 +382,7 @@ struct VTable {
 
 impl VTable {
     unsafe fn drop<T>(this: *mut u8) {
-        this.cast::<T>().drop_in_place()
+        this.cast::<T>().drop_in_place();
     }
 
     unsafe fn poll<T>(this: *mut u8, cx: &mut std::task::Context) -> Poll<()>

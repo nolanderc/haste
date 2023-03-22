@@ -17,7 +17,7 @@ use haste::Durability;
 use notify::Watcher;
 use path::NormalPath;
 use util::future::IteratorExt;
-use util::future::{FutureExt, StreamExt};
+use util::future::StreamExt;
 
 use crate::common::Text;
 use crate::diagnostic::error;
@@ -246,11 +246,21 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
         let Ok(paths) = receiver.recv() else { return };
         changes.extend(paths);
 
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        loop {
+            // wait a bit to allow any pending file operations to complete
+            std::thread::sleep(std::time::Duration::from_millis(20));
 
-        // drain the event queue
-        while let Ok(paths) = receiver.try_recv() {
-            changes.extend(paths);
+            let mut maybe_pending_events = false;
+
+            // drain the event queue
+            while let Ok(paths) = receiver.try_recv() {
+                changes.extend(paths);
+                maybe_pending_events = true;
+            }
+
+            if !maybe_pending_events {
+                break;
+            }
         }
 
         let changed_paths = haste::scope(db, |scope, db| {
@@ -285,6 +295,7 @@ fn run(db: &mut Database, arguments: Arguments) {
     let process = cpu_time::ProcessTime::now();
 
     haste::scope(db, |scope, db| {
+        eprintln!("running...");
         let result = scope.block_on(compile(db, arguments.config));
 
         match result {
@@ -359,40 +370,17 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let asts = files.lookup(db).parse(db).await?;
     let package_name = naming::package_name(db, files).await?;
 
-    let import_count = asts.iter().map(|ast| ast.imports.len()).sum();
-    let mut resolved = Vec::with_capacity(import_count);
-
-    if import_count > 0 {
-        let go_mod = import::closest_go_mod(db, asts[0].source.parent(db).unwrap()).await?;
-        for ast in asts.iter() {
-            for import in ast.imports.iter() {
-                resolved.push(import::resolve(db, import.path.text, go_mod).with_context(
-                    |error| {
-                        let span = ast.span(None, import.path.span);
-                        error.label(span, "could not resolve the import")
-                    },
-                ));
-            }
-        }
-    }
-
-    let resolved = resolved.try_join_all().await?;
-    let packages = resolved
+    let resolved = asts
         .iter()
-        .map(|&package| compile_package_files(db, package))
-        .start_all();
-
-    let package_names = resolved
-        .iter()
-        .map(|&package| naming::package_name(db, package))
+        .map(|ast| import::resolve_imports(db, ast))
         .try_join_all()
         .await?;
 
-    let mut package_names = package_names.into_iter();
-    let mut import_names = Vec::with_capacity(asts.len());
-    for ast in asts.iter() {
-        import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
-    }
+    let packages = resolved
+        .iter()
+        .flatten()
+        .map(|&package| compile_package_files(db, package))
+        .start_all();
 
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
     let decls = package_scope
@@ -401,21 +389,24 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .try_join_all()
         .await?;
 
-    let mut errors = Vec::new();
+    let mut futures = Vec::new();
 
     for ((_name, path), symbols) in package_scope.iter().zip(decls.iter()) {
         for (&node, &symbol) in symbols.iter() {
             match symbol {
                 naming::Symbol::Decl(decl) => {
-                    match naming::decl_symbols(db, decl).await {
-                        Ok(_) => {}
-                        Err(error) => {
-                            let ast = syntax::parse_file(db, path.source).await.as_ref()?;
-                            let decl = &ast.declarations[path.index];
-                            let span = ast.span(Some(path.index), decl.nodes.spans[node]);
-                            errors.push(error.label(span, ""));
+                    let symbols = naming::decl_symbols(db, decl);
+                    futures.push(async move {
+                        match symbols.await {
+                            Ok(_) => Ok(()),
+                            Err(error) => {
+                                let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+                                let decl = &ast.declarations[path.index];
+                                let span = ast.span(Some(path.index), decl.nodes.spans[node]);
+                                Err(error.label(span, "referenced here"))
+                            }
                         }
-                    };
+                    });
                 }
                 naming::Symbol::Package(_)
                 | naming::Symbol::Local(_)
@@ -424,8 +415,19 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         }
     }
 
-    if !errors.is_empty() {
-        return Err(Diagnostic::combine(errors));
+    let _resolved_symbols = futures.try_join_all().await?;
+
+    let package_names = resolved
+        .iter()
+        .flatten()
+        .map(|&package| naming::package_name(db, package))
+        .try_join_all()
+        .await?;
+
+    let mut package_names = package_names.into_iter();
+    let mut import_names = Vec::with_capacity(asts.len());
+    for ast in asts.iter() {
+        import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
     packages.try_join_all().await?;

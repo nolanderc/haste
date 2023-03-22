@@ -12,7 +12,7 @@ use crate::{
 
 use super::*;
 
-pub async fn parse(db: &dyn crate::Db, source: &BStr, path: SourcePath) -> crate::Result<File> {
+pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -40,7 +40,7 @@ struct Parser<'a> {
     diagnostics: Vec<Diagnostic>,
 
     /// Path to the file being parsed (used for diagnostics)
-    path: SourcePath,
+    path: NormalPath,
 
     /// List of tokens in the current file.
     tokens: &'a [SpannedToken],
@@ -531,8 +531,8 @@ impl<'a> Parser<'a> {
 
         if !imports.is_empty() {
             // prefetch the imports:
-            let path = self.path.path(self.db).clone();
-            if let Ok(go_mod) = crate::import::closest_go_mod(self.db, path).await {
+            let dir = self.path.parent(self.db).unwrap();
+            if let Ok(go_mod) = crate::import::closest_go_mod(self.db, dir).await {
                 for import in imports.iter() {
                     crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
                 }

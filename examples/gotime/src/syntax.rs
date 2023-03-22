@@ -8,14 +8,14 @@ use haste::non_max::{NonMaxU16, NonMaxU32};
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
-    source::SourcePath,
+    path::NormalPath,
     span::{FileRange, Span},
     token::Token,
     Storage, Text,
 };
 
 #[haste::query]
-pub async fn parse_file(db: &dyn crate::Db, path: SourcePath) -> crate::Result<File> {
+pub async fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<File> {
     let source = crate::source::source_text(db, path).await?;
     self::parse::parse(db, &source, path).await
 }
@@ -25,7 +25,7 @@ pub type KeyList<K, V> = Box<KeySlice<K, V>>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct File {
     /// The path to the source file this represents
-    pub source: SourcePath,
+    pub source: NormalPath,
 
     /// List of all spans that occur in the source file
     pub span_ranges: KeyList<Key<Span>, FileRange>,

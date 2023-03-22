@@ -165,7 +165,6 @@ struct ActiveData {
 
 pub(crate) struct QueryInfo {
     pub path: IngredientPath,
-    pub is_input: bool,
 }
 
 impl ActiveData {
@@ -177,10 +176,7 @@ impl ActiveData {
 
     fn current_task(&self) -> Option<QueryInfo> {
         let task = self.task.replace(None)?;
-        let info = QueryInfo {
-            path: task.this,
-            is_input: task.is_input,
-        };
+        let info = QueryInfo { path: task.this };
         self.task.set(Some(task));
         Some(info)
     }
@@ -223,6 +219,10 @@ impl<'db, Q: Query> ExecFuture<'db, Q> {
 
     pub fn query(&self) -> IngredientPath {
         self.task.as_ref().unwrap().this
+    }
+
+    pub fn database(&self) -> &'db DatabaseFor<Q> {
+        self.db
     }
 }
 
@@ -313,12 +313,8 @@ impl Runtime {
         this: IngredientPath,
     ) -> ExecFuture<'db, Q> {
         let transitive = if Q::IS_INPUT {
-            let current = self.current_revision();
             TransitiveDependencies {
-                inputs: Some(RevisionRange {
-                    earliest: current,
-                    latest: current,
-                }),
+                inputs: None,
                 durability: Durability::DEFAULT,
             }
         } else {

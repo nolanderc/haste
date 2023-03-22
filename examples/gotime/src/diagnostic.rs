@@ -5,13 +5,14 @@ pub(crate) use self::macros::*;
 
 use std::{fmt::Write, sync::Arc};
 
-use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use bstr::{BStr, ByteSlice};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::DatabaseExt;
 use smallvec::SmallVec;
 
 use crate::{
-    source::{line_starts, source_text, SourcePath},
+    path::NormalPath,
+    source::{line_starts, source_text},
     span::Span,
 };
 
@@ -35,7 +36,7 @@ enum Inner {
     /// Some additional information attached to some other diagnostic
     Attachment(Diagnostic, SmallVec<[Attachment; 1]>),
     /// Multiple diagnostics combined into one.
-    Combine(Vec<Diagnostic>),
+    Combine(SmallVec<[Diagnostic; 2]>),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -106,11 +107,11 @@ impl Diagnostic {
     }
 
     pub fn push(&mut self, other: Diagnostic) {
-        // if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
-        //     list.push(other);
-        //     return;
-        // }
-        //
+        if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
+            list.push(other);
+            return;
+        }
+
         *self = Self::combine([self.clone(), other])
     }
 
@@ -170,11 +171,9 @@ impl Diagnostic {
         attachments: &mut Vec<&'a Attachment>,
         out: &mut impl Write,
         visited: &mut VisitedSet,
-    ) -> FmtResult<bool> {
-        let mut formatted = false;
-
+    ) -> FmtResult<()> {
         if !visited.formatted.insert(Arc::as_ptr(&self.inner)) {
-            return Ok(formatted);
+            return Ok(());
         }
 
         match &*self.inner {
@@ -199,23 +198,20 @@ impl Diagnostic {
                     let last = last_message == i;
                     attachment.format(message.severity, sources, last, out)?;
                 }
-
-                formatted = true;
             }
             Inner::Attachment(parent, new_attachments) => {
                 attachments.extend(new_attachments.iter().rev());
-                formatted = parent.format(sources, attachments, out, visited)?;
+                parent.format(sources, attachments, out, visited)?;
                 attachments.truncate(attachments.len() - new_attachments.len());
             }
             Inner::Combine(combined) => {
                 for diagnostic in combined {
-                    if diagnostic.format(sources, attachments, out, visited)? {
-                        formatted = true;
-                    }
+                    diagnostic.format(sources, attachments, out, visited)?;
                 }
             }
         }
-        Ok(formatted)
+
+        Ok(())
     }
 }
 
@@ -223,7 +219,7 @@ impl Attachment {
     fn format(
         &self,
         parent_severity: Severity,
-        sources: &HashMap<SourcePath, SourceFileInfo>,
+        sources: &HashMap<NormalPath, SourceFileInfo>,
         last: bool,
         out: &mut impl Write,
     ) -> FmtResult<()> {
@@ -241,7 +237,7 @@ impl Label {
     fn format(
         &self,
         parent_severity: Severity,
-        sources: &HashMap<SourcePath, SourceFileInfo>,
+        sources: &HashMap<NormalPath, SourceFileInfo>,
         last: bool,
         out: &mut impl Write,
     ) -> FmtResult<()> {
@@ -370,7 +366,7 @@ impl SourceFileInfo<'_> {
     }
 }
 
-type SourceSet<'db> = HashMap<SourcePath, SourceFileInfo<'db>>;
+type SourceSet<'db> = HashMap<NormalPath, SourceFileInfo<'db>>;
 
 impl Diagnostic {
     async fn get_source_infos<'db>(&self, db: &'db dyn crate::Db) -> SourceSet<'db> {

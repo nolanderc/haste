@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -15,12 +15,12 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use haste::Durability;
 use notify::Watcher;
+use path::NormalPath;
 use util::future::IteratorExt;
 use util::future::{FutureExt, StreamExt};
 
 use crate::common::Text;
 use crate::diagnostic::error;
-use crate::source::SourcePath;
 
 mod common;
 mod diagnostic;
@@ -30,6 +30,7 @@ mod import;
 mod index_map;
 mod key;
 mod naming;
+mod path;
 mod process;
 mod source;
 mod span;
@@ -40,7 +41,7 @@ mod util;
 #[haste::storage]
 pub struct Storage(
     common::Text,
-    source::SourcePath,
+    path::NormalPath,
     source::line_starts,
     syntax::parse_file,
     import::resolve,
@@ -56,8 +57,7 @@ pub struct Database {
     bytes: AtomicUsize,
     lines: AtomicUsize,
     files: AtomicUsize,
-    touched_paths: DashSet<Arc<Path>>,
-    cwd: Option<PathBuf>,
+    touched_paths: DashSet<NormalPath>,
 }
 
 impl Database {
@@ -68,7 +68,6 @@ impl Database {
             lines: AtomicUsize::new(0),
             files: AtomicUsize::new(0),
             touched_paths: DashSet::new(),
-            cwd: std::env::current_dir().ok(),
         }
     }
 }
@@ -87,33 +86,33 @@ pub trait Db:
     + haste::WithStorage<naming::Storage>
 {
     /// Notifies the database that the filesystem is being accessed.
-    fn touch_path(&self, path: Arc<Path>) {
-        let durability = self.path_durability_untracked(&path);
+    fn touch_path(&self, path: NormalPath) {
+        let durability = self.path_durability_untracked(path);
         self.runtime().set_durability(durability);
     }
 
     /// Used to cellect metrics about the accessed files.
-    fn register_file(&self, path: Arc<Path>, contents: &[u8]) {
+    fn register_file(&self, path: NormalPath, contents: &[u8]) {
         _ = path;
         _ = contents;
     }
 
     /// Get the durability of the given path.
-    fn path_durability_untracked(&self, path: &Path) -> Durability {
+    fn path_durability_untracked(&self, path: NormalPath) -> Durability {
         _ = path;
         Durability::MEDIUM
     }
 }
 
 impl Db for Database {
-    fn touch_path(&self, path: Arc<Path>) {
-        let durability = self.path_durability_untracked(&path);
+    fn touch_path(&self, path: NormalPath) {
+        let durability = self.path_durability_untracked(path);
         self.storage.runtime().set_durability(durability);
 
         self.touched_paths.insert(path);
     }
 
-    fn register_file(&self, path: Arc<Path>, contents: &[u8]) {
+    fn register_file(&self, path: NormalPath, contents: &[u8]) {
         _ = path;
         let lines = 1 + contents.iter().filter(|&&byte| byte == b'\n').count();
         self.lines
@@ -124,24 +123,18 @@ impl Db for Database {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn path_durability_untracked(&self, path: &Path) -> Durability {
-        if let Some(goroot) = crate::env::default::GOROOT {
-            if path.starts_with(goroot) {
-                return Durability::HIGH;
-            }
-        }
-
-        if let Some(cwd) = &self.cwd {
-            if path.starts_with(cwd) {
+    fn path_durability_untracked(&self, path: NormalPath) -> Durability {
+        match path.lookup(self) {
+            path::NormalPathData::Relative(path) => {
                 if path.extension() == Some(OsStr::new("go")) {
-                    return Durability::LOW;
+                    Durability::LOW
                 } else {
-                    return Durability::MEDIUM;
+                    Durability::MEDIUM
                 }
             }
+            path::NormalPathData::GoPath(_) => Durability::MEDIUM,
+            path::NormalPathData::GoRoot(_) => Durability::HIGH,
         }
-
-        Durability::DEFAULT
     }
 }
 
@@ -163,14 +156,15 @@ struct CompileConfig {
 }
 
 fn parse_arc_path(text: &str) -> std::io::Result<Arc<Path>> {
-    let path = Path::new(text);
-    let path = path.canonicalize()?;
-    Ok(Arc::from(path))
+    Ok(Arc::from(Path::new(text)))
 }
 
 fn main() {
     tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .without_time()
         .with_target(false)
         .init();
@@ -200,8 +194,6 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
         }
     }
 
-    let cwd = std::env::current_dir().unwrap();
-
     let (sender, receiver) = std::sync::mpsc::sync_channel(128);
     let mut watcher =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
@@ -220,31 +212,34 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
     let mut watched = HashSet::new();
     let mut changes = HashSet::new();
 
+    let cwd = std::env::current_dir().unwrap();
+
     loop {
         run(db, arguments.clone());
 
-        for touched in db.touched_paths.iter() {
-            if !touched.starts_with(&cwd) {
-                continue;
-            }
-
-            if !watched.insert(touched.clone()) {
-                continue;
-            }
-
-            if let Err(error) = watcher.watch(&touched, notify::RecursiveMode::NonRecursive) {
-                match &error.kind {
-                    notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                        continue
+        haste::scope(db, |scope, db| {
+            scope.block_on(async {
+                for touched in db.touched_paths.iter() {
+                    if !watched.insert(*touched) {
+                        continue;
                     }
-                    _ => {}
-                }
 
-                tracing::error!(path = ?*touched, error = ?error.kind, "could not watch path");
-            } else {
-                tracing::info!(path = ?*touched, "watching");
-            }
-        }
+                    let path = touched.system_path(db).await.unwrap();
+
+                    if let Err(error) = watcher.watch(&path, notify::RecursiveMode::NonRecursive) {
+                        if let notify::ErrorKind::Io(io) = &error.kind {
+                            if let std::io::ErrorKind::NotFound = io.kind() {
+                                continue;
+                            }
+                        }
+
+                        tracing::warn!(%error, "could not watch path");
+                    } else {
+                        tracing::debug!(path = ?*touched, "watching");
+                    }
+                }
+            })
+        });
         db.touched_paths.clear();
 
         eprintln!("[waiting for changes...]");
@@ -258,13 +253,29 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
             changes.extend(paths);
         }
 
-        for path in changes.drain() {
-            // Work around an issue on WSL where removing the file causes the watcher to stop
-            // working for that file. This is especially noticeable when saving in `vim`: it first
-            // removes the file before writing a new one it its place.
-            _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);
+        let changed_paths = haste::scope(db, |scope, db| {
+            scope.block_on(async {
+                let mut paths = Vec::with_capacity(changes.len());
+                for changed in changes.drain() {
+                    // Work around an issue on WSL where removing the file causes the watcher to stop
+                    // working for that file. This is especially noticeable when saving in `vim`: it first
+                    // removes the file before writing a new one it its place.
+                    _ = watcher.watch(&changed, notify::RecursiveMode::NonRecursive);
 
-            fs::invalidate_path(db, Arc::from(path));
+                    let path = if let Ok(relative) = changed.strip_prefix(&cwd) {
+                        relative
+                    } else {
+                        &changed
+                    };
+
+                    paths.push(NormalPath::new(db, path).await?);
+                }
+                crate::Result::<_>::Ok(paths)
+            })
+        });
+
+        for path in changed_paths.unwrap() {
+            fs::invalidate_path(db, path);
         }
     }
 }
@@ -321,7 +332,12 @@ fn run(db: &mut Database, arguments: Arguments) {
 #[haste::query]
 #[clone]
 async fn compile(db: &dyn crate::Db, config: CompileConfig) -> Result<Arc<Package>> {
-    let package = import::file_set(db, config.package).await?;
+    let mut paths = Vec::with_capacity(config.package.len());
+    for path in config.package {
+        paths.push(NormalPath::new(db, &path).await?);
+    }
+    let package = import::file_set(db, paths.into()).await?;
+
     compile_package_files(db, package).await
 }
 
@@ -347,7 +363,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let mut resolved = Vec::with_capacity(import_count);
 
     if import_count > 0 {
-        let go_mod = import::closest_go_mod(db, asts[0].source.path(db).clone()).await?;
+        let go_mod = import::closest_go_mod(db, asts[0].source.parent(db).unwrap()).await?;
         for ast in asts.iter() {
             for import in ast.imports.iter() {
                 resolved.push(import::resolve(db, import.path.text, go_mod).with_context(
@@ -384,6 +400,33 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .map(|&name| naming::decl_symbols(db, naming::DeclId::new(files, name)))
         .try_join_all()
         .await?;
+
+    let mut errors = Vec::new();
+
+    for ((_name, path), symbols) in package_scope.iter().zip(decls.iter()) {
+        for (&node, &symbol) in symbols.iter() {
+            match symbol {
+                naming::Symbol::Decl(decl) => {
+                    match naming::decl_symbols(db, decl).await {
+                        Ok(_) => {}
+                        Err(error) => {
+                            let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+                            let decl = &ast.declarations[path.index];
+                            let span = ast.span(Some(path.index), decl.nodes.spans[node]);
+                            errors.push(error.label(span, ""));
+                        }
+                    };
+                }
+                naming::Symbol::Package(_)
+                | naming::Symbol::Local(_)
+                | naming::Symbol::Builtin(_) => {}
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(Diagnostic::combine(errors));
+    }
 
     packages.try_join_all().await?;
 

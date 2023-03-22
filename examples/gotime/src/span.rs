@@ -1,15 +1,15 @@
 use haste::non_max::NonMaxU32;
 
-use crate::source::SourcePath;
+use crate::path::NormalPath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
-    pub path: SourcePath,
+    pub path: NormalPath,
     pub range: FileRange,
 }
 
 impl Span {
-    pub fn new(path: SourcePath, range: FileRange) -> Self {
+    pub fn new(path: NormalPath, range: FileRange) -> Self {
         Self { path, range }
     }
 

@@ -1,31 +1,34 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use std::io::BufRead;
 
+use crate::path::NormalPath;
 use crate::{error, Result};
 
 #[haste::storage]
 pub struct Storage(read, list_dir, metadata, read_header);
 
 /// Invalidates the given path, forcing re-evaluation if it is needed.
-pub fn invalidate_path(db: &mut dyn crate::Db, path: Arc<Path>) {
-    read::invalidate(db, path.clone());
-    list_dir::invalidate(db, path.clone());
-    metadata::invalidate(db, path.clone());
+pub fn invalidate_path(db: &mut dyn crate::Db, path: NormalPath) {
+    read::invalidate(db, path);
+    list_dir::invalidate(db, path);
+    metadata::invalidate(db, path);
     read_header::invalidate(db, path);
 }
 
 #[haste::query]
 #[clone]
 #[input]
-pub async fn read(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[u8]>> {
-    db.touch_path(path.clone());
+pub async fn read(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[u8]>> {
+    db.touch_path(path);
 
-    let bytes = std::fs::read(&*path).map_err(|error| match error.kind() {
+    let system_path = path.system_path(db).await?;
+
+    let bytes = std::fs::read(system_path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => {
-            error!("file not found: `{}`", path.display())
+            error!("file not found: `{path}`")
         }
-        _ => error!("could not read file `{}`: {}", path.display(), error),
+        _ => error!("could not read file `{path}`: {error}"),
     })?;
 
     db.register_file(path, &bytes);
@@ -35,28 +38,25 @@ pub async fn read(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[u8]>> {
 
 #[haste::query]
 #[input]
-pub async fn list_dir(db: &dyn crate::Db, path: Arc<Path>) -> Result<Arc<[Arc<Path>]>> {
-    db.touch_path(path.clone());
+pub async fn list_dir(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[NormalPath]>> {
+    db.touch_path(path);
 
-    async fn read_dir(path: Arc<Path>) -> std::io::Result<Arc<[Arc<Path>]>> {
-        let mut sources = Vec::with_capacity(8);
+    let system_path = path.system_path(db).await?;
 
-        for entry in std::fs::read_dir(path)? {
-            sources.push(Arc::from(entry?.path()));
-        }
+    let mut sources = Vec::with_capacity(8);
+    let dir = std::fs::read_dir(system_path)
+        .map_err(|error| error!("could not open the directory `{path}`: {error}"))?;
 
-        sources.sort();
-
-        Ok(Arc::from(sources))
+    for entry in dir {
+        let entry = entry.map_err(|error| {
+            error!("could not list all files in the directory `{path}`: {error}")
+        })?;
+        sources.push(NormalPath::new(db, &entry.path()).await?);
     }
 
-    read_dir(path.clone()).await.map_err(|error| {
-        error!(
-            "could not read the directory `{}`: {}",
-            path.display(),
-            error
-        )
-    })
+    sources.sort_by_key(|path| path.lookup(db));
+
+    Ok(sources.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,11 +83,13 @@ impl Metadata {
 #[haste::query]
 #[input]
 #[clone]
-pub async fn metadata(db: &dyn crate::Db, path: Arc<Path>) -> Result<Metadata> {
-    db.touch_path(path.clone());
+pub async fn metadata(db: &dyn crate::Db, path: NormalPath) -> Result<Metadata> {
+    db.touch_path(path);
 
-    let meta = std::fs::metadata(&*path)
-        .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;
+    let system_path = path.system_path(db).await?;
+
+    let meta = std::fs::metadata(system_path)
+        .map_err(|error| error!("could not open `{path}`: {error}"))?;
 
     Ok(Metadata {
         kind: if meta.is_dir() {
@@ -98,12 +100,12 @@ pub async fn metadata(db: &dyn crate::Db, path: Arc<Path>) -> Result<Metadata> {
     })
 }
 
-pub async fn is_file(db: &dyn crate::Db, path: Arc<Path>) -> bool {
+pub async fn is_file(db: &dyn crate::Db, path: NormalPath) -> bool {
     let Ok(meta) = metadata(db, path).await else { return false };
     meta.is_file()
 }
 
-pub async fn is_dir(db: &dyn crate::Db, path: Arc<Path>) -> bool {
+pub async fn is_dir(db: &dyn crate::Db, path: NormalPath) -> bool {
     let Ok(meta) = metadata(db, path).await else { return false };
     meta.is_dir()
 }
@@ -111,11 +113,13 @@ pub async fn is_dir(db: &dyn crate::Db, path: Arc<Path>) -> bool {
 /// Reads all bytes in a file up until the first token that is neither whitespace nor a comment.
 #[haste::query]
 #[input]
-pub async fn read_header(db: &dyn crate::Db, path: Arc<Path>) -> Result<String> {
-    db.touch_path(path.clone());
+pub async fn read_header(db: &dyn crate::Db, path: NormalPath) -> Result<String> {
+    db.touch_path(path);
 
-    let file = std::fs::File::open(&*path)
-        .map_err(|error| error!("could not open `{}`: {}", path.display(), error))?;
+    let system_path = path.system_path(db).await?;
+
+    let file = std::fs::File::open(system_path)
+        .map_err(|error| error!("could not open `{path}`: {error}"))?;
 
     let mut reader = std::io::BufReader::new(file);
 
@@ -127,7 +131,7 @@ pub async fn read_header(db: &dyn crate::Db, path: Arc<Path>) -> Result<String> 
 
         let count = reader
             .read_line(&mut text)
-            .map_err(|error| error!("could not read `{}`: {}", path.display(), error))?;
+            .map_err(|error| error!("could not read `{path}`: {error}"))?;
 
         if count == 0 {
             return Ok(text);

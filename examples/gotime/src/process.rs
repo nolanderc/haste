@@ -3,7 +3,7 @@ use std::{ffi::OsString, path::Path, sync::Arc};
 use bstr::{BStr, ByteSlice};
 use haste::Durability;
 
-use crate::{error, Result};
+use crate::{error, path::NormalPath, Result};
 
 #[haste::storage]
 pub struct Storage(command, env_var, go_var);
@@ -11,28 +11,31 @@ pub struct Storage(command, env_var, go_var);
 #[haste::query]
 #[input]
 pub async fn command(
-    _db: &dyn crate::Db,
+    db: &dyn crate::Db,
     command: Arc<str>,
     args: Arc<[Arc<str>]>,
-    cwd: Option<Arc<Path>>,
+    cwd: Option<NormalPath>,
 ) -> Result<std::process::Output, String> {
-    let mut command = std::process::Command::new(&*command);
+    let mut command = tokio::process::Command::new(&*command);
     command.args(args.iter().map(|arg| &**arg));
 
     if let Some(cwd) = cwd {
-        command.current_dir(&*cwd);
+        // TODO: don't silently discard this error (even though we don't expect it to ever fail)
+        if let Ok(cwd) = cwd.system_path(db).await {
+            command.current_dir(cwd);
+        }
     }
 
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    command.output().map_err(|error| error.to_string())
+    command.output().await.map_err(|error| error.to_string())
 }
 
 pub async fn go(
     db: &dyn crate::Db,
     args: impl IntoIterator<Item = impl Into<Arc<str>>>,
-    cwd: Option<Arc<Path>>,
+    cwd: Option<NormalPath>,
 ) -> crate::Result<&BStr> {
     let goroot = go_var_path(db, "GOROOT").await?;
     let go_path = goroot.join("bin").join("go");
@@ -42,7 +45,7 @@ pub async fn go(
         db,
         Arc::from(go_path),
         args.into_iter().map(Into::into).collect(),
-        cwd.map(Into::into),
+        cwd,
     )
     .await
     .as_ref()

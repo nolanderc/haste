@@ -8,7 +8,7 @@ use crate::{
     import::{self, FileSet},
     index_map::IndexMap,
     key::{Key, KeyOps},
-    source::SourcePath,
+    path::NormalPath,
     span::Span,
     syntax::{self, DeclKind, ExprId, FuncDecl, Node, NodeId, SpanId, TypeId},
     Diagnostic, Result,
@@ -36,7 +36,7 @@ impl DeclId {
     async fn span(self, db: &dyn crate::Db) -> Result<Option<Span>> {
         let Some(path) = self.try_get_path(db).await? else { return Ok(None) };
         let ast = syntax::parse_file(db, path.source).await.as_ref()?;
-        Ok(Some(path.span(ast)))
+        Ok(Some(path.span_in_ast(ast)))
     }
 
     async fn try_get_path(self, db: &dyn crate::Db) -> Result<Option<DeclPath>> {
@@ -64,13 +64,13 @@ impl DeclId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclPath {
     /// The file in which the declaration is defined.
-    source: SourcePath,
+    pub source: NormalPath,
 
     /// The index of the declaration within the file.
-    index: Key<syntax::Decl>,
+    pub index: Key<syntax::Decl>,
 
     /// To support multiple nested decls:
-    sub: SubIndex,
+    pub sub: SubIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,18 +84,23 @@ pub struct SubIndex {
     ///     z bool = true
     /// )
     /// ```
-    row: u16,
+    pub row: u16,
 
     /// The index in a list of assignments. Example
     ///
     /// ```go
     /// var a, b, c int = 1, 2, 3
     /// ```
-    col: u16,
+    pub col: u16,
 }
 
 impl DeclPath {
-    fn span(&self, ast: &syntax::File) -> Span {
+    pub async fn span(&self, db: &dyn crate::Db) -> Result<Span> {
+        let ast = syntax::parse_file(db, self.source).await.as_ref()?;
+        Ok(self.span_in_ast(ast))
+    }
+
+    pub fn span_in_ast(&self, ast: &syntax::File) -> Span {
         let decl = &ast.declarations[self.index];
         let id = match self.sub.lookup_in(decl) {
             SingleDecl::TypeDef(spec) | SingleDecl::TypeAlias(spec) => spec.name.span,
@@ -109,7 +114,7 @@ impl DeclPath {
 }
 
 impl SubIndex {
-    fn lookup_in(&self, decl: &syntax::Decl) -> SingleDecl {
+    pub fn lookup_in(&self, decl: &syntax::Decl) -> SingleDecl {
         match decl.kind {
             DeclKind::Type(node) | DeclKind::Const(node) | DeclKind::Var(node) => {
                 let node = match decl.nodes.kinds[node] {
@@ -172,7 +177,7 @@ impl FileMember {
 }
 
 #[haste::query]
-pub async fn file_scope(db: &dyn crate::Db, path: SourcePath) -> Result<HashMap<Text, FileMember>> {
+pub async fn file_scope(db: &dyn crate::Db, path: NormalPath) -> Result<HashMap<Text, FileMember>> {
     let ast = syntax::parse_file(db, path).await.as_ref()?;
     let resolved_imports = import::resolve_imports(db, ast).await?;
 
@@ -320,12 +325,12 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
         for decl in decls {
             let ast = syntax::parse_file(db, decl.source).await.as_ref()?;
             let message = if file_count > 1 {
-                let filename = decl.source.path(db).file_name().unwrap();
+                let filename = decl.source.file_name(db).unwrap();
                 format!("one definition in `{}`", filename.to_string_lossy())
             } else {
                 format!("one definition here")
             };
-            error = error.label(decl.span(ast), message);
+            error = error.label(decl.span_in_ast(ast), message);
         }
         combined.push(error);
     }

@@ -232,6 +232,16 @@ impl TransitiveDependencies {
     pub fn extend(&mut self, other: Self) {
         *self = self.combine(other);
     }
+
+    pub(crate) fn add_input(&mut self, revision: Revision) {
+        self.inputs = RevisionRange::join(
+            self.inputs,
+            Some(RevisionRange {
+                earliest: revision,
+                latest: revision,
+            }),
+        );
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

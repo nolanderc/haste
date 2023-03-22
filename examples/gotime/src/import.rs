@@ -9,17 +9,19 @@ use futures::Future;
 
 use crate::{
     common::Text,
-    error, fs, process,
+    error, fs,
+    path::{NormalPath, NormalPathData},
+    process,
     span::{FileRange, Span},
     syntax,
     util::future::{FutureExt, IteratorExt},
-    Result, SourcePath, Storage,
+    Result, Storage,
 };
 
 pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<Vec<FileSet>> {
     let mut resolved = Vec::with_capacity(ast.imports.len());
 
-    let go_mod = closest_go_mod(db, ast.source.path(db).clone()).await?;
+    let go_mod = closest_go_mod(db, ast.source.parent(db).unwrap()).await?;
     for import in ast.imports.iter() {
         resolved.push(resolve(db, import.path.text, go_mod).with_context(|error| {
             let span = ast.span(None, import.path.span);
@@ -35,21 +37,20 @@ pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<V
 pub async fn resolve(
     db: &dyn crate::Db,
     import_name: Text,
-    go_mod: Option<SourcePath>,
+    go_mod: Option<NormalPath>,
 ) -> Result<FileSet> {
     let name = import_name.get(db);
 
-    let goroot = process::go_var_path(db, "GOROOT").await?;
+    let candidates = [
+        NormalPathData::GoPath(Path::new("src").join(name).into()),
+        NormalPathData::GoRoot(Path::new("src").join(name).into()),
+        NormalPathData::GoRoot(Path::new("src/vendor").join(name).into()),
+    ];
 
-    let src_import_path: Arc<Path> = goroot.join("src").join(name).into();
-    if fs::is_dir(db, src_import_path.clone()).await {
-        return file_set_from_dir(db, src_import_path).await;
-    }
-
-    if name.starts_with("golang.org/x/") {
-        let vendor_import_path: Arc<Path> = goroot.join("src/vendor").join(name).into();
-        if fs::is_dir(db, vendor_import_path.clone()).await {
-            return file_set_from_dir(db, vendor_import_path).await;
+    for path in candidates {
+        let path = NormalPath::insert(db, path);
+        if fs::is_dir(db, path).await {
+            return file_set_from_dir(db, path).await;
         }
     }
 
@@ -60,7 +61,7 @@ pub async fn resolve(
 async fn resolve_import_go_list(
     db: &dyn crate::Db,
     name: &str,
-    go_mod: Option<SourcePath>,
+    go_mod: Option<NormalPath>,
 ) -> Result<FileSet> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
@@ -69,40 +70,31 @@ async fn resolve_import_go_list(
         go_files: Vec<PathBuf>,
     }
 
-    let mod_path = go_mod
-        .and_then(|path| path.path(db).parent())
-        .map(Arc::from);
-
-    let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_path).await?;
+    let mod_dir = go_mod.and_then(|path| path.parent(db));
+    let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_dir).await?;
     let pkg: GoListPackage = serde_json::from_slice(output).unwrap();
 
-    let files = pkg
-        .go_files
-        .into_iter()
-        .map(|file| Arc::from(pkg.dir.join(file)))
-        .collect();
-
-    file_set(db, files).await
+    let mut files = Vec::with_capacity(pkg.go_files.len());
+    for file in pkg.go_files {
+        let path = pkg.dir.join(file);
+        files.push(NormalPath::new(db, &path).await?);
+    }
+    file_set(db, files.into()).await
 }
 
-pub async fn closest_go_mod(db: &dyn crate::Db, mut path: Arc<Path>) -> Result<Option<SourcePath>> {
-    if fs::metadata(db, path.clone()).await?.is_file() {
-        match path.parent() {
-            Some(parent) => path = Arc::from(parent),
-            None => return Ok(None),
-        }
-    }
-
+pub async fn closest_go_mod(
+    db: &dyn crate::Db,
+    mut path: NormalPath,
+) -> Result<Option<NormalPath>> {
     loop {
-        let mod_path: Arc<Path> = path.join("go.mod").into();
-        if fs::is_file(db, mod_path.clone()).await {
-            return Ok(Some(SourcePath::new(db, mod_path)));
+        let mod_path = path.join(db, "go.mod").unwrap();
+
+        if fs::is_file(db, mod_path).await {
+            return Ok(Some(mod_path));
         }
 
-        match path.parent() {
-            Some(parent) => path = Arc::from(parent),
-            None => return Ok(None),
-        }
+        let Some(parent) = path.parent(db) else { return Ok(None) };
+        path = parent;
     }
 }
 
@@ -110,7 +102,7 @@ pub async fn closest_go_mod(db: &dyn crate::Db, mut path: Arc<Path>) -> Result<O
 #[haste::intern(FileSet)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FileSetData {
-    pub sources: Arc<[SourcePath]>,
+    pub sources: Arc<[NormalPath]>,
 }
 
 impl std::fmt::Debug for FileSetData {
@@ -120,7 +112,7 @@ impl std::fmt::Debug for FileSetData {
 }
 
 impl FileSetData {
-    pub fn iter(&self) -> impl Iterator<Item = SourcePath> + ExactSizeIterator + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = NormalPath> + ExactSizeIterator + '_ {
         self.sources.iter().copied()
     }
 
@@ -146,87 +138,84 @@ impl FileSet {
     pub fn iter(
         self,
         db: &dyn crate::Db,
-    ) -> impl Iterator<Item = SourcePath> + ExactSizeIterator + '_ {
+    ) -> impl Iterator<Item = NormalPath> + ExactSizeIterator + '_ {
         self.lookup(db).sources.iter().copied()
     }
 }
 
 #[haste::query]
 #[clone]
-pub async fn file_set(db: &dyn crate::Db, mut files: Vec<Arc<Path>>) -> Result<FileSet> {
+pub async fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Result<FileSet> {
     assert!(!files.is_empty());
 
-    if files.len() == 1 && fs::metadata(db, files[0].clone()).await?.is_dir() {
-        let dir_path = files.pop().unwrap();
-        return file_set_from_dir(db, dir_path).await;
+    if files.len() == 1 && fs::is_dir(db, files[0]).await {
+        return file_set_from_dir(db, files[0]).await;
     }
 
-    files.sort();
-    files.dedup();
+    let key = |path: &NormalPath| path.lookup(db);
 
-    let mut sources = Vec::with_capacity(files.len());
-
-    for file in files {
-        sources.push(SourcePath::new(db, file));
+    let mut is_sorted = true;
+    for window in files.windows(2) {
+        if key(&window[0]) > key(&window[1]) {
+            is_sorted = false;
+            break;
+        }
     }
 
-    Ok(FileSet::insert(
-        db,
-        FileSetData {
-            sources: Arc::from(sources),
-        },
-    ))
+    if !is_sorted {
+        let mut tmp = files.iter().copied().collect::<Vec<_>>();
+        tmp.sort_by_key(key);
+        tmp.dedup();
+        files = Arc::from(tmp);
+    }
+
+    Ok(FileSet::insert(db, FileSetData { sources: files }))
 }
 
-pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: Arc<Path>) -> Result<FileSet> {
-    let entries = fs::list_dir(db, dir_path.clone()).await.as_deref()?;
+pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: NormalPath) -> Result<FileSet> {
+    let entries = fs::list_dir(db, dir_path).await.as_deref()?;
 
-    let sources: Arc<[_]> = entries
+    let enabled = entries
         .iter()
-        .map(|path| is_enabled_source_file(db, path.clone()))
+        .map(|path| is_enabled_source_file(db, *path))
         .try_join_all()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        .await?;
+
+    let mut sources = Vec::with_capacity(entries.len());
+    for (&entry, enabled) in entries.iter().zip(enabled) {
+        if enabled {
+            sources.push(entry);
+        }
+    }
 
     if sources.is_empty() {
-        return Err(error!(
-            "no applicable source files found in `{}`",
-            dir_path.display()
-        ));
+        return Err(error!("no applicable source files found in `{dir_path}`",));
     }
+
+    let sources = Arc::from(sources);
 
     Ok(FileSet::insert(db, FileSetData { sources }))
 }
 
-pub async fn is_enabled_source_file(
-    db: &dyn crate::Db,
-    path: Arc<Path>,
-) -> Result<Option<SourcePath>> {
-    if !is_go_source_file(db, path.clone()).await {
-        return Ok(None);
+pub async fn is_enabled_source_file(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
+    if !is_go_source_file(db, path).await {
+        return Ok(false);
     }
 
-    let source = SourcePath::new(db, path.clone());
-    if !is_source_enabled(db, path, source).await? {
-        return Ok(None);
+    if !is_source_enabled(db, path).await? {
+        return Ok(false);
     }
 
-    Ok(Some(source))
+    Ok(true)
 }
 
-async fn is_go_source_file(db: &dyn crate::Db, path: Arc<Path>) -> bool {
-    let Some(extension) = path.extension() else { return false };
+async fn is_go_source_file(db: &dyn crate::Db, path: NormalPath) -> bool {
+    let Some(extension) = path.extension(db) else { return false };
     extension == "go" && fs::is_file(db, path).await
 }
 
-async fn is_source_enabled(
-    db: &dyn crate::Db,
-    path: Arc<Path>,
-    source: SourcePath,
-) -> Result<bool> {
-    let Some(stem) = path.file_stem() else { return Ok(false) };
+async fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
+    let Some(stem) = path.file_stem(db) else { return Ok(false) };
     let name = stem.to_string_lossy();
     let name_bytes = name.as_bytes();
 
@@ -248,7 +237,7 @@ async fn is_source_enabled(
                 .map(|ch| ch.len_utf8())
                 .unwrap_or(0);
             let range = FileRange::from(offset..offset + len);
-            let span = Span::new(source, range);
+            let span = Span::new(path, range);
             return Err(error!("malformed build constraint").label(span, ""));
         }
     };
@@ -418,7 +407,7 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    // we match any of: 
+    // we match any of:
     //  (1)   {name}_$GOOS.go
     //  (2)   {name}_$GOARCH.go
     //  (3)   {name}_$GOOS_$GOARCH.go

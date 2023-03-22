@@ -249,14 +249,6 @@ pub trait DatabaseExt: Database {
         let cache = storage.container();
         let path = cache.path();
 
-        if let Some(current) = runtime.current_query() {
-            assert!(
-                !current.is_input,
-                "{}: input queries may not invoke other queries",
-                crate::util::fmt::from_fn(|f| db.fmt_index(current.path, f))
-            );
-        }
-
         let future = cache.get_or_evaluate(db, input);
 
         crate::util::future::poll_fn_pin(future, move |future, cx| {
@@ -276,14 +268,6 @@ pub trait DatabaseExt: Database {
     {
         let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
-
-        if let Some(current) = runtime.current_query() {
-            assert!(
-                !current.is_input,
-                "{}: input queries may not invoke other queries",
-                crate::util::fmt::from_fn(|f| db.fmt_index(current.path, f))
-            );
-        }
 
         enum SpawnResult<Cached, Pending> {
             Cached(Cached),

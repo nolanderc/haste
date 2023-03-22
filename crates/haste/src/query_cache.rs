@@ -544,25 +544,22 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
 
         let id = this.inner.query().resource;
 
-        let result = std::task::ready!(this.inner.poll(cx));
+        let result = std::task::ready!(this.inner.as_mut().poll(cx));
         tracing::trace!("output ready");
 
-        let new = this.storage.create_output(result);
+        let mut new = this.storage.create_output(result);
         let mut slot = this.slot.take().unwrap();
 
         if let Some(last_changed) = slot.last_changed() {
-            if let Some(previous) = slot.get_output() {
-                if new.output == previous.output {
+            if let Some(old) = slot.get_output() {
+                if new.output == old.output {
                     // backdate the result (verify the output, but keep the revision it was last
                     // changed)
-                    previous.dependencies = new.dependencies;
-                    previous.transitive = new.transitive;
+                    old.dependencies = new.dependencies;
+                    old.transitive = new.transitive;
 
                     if Q::IS_INPUT {
-                        previous.transitive.as_mut().unwrap().inputs = Some(RevisionRange {
-                            earliest: last_changed,
-                            latest: last_changed,
-                        });
+                        old.transitive.as_mut().unwrap().add_input(last_changed);
                     }
 
                     tracing::debug!(reason = "output unchanged", "backdating");
@@ -573,6 +570,12 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
             }
 
             tracing::trace!("output changed");
+        }
+
+        if Q::IS_INPUT {
+            // all input queries implicitly depend on themselves
+            let current = this.inner.database().runtime().current_revision();
+            new.transitive.as_mut().unwrap().add_input(current);
         }
 
         let slot = slot.finish(new);

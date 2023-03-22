@@ -121,14 +121,14 @@ fn main() {
 
     eprintln!("total time: {:?}", start.elapsed());
 
-    let a = Text::new(&db, TextData("hello".into()));
-    let b = Text::new(&db, TextData("hello".into()));
+    let a = Text::insert(&db, TextData("hello".into()));
+    let b = Text::insert(&db, TextData("hello".into()));
     assert_eq!(a, b);
-    assert_eq!(a.get(&db).0, "hello");
-    assert_eq!(b.get(&db).0, "hello");
+    assert_eq!(a.lookup(&db).0, "hello");
+    assert_eq!(b.lookup(&db).0, "hello");
 
-    let name = Text::new(&db, TextData("John".into()));
-    let person = Person::new(&db, PersonData { name, age: 37 });
+    let name = Text::insert(&db, TextData("John".into()));
+    let person = Person::insert(&db, PersonData { name, age: 37 });
     assert_eq!(person.name(&db), name);
     assert_eq!(person.age(&db), 37);
 

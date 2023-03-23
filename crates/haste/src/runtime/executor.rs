@@ -2,7 +2,7 @@ mod injector;
 mod task;
 
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell},
     future::Future,
     mem::{ManuallyDrop, MaybeUninit},
     pin::Pin,
@@ -182,10 +182,17 @@ impl Executor {
             .map(|worker| LocalScheduler::new(shared.clone(), worker));
 
         let mut threads = Vec::with_capacity(worker_count);
-        for local in locals.by_ref().take(worker_count) {
-            threads.push(std::thread::spawn(move || {
-                local.run();
-            }));
+        for (index, local) in locals.by_ref().take(worker_count).enumerate() {
+            let result = std::thread::Builder::new()
+                .name(format!("haste-worker-{index}"))
+                .spawn(move || {
+                    local.run();
+                });
+
+            match result {
+                Ok(handle) => threads.push(handle),
+                Err(error) => tracing::error!(%error, "could not spawn worker thread"),
+            }
         }
 
         let local = locals.next();
@@ -261,8 +268,8 @@ impl Executor {
         let result = shared.state.compare_exchange(
             State::Running,
             State::Shutdown,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
         if result.is_err() {
             return false;
@@ -274,9 +281,20 @@ impl Executor {
             shared.wake_condition.notify_all();
         }
 
-        // if the local scheduler has any pending tasks we need to drop them:
-        if let Some(local) = self.local.lock().unwrap().as_ref() {
-            local.drain();
+        {
+            // if the local scheduler has any pending tasks we need to drop them:
+            let guard = match self.local.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    panic!("main scheduler still running when shutting down")
+                }
+            };
+            if let Some(guard) = guard {
+                if let Some(local) = guard.as_ref() {
+                    local.drain();
+                }
+            }
         }
 
         // wait until all workers are suspended:
@@ -367,7 +385,7 @@ struct LocalScheduler {
 }
 
 thread_local! {
-    static LOCAL: UnsafeCell<Option<LocalScheduler>> = UnsafeCell::new(None);
+    static LOCAL: RefCell<Option<LocalScheduler>> = RefCell::new(None);
 }
 
 impl LocalScheduler {
@@ -472,29 +490,26 @@ impl LocalScheduler {
 
     fn try_with<T>(f: impl FnOnce(Option<&LocalScheduler>) -> T) -> T {
         LOCAL.with(|cell| {
-            let local = unsafe { (*cell.get()).as_ref() };
-            f(local)
+            let local = cell.borrow();
+            f(local.as_ref())
         })
     }
 
     fn enter<T>(mut self, f: impl FnOnce(&LocalScheduler) -> T) -> (LocalScheduler, T) {
         LOCAL.with(|cell| {
-            let ptr = cell.get();
+            let old = cell
+                .try_borrow_mut()
+                .expect("a single thread cannot have two active schedulers")
+                .replace(self);
 
-            let local = unsafe {
-                assert!(
-                    (*ptr).is_none(),
-                    "a single thread cannot have two active schedulers"
-                );
-                ptr.write(Some(self));
-                (*ptr).as_ref().unwrap_unchecked()
+            let output = {
+                let local_ref = cell.borrow();
+                let local = local_ref.as_ref().unwrap();
+                let _tokio_guard = local.shared.tokio_handle.enter();
+                f(local)
             };
 
-            let tokio_guard = local.shared.tokio_handle.enter();
-            let output = f(local);
-            drop(tokio_guard);
-
-            self = unsafe { (*ptr).take().unwrap_unchecked() };
+            self = std::mem::replace(&mut *cell.borrow_mut(), old).unwrap();
 
             (self, output)
         })

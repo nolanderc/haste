@@ -1,6 +1,6 @@
 use crate::{
     arena::{Arena, RawArena},
-    non_max::NonMaxU32,
+    integer::NonMaxU32,
     shard_map::ShardMap,
     Change, ContainerPath, LastChangeFuture,
 };

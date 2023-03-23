@@ -16,7 +16,7 @@ pub async fn command(
     args: Arc<[Arc<str>]>,
     cwd: Option<NormalPath>,
 ) -> Result<std::process::Output, String> {
-    let mut command = tokio::process::Command::new(&*command);
+    let mut command = std::process::Command::new(&*command);
     command.args(args.iter().map(|arg| &**arg));
 
     if let Some(cwd) = cwd {
@@ -29,7 +29,7 @@ pub async fn command(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    command.output().await.map_err(|error| error.to_string())
+    command.output().map_err(|error| error.to_string())
 }
 
 pub async fn go(

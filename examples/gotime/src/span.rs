@@ -1,4 +1,4 @@
-use haste::non_max::NonMaxU32;
+use haste::integer::NonMaxU32;
 
 use crate::path::NormalPath;
 

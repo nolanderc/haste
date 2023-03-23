@@ -64,7 +64,7 @@ pub async fn resolve(
     }
 
     Err(error!("could not resolve the module `{import_name}`")
-        .help("make sure that all dependencies are vendored using `go vendor`"))
+        .help("make sure that all dependencies are vendored using `go mod vendor`"))
 }
 
 /// In case our logic fails to resolve an import we fall back to the reference Go compiler.

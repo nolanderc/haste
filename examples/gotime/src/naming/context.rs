@@ -216,10 +216,14 @@ impl<'db> NamingContext<'db> {
                 }
             }
             Node::Unary(_op, expr) => self.resolve_expr(expr),
-            Node::Binary(lhs, _op, rhs) => {
-                self.resolve_expr(lhs);
-                self.resolve_expr(rhs);
+
+            Node::Binary(interleaved) => {
+                for expr in self.nodes.indirect(interleaved).iter().step_by(2) {
+                    self.resolve_expr(*expr);
+                }
             }
+            Node::BinaryOp(_op) => {}
+
             Node::Function(signature, body) => self.resolve_func(signature, Some(body)),
             Node::Index(array, index) => {
                 self.resolve_expr(array);

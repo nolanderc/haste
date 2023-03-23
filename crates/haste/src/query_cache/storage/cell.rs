@@ -14,7 +14,7 @@ use futures_lite::FutureExt;
 use smallvec::SmallVec;
 
 use crate::{
-    non_max::NonMaxU32,
+    integer::NonMaxU32,
     revision::{AtomicRevision, Revision},
     Change, Cycle, Durability, Runtime,
 };

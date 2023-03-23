@@ -8,7 +8,7 @@ mod durability;
 pub mod fmt;
 mod input;
 pub mod interner;
-pub mod non_max;
+pub mod integer;
 pub mod query_cache;
 mod revision;
 mod runtime;
@@ -27,7 +27,7 @@ use runtime::QueryMetrics;
 pub use runtime::{Cycle, CycleStrategy, Dependency, Runtime};
 pub use storage::*;
 
-use non_max::NonMaxU32;
+use integer::NonMaxU32;
 use util::CallOnDrop;
 
 /// A generic value that uniquely identifies a resource within some ingredient.

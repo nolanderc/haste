@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    non_max::NonMaxU32, revision::Revision, Database, Dependency, DynQueryCache, Runtime,
+    integer::NonMaxU32, revision::Revision, Database, Dependency, DynQueryCache, Runtime,
     StaticDatabase, TransitiveDependencies, WithStorage,
 };
 

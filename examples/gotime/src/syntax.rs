@@ -1,10 +1,8 @@
 pub mod parse;
 mod print;
 
-use std::num::{NonZeroU16, NonZeroUsize};
-
 use bstr::BStr;
-use haste::non_max::{NonMaxU16, NonMaxU32};
+use haste::integer::{NonMaxU32, B32, U24};
 
 use crate::{
     key::{Base, Key, KeySlice, KeyVec, Relative},
@@ -62,17 +60,15 @@ impl File {
 /// References a span relative to the `base_span` in the closent containing declaration. If
 /// outside a declaration, the index is absolute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SpanId(NonMaxU16);
+pub struct SpanId(Relative<Key<Span>>);
 
 impl SpanId {
     fn from_relative(relative: Relative<Key<Span>>) -> SpanId {
-        use crate::key::KeyOps;
-        Self(NonMaxU16::new(relative.into_offset().index() as u16).unwrap())
+        Self(relative)
     }
 
     fn absolute(self) -> Key<Span> {
-        use crate::key::KeyOps;
-        Key::from_index(self.0.get() as usize)
+        self.0.into_offset()
     }
 
     fn relative(self) -> Relative<Key<Span>> {
@@ -169,7 +165,7 @@ pub struct FunctionBody {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
     /// The index of the first parmeter in the `indirect` node list.
-    start: NonMaxU16,
+    start: B32,
     /// The number of input parameters, or negative if variadic.
     inputs: i16,
     /// The number of output values.
@@ -178,7 +174,7 @@ pub struct Signature {
 
 impl Signature {
     fn new(nodes: NodeRange, outputs: u16) -> Self {
-        let inputs = nodes.length.get() - outputs;
+        let inputs = nodes.length.get() - outputs as u32;
         Self {
             start: nodes.start,
             inputs: i16::try_from(inputs).expect("too many function parameters"),
@@ -194,20 +190,20 @@ impl Signature {
 
     pub fn inputs(&self) -> NodeRange {
         let start = self.start;
-        let length = NonMaxU16::new(self.inputs.unsigned_abs()).unwrap();
+        let length = U24::new(self.inputs.unsigned_abs().into()).unwrap();
         NodeRange { start, length }
     }
 
     pub fn outputs(&self) -> NodeRange {
-        let start = self.start.get() + self.inputs.unsigned_abs();
-        let start = NonMaxU16::new(start).unwrap();
-        let length = NonMaxU16::new(self.outputs).unwrap();
+        let start = self.start.get() + u32::from(self.inputs.unsigned_abs());
+        let start = B32::new(start);
+        let length = U24::new(self.outputs.into()).unwrap();
         NodeRange { start, length }
     }
 
     pub fn inputs_and_outputs(&self) -> NodeRange {
         let start = self.start;
-        let length = NonMaxU16::new(self.inputs.unsigned_abs() + self.outputs).unwrap();
+        let length = U24::new(u32::from(self.inputs.unsigned_abs() + self.outputs)).unwrap();
         NodeRange { start, length }
     }
 }
@@ -268,7 +264,7 @@ impl NodeStorage {
 /// References a node in the current declaration.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId {
-    raw: NonZeroU16,
+    raw: NonMaxU32,
 }
 
 impl std::fmt::Debug for NodeId {
@@ -277,24 +273,27 @@ impl std::fmt::Debug for NodeId {
     }
 }
 
+impl NodeId {
+    fn new(index: usize) -> Option<Self> {
+        NonMaxU32::new(index as u32).map(|raw| Self { raw })
+    }
+}
+
 impl crate::key::KeyOps for NodeId {
     fn from_index(index: usize) -> Self {
-        let index = NonZeroUsize::new(1 + index).unwrap();
-        let raw = NonZeroU16::try_from(index)
-            .expect("exhausted syntax node IDs, try reducing the size of declarations");
-        Self { raw }
+        Self::new(index).expect("exhausted syntax node IDs")
     }
 
     fn index(self) -> usize {
-        (self.raw.get() - 1) as usize
+        self.raw.get() as usize
     }
 }
 
 /// Refers to a range of nodes in the `indirect` list.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeRange {
-    pub start: NonMaxU16,
-    pub length: NonMaxU16,
+    pub start: B32,
+    pub length: U24,
 }
 
 impl NodeRange {
@@ -334,6 +333,7 @@ impl std::fmt::Debug for NodeRange {
 
 macro_rules! node_id_wrapper {
     ($id:ident, $range:ident) => {
+        #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $id {
             pub node: NodeId,
@@ -358,6 +358,7 @@ macro_rules! node_id_wrapper {
             }
         }
 
+        #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $range {
             pub nodes: NodeRange,
@@ -487,8 +488,10 @@ pub enum Node {
     /// A unary/prefix operator (eg. `!true`)
     Unary(UnaryOperator, ExprId),
 
-    /// A binary operator (eg. `a + b`)
-    Binary(ExprId, BinaryOperator, ExprId),
+    /// A sequence of interleaved expressions and binary operators of the same precedence level:
+    /// `a + b - c | ... ^ z`
+    Binary(ExprRange),
+    BinaryOp(BinaryOperator),
 
     /// A function literal with a body
     Function(Signature, FunctionBody),
@@ -587,12 +590,12 @@ pub enum Node {
     For(Option<StmtId>, Option<ExprId>, Option<StmtId>, Block),
     /// `for range <expr> {...} `
     ForRangePlain(ExprId, Block),
-    /// `for <expr>, <expr?> = range <expr> {...} `
+    /// `for <expr>, <expr?> = range <expr> {...}`
     ForRange(ExprId, Option<ExprId>, AssignOrDefine, ExprId, Block),
 }
 
 const _: () = assert!(
-    std::mem::size_of::<Node>() <= 16,
+    std::mem::size_of::<Node>() <= 24,
     "syntax `Node`s should be kept small to reduce memory usage and cache misses"
 );
 

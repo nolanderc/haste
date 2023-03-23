@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use haste::non_max::NonMaxU32;
+use haste::integer::NonMaxU32;
 
 /// Like `Vec<T>`, but can only be indexed by a specific type.
 #[repr(transparent)]

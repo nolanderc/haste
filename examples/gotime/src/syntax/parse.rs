@@ -1,7 +1,7 @@
 use std::{borrow::Cow, ops::Range};
 
 use bstr::{BString, ByteSlice, ByteVec};
-use haste::non_max::NonMaxU32;
+use haste::integer::NonMaxU32;
 use smallvec::SmallVec;
 
 use crate::{
@@ -157,8 +157,8 @@ impl Data {
         self.node.indirect_stack.truncate(base);
 
         NodeRange {
-            start: NonMaxU16::new(start as u16).unwrap(),
-            length: NonMaxU16::new(length as u16).unwrap(),
+            start: B32::new(start as u32),
+            length: U24::new(length as u32).unwrap(),
         }
     }
 
@@ -261,6 +261,12 @@ impl<'a> Parser<'a> {
     fn advance(&mut self) {
         self.current_token += 1;
         self.expected.clear();
+    }
+
+    fn advance_and_get(&mut self) -> SpannedToken {
+        self.current_token += 1;
+        self.expected.clear();
+        self.tokens[self.current_token - 1]
     }
 
     fn peek(&self) -> Option<SpannedToken> {
@@ -483,7 +489,7 @@ impl<'a> Parser<'a> {
 
     fn node_range_span(&self, range: NodeRange) -> FileRange {
         let first = range.start.get();
-        let last = first + range.length.get().saturating_sub(1);
+        let last = first + range.length.get().saturating_sub(1) as u32;
 
         let base = self.data.base.node_indirect;
         let first_id = self.data.node.indirect[first as usize - base];
@@ -496,7 +502,12 @@ impl<'a> Parser<'a> {
         let index = self.data.node.kinds.len() - self.data.base.nodes;
         self.data.node.kinds.push(node);
         self.data.node.spans.push(span);
-        NodeId::from_index(index)
+
+        if let Some(id) = NodeId::new(index) {
+            id
+        } else {
+            panic!("exhausted node IDs in `{}`", self.path);
+        }
     }
 
     fn emit_stmt(&mut self, node: Node, span: SpanId) -> StmtId {
@@ -1948,21 +1959,44 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn binary_expr(&mut self, mut lhs: ExprId, min_precedence: u8) -> Result<ExprId> {
+    fn binary_expr(&mut self, lhs: ExprId, min_precedence: u8) -> Result<ExprId> {
+        let mut interleaved = SmallVec::<[ExprId; 7]>::new();
+        interleaved.push(lhs);
+
         while let Some(op) = self.peek_binary_op() {
             let current_precedence = op.precedence();
-            if current_precedence <= min_precedence {
+            if current_precedence < min_precedence {
                 break;
             }
-            self.advance();
+            let op_token = self.advance_and_get();
 
             let mut rhs = self.unary_expr()?;
-            rhs = self.binary_expr(rhs, current_precedence)?;
 
-            let span = self.emit_join(lhs, rhs);
-            lhs = self.emit_expr(Node::Binary(lhs, op, rhs), span);
+            if let Some(next) = self.peek_binary_op() {
+                if next.precedence() > current_precedence {
+                    rhs = self.binary_expr(rhs, current_precedence)?;
+                }
+            }
+
+            let op_span = self.emit_span(op_token);
+            interleaved.push(self.emit_expr(Node::BinaryOp(op), op_span));
+            interleaved.push(rhs);
         }
-        Ok(lhs)
+
+        if interleaved.len() == 1 {
+            return Ok(interleaved[0]);
+        }
+
+        let nodes = self.multi(|this| {
+            this.data
+                .node
+                .indirect_stack
+                .extend(interleaved.iter().map(|expr| expr.node));
+            Ok(())
+        })?;
+
+        let span = self.emit_span(nodes);
+        Ok(self.emit_expr(Node::Binary(ExprRange::new(nodes)), span))
     }
 
     fn peek_binary_op(&mut self) -> Option<BinaryOperator> {

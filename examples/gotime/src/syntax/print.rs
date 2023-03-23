@@ -519,34 +519,34 @@ fn write_node(
                 write!(out, "{op}")?;
                 recurse!(expr.node);
             }
-            Node::Binary(lhs, op, rhs) => {
-                let precedence = |expr: ExprId| match nodes.kinds[expr.node] {
-                    Node::Binary(_, op, _) => op.precedence(),
-                    _ => 123,
+
+            Node::Binary(interleaved) => {
+                let binary_precedence = |interleaved: ExprRange| {
+                    let op_node = nodes.indirect(interleaved)[1].node;
+                    let Node::BinaryOp(op) = nodes.kinds[op_node] else { unreachable!() };
+                    op.precedence()
                 };
 
-                if precedence(lhs) <= op.precedence() {
-                    // (a + b) * rhs
-                    write!(out, "(")?;
-                    write_node(out, nodes, lhs.node)?;
-                    write!(out, ")")?;
-                } else {
-                    write_node(out, nodes, lhs.node)?;
-                }
+                let expr_precedence = |expr: ExprId| match nodes.kinds[expr.node] {
+                    Node::Binary(others) => binary_precedence(others),
+                    _ => 123, // some large number
+                };
 
-                write!(out, " {op} ")?;
+                let current_precedence = binary_precedence(interleaved);
 
-                if precedence(rhs) < op.precedence() {
-                    // lhs * (b + c)
-                    write!(out, "(")?;
-                    write_node(out, nodes, rhs.node)?;
-                    write!(out, ")")?;
-                } else {
-                    recurse!(rhs.node);
+                for &expr in nodes.indirect(interleaved).iter() {
+                    if expr_precedence(expr) < current_precedence {
+                        write!(out, "(")?;
+                        write_node(out, nodes, expr.node)?;
+                        write!(out, ")")?;
+                    } else {
+                        write_node(out, nodes, expr.node)?;
+                    }
                 }
 
                 Ok(())
             }
+            Node::BinaryOp(op) => write!(out, " {op} "),
 
             Node::Array(size, inner) => {
                 write!(out, "[")?;

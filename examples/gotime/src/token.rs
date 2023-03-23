@@ -14,7 +14,7 @@
 use std::num::NonZeroU32;
 
 use bstr::{BStr, ByteSlice};
-use haste::non_max::NonMaxU32;
+use haste::integer::NonMaxU32;
 
 use crate::span::FileRange;
 

@@ -45,7 +45,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub(crate) fn new() -> Self {
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();

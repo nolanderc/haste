@@ -25,9 +25,7 @@ pub async fn read(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[u8]>> {
     let system_path = path.system_path(db).await?;
 
     let bytes = std::fs::read(system_path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            error!("file not found: `{path}`")
-        }
+        std::io::ErrorKind::NotFound => error!("file not found: `{path}`"),
         _ => error!("could not read file `{path}`: {error}"),
     })?;
 

@@ -1,9 +1,6 @@
 pub mod arc;
 pub mod fmt;
 pub mod future;
-mod signal;
-
-pub use signal::{DropSignal, Signal, WaitSignal};
 
 pub struct CallOnDrop<T, F: FnMut() -> T>(pub F);
 
@@ -50,6 +47,3 @@ pub fn debug_size_val<T: Sized>(_val: &T) {
     );
 }
 
-pub unsafe fn bytes_of<T>(data: &T) -> &[u8] {
-    std::slice::from_raw_parts(data as *const T as *const u8, std::mem::size_of::<T>())
-}

@@ -144,7 +144,7 @@ impl<'db> NamingContext<'db> {
                     self.resolved.insert(node, symbol);
                 } else {
                     self.emit(
-                        error!("could not find `{}` in the current scope", name)
+                        error!("could not find `{}` in `{}`", name, self.ast.source)
                             .label(self.node_span(node), ""),
                     );
                 }
@@ -243,12 +243,10 @@ impl<'db> NamingContext<'db> {
                 self.resolve_expr(cap);
             }
             Node::TypeDef(spec) | Node::TypeAlias(spec) => {
-                self.local_scope.enter();
                 if let Some(name) = spec.name.text {
                     self.local_scope.insert_local(name, node, 0);
                 }
                 self.resolve_type(spec.inner);
-                self.local_scope.exit();
             }
             Node::ConstDecl(names, typ, exprs) => {
                 if let Some(typ) = typ {

@@ -19,8 +19,8 @@ impl Injector {
     }
 
     pub fn push(&self, task: Task) {
-        self.tasks.lock().unwrap().push(task);
         self.approx_len.fetch_add(1, Relaxed);
+        self.tasks.lock().unwrap().push(task);
     }
 
     pub fn pop(&self) -> Option<Task> {

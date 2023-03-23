@@ -67,15 +67,18 @@ impl Task {
         unsafe { &*self.header }
     }
 
-    pub(super) fn poll(self) {
+    #[must_use]
+    pub fn poll(self) -> Option<Duration> {
         let header = self.header();
 
         if !header.state.try_begin_poll() {
-            return;
+            return None;
         }
 
         let waker = self.clone().into_waker();
         let mut cx = std::task::Context::from_waker(&waker);
+
+        let start_poll_time = std::time::Instant::now();
 
         unsafe {
             let future = header.future_ptr();
@@ -91,6 +94,8 @@ impl Task {
                 }
             }
         }
+
+        Some(start_poll_time.elapsed())
     }
 
     fn into_waker(self) -> Waker {

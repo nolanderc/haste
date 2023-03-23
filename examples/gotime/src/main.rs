@@ -47,6 +47,7 @@ pub struct Storage(
     import::resolve,
     import::FileSet,
     import::file_set,
+    import::sources_in_dir,
     compile,
     compile_package_files,
 );
@@ -270,7 +271,7 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
                     // Work around an issue on WSL where removing the file causes the watcher to stop
                     // working for that file. This is especially noticeable when saving in `vim`: it first
                     // removes the file before writing a new one it its place.
-                    _ = watcher.watch(&changed, notify::RecursiveMode::NonRecursive);
+                    _ = watcher.watch(&changed, notify::RecursiveMode::Recursive);
 
                     let path = if let Ok(relative) = changed.strip_prefix(&cwd) {
                         relative
@@ -313,8 +314,9 @@ fn run(db: &mut Database, arguments: Arguments) {
     });
 
     let real = start.elapsed();
+    let total = db.storage.runtime().poll_duration();
     let cpu = process.elapsed();
-    eprintln!("real: {:?} (cpu: {:?})", real, cpu);
+    eprintln!("real: {:?} (total: {:?}, cpu: {:?})", real, total, cpu);
 
     let bytes = std::mem::take(db.bytes.get_mut());
     let lines = std::mem::take(db.lines.get_mut());
@@ -403,7 +405,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
                                 let ast = syntax::parse_file(db, path.source).await.as_ref()?;
                                 let decl = &ast.declarations[path.index];
                                 let span = ast.span(Some(path.index), decl.nodes.spans[node]);
-                                Err(error.label(span, "referenced here"))
+                                Err(error.label(span, "referenced from here"))
                             }
                         }
                     });
@@ -430,6 +432,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
+    // resolve all errors in other packages
     packages.try_join_all().await?;
 
     Ok(Arc::new(Package {

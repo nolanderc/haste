@@ -6,7 +6,6 @@ use std::{
 
 use arrayvec::ArrayVec;
 use bstr::{BStr, ByteSlice};
-use std::future::Future;
 
 use crate::{
     common::Text,
@@ -61,7 +60,7 @@ pub async fn resolve(
     for path in candidates {
         let path = NormalPath::insert(db, path);
         if fs::is_dir(db, path).await {
-            return file_set_from_dir(db, path).await;
+            return Ok(FileSet::insert(db, FileSetData::Directory(path)));
         }
     }
 
@@ -78,19 +77,14 @@ async fn resolve_import_go_list(
     #[serde(rename_all = "PascalCase")]
     struct GoListPackage {
         dir: PathBuf,
-        go_files: Vec<PathBuf>,
     }
 
     let mod_dir = go_mod.and_then(|path| path.parent(db));
     let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_dir).await?;
     let pkg: GoListPackage = serde_json::from_slice(output).unwrap();
 
-    let mut files = Vec::with_capacity(pkg.go_files.len());
-    for file in pkg.go_files {
-        let path = pkg.dir.join(file);
-        files.push(NormalPath::new(db, &path).await?);
-    }
-    file_set(db, files.into()).await
+    let dir_path = NormalPath::new(db, &pkg.dir).await?;
+    Ok(FileSet::insert(db, FileSetData::Directory(dir_path)))
 }
 
 pub async fn closest_go_mod(
@@ -112,45 +106,35 @@ pub async fn closest_go_mod(
 /// A set of files which together represent an entire package.
 #[haste::intern(FileSet)]
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FileSetData {
-    pub sources: Arc<[NormalPath]>,
+pub enum FileSetData {
+    Sources(Arc<[NormalPath]>),
+    Directory(NormalPath),
 }
 
 impl std::fmt::Debug for FileSetData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
+        match self {
+            FileSetData::Sources(list) => list.fmt(f),
+            FileSetData::Directory(path) => path.fmt(f),
+        }
     }
 }
 
 impl FileSetData {
-    pub fn iter(&self) -> impl Iterator<Item = NormalPath> + ExactSizeIterator + '_ {
-        self.sources.iter().copied()
+    pub async fn sources(&self, db: &dyn crate::Db) -> Result<Arc<[NormalPath]>> {
+        match self {
+            FileSetData::Sources(sources) => Ok(sources.clone()),
+            FileSetData::Directory(dir_path) => sources_in_dir(db, *dir_path).await,
+        }
     }
 
-    pub fn len(&self) -> usize {
-        self.sources.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn parse<'db>(
-        &self,
-        db: &'db dyn crate::Db,
-    ) -> impl Future<Output = Result<Vec<&'db syntax::File>>> {
-        self.iter()
-            .map(|path| syntax::parse_file(db, path))
+    pub async fn parse<'db>(&self, db: &'db dyn crate::Db) -> Result<Vec<&'db syntax::File>> {
+        self.sources(db)
+            .await?
+            .iter()
+            .map(|path| syntax::parse_file(db, *path))
             .try_join_all()
-    }
-}
-
-impl FileSet {
-    pub fn iter(
-        self,
-        db: &dyn crate::Db,
-    ) -> impl Iterator<Item = NormalPath> + ExactSizeIterator + '_ {
-        self.lookup(db).sources.iter().copied()
+            .await
     }
 }
 
@@ -159,32 +143,35 @@ impl FileSet {
 pub async fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Result<FileSet> {
     assert!(!files.is_empty());
 
-    if files.len() == 1 && fs::is_dir(db, files[0]).await {
-        return file_set_from_dir(db, files[0]).await;
-    }
+    let data = if files.len() == 1 && fs::is_dir(db, files[0]).await {
+        FileSetData::Directory(files[0])
+    } else {
+        let key = |path: &NormalPath| path.lookup(db);
 
-    let key = |path: &NormalPath| path.lookup(db);
-
-    let mut is_sorted = true;
-    for window in files.windows(2) {
-        if key(&window[0]) > key(&window[1]) {
-            is_sorted = false;
-            break;
+        let mut is_sorted = true;
+        for window in files.windows(2) {
+            if key(&window[0]) > key(&window[1]) {
+                is_sorted = false;
+                break;
+            }
         }
-    }
 
-    if !is_sorted {
-        let mut tmp = files.iter().copied().collect::<Vec<_>>();
-        tmp.sort_by_key(key);
-        tmp.dedup();
-        files = Arc::from(tmp);
-    }
+        if !is_sorted {
+            let mut tmp = files.iter().copied().collect::<Vec<_>>();
+            tmp.sort_by_key(key);
+            tmp.dedup();
+            files = Arc::from(tmp);
+        }
+        FileSetData::Sources(files)
+    };
 
-    Ok(FileSet::insert(db, FileSetData { sources: files }))
+    Ok(FileSet::insert(db, data))
 }
 
-pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: NormalPath) -> Result<FileSet> {
-    let entries = fs::list_dir(db, dir_path).await.as_deref()?;
+#[haste::query]
+#[clone]
+pub async fn sources_in_dir(db: &dyn crate::Db, dir: NormalPath) -> Result<Arc<[NormalPath]>> {
+    let entries = fs::list_dir(db, dir).await.as_deref()?;
 
     let enabled = entries
         .iter()
@@ -200,12 +187,10 @@ pub async fn file_set_from_dir(db: &dyn crate::Db, dir_path: NormalPath) -> Resu
     }
 
     if sources.is_empty() {
-        return Err(error!("no applicable source files found in `{dir_path}`",));
+        return Err(error!("no applicable source files found in `{dir}`",));
     }
 
-    let sources = Arc::from(sources);
-
-    Ok(FileSet::insert(db, FileSetData { sources }))
+    Ok(Arc::from(sources))
 }
 
 pub async fn is_enabled_source_file(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {

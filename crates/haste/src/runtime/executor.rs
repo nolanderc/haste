@@ -8,13 +8,14 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{
-            AtomicU32, AtomicUsize,
+            AtomicU32, AtomicU64, AtomicUsize,
             Ordering::{self, Acquire, Relaxed, Release},
         },
         Arc, Condvar, Mutex, Weak,
     },
     task::{Poll, RawWaker, RawWakerVTable, Waker},
     thread::JoinHandle,
+    time::Duration,
 };
 
 use crossbeam_utils::CachePadded;
@@ -43,6 +44,11 @@ struct Shared {
     /// tasks may be spawned in the tokio runtime, as we cannot guarantee that they are dropped
     /// when `stop` is called.
     tokio_handle: tokio::runtime::Handle,
+
+    /// Total number of nanoseconds spent polling tasks. This represents the amount of effective
+    /// work performed by the executor. Everything else is considered runtime overhead. The value
+    /// is updated each time the executor shuts down.
+    poll_duration: CachePadded<AtomicU64>,
 
     injector: Injector,
     workers: Vec<WorkerState>,
@@ -126,10 +132,22 @@ const MAX_LOCAL_TASKS: usize = 256;
 
 impl Executor {
     pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            .saturating_sub(1);
+        const ENV: &str = "HASTE_WORKER_THREADS";
+        let worker_count = std::env::var(ENV)
+            .ok()
+            .and_then(|var| match var.parse::<usize>() {
+                Ok(count) => Some(count),
+                Err(error) => {
+                    tracing::warn!(
+                        value = var,
+                        %error,
+                        "could not parse the value of {ENV}"
+                    );
+                    None
+                }
+            })
+            .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
+            .unwrap_or(8);
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))
@@ -137,6 +155,7 @@ impl Executor {
 
         let shared = Arc::new(Shared {
             tokio_handle,
+            poll_duration: CachePadded::new(AtomicU64::new(0)),
 
             injector: Injector::new(),
             workers: workers
@@ -225,6 +244,8 @@ impl Executor {
     pub fn start(&self) -> bool {
         let shared = &*self.shared;
 
+        self.shared.poll_duration.store(0, Relaxed);
+
         let result = shared.state.compare_exchange(
             State::Shutdown,
             State::Running,
@@ -278,6 +299,12 @@ impl Executor {
         }
 
         true
+    }
+
+    /// The amount of time spent polling tasks since the executor was last started.
+    pub fn poll_duration(&self) -> Duration {
+        let nanos = self.shared.poll_duration.load(Relaxed);
+        Duration::from_nanos(nanos)
     }
 
     fn terminate(&mut self) {
@@ -334,6 +361,9 @@ struct LocalScheduler {
     /// immediately awaits it. This way other threads don't immediately try to steal it, which in
     /// turn leads to better thread and cache locality and less contention on the stealers.
     reserved_next: Cell<Option<Task>>,
+
+    /// Duration spent in `Task::poll`. See `Shared::poll_duration`.
+    poll_duration: Cell<Duration>,
 }
 
 thread_local! {
@@ -346,12 +376,17 @@ impl LocalScheduler {
             shared,
             queue,
             reserved_next: Cell::new(None),
+            poll_duration: Cell::new(Duration::ZERO),
         }
     }
 
     fn run(mut self) -> Self {
         (self, _) = self.enter(|local| {
             let _suspend_guard = CallOnDrop(|| {
+                // make sure we don't hold on to any dead state.
+                local.publish_reserved_tasks();
+                local.publish_poll_duration();
+
                 // When the worker exits, mark it as suspended so that the executor can terminate
                 // gracefully without waiting endlessly for this thread to complete:
                 if let Ok(mut suspended) = local.shared.suspended_workers.try_lock() {
@@ -360,7 +395,7 @@ impl LocalScheduler {
             });
 
             while let Some(task) = local.next_task() {
-                task.poll();
+                local.poll_task(task);
             }
         });
         self
@@ -409,11 +444,11 @@ impl LocalScheduler {
 
                 if let Some(task) = local.try_next_task() {
                     stalled_count = 0;
-                    task.poll();
+                    local.poll_task(task);
                 } else {
                     stalled_count = stalled_count.saturating_add(1);
 
-                    if stalled_count >= max_stalled_count {
+                    if stalled_count > max_stalled_count {
                         std::thread::yield_now();
                     } else {
                         std::hint::spin_loop();
@@ -423,8 +458,16 @@ impl LocalScheduler {
         });
 
         this.publish_reserved_tasks();
+        this.publish_poll_duration();
 
         (this, output)
+    }
+
+    fn poll_task(&self, task: Task) {
+        if let Some(duration) = task.poll() {
+            let old = self.poll_duration.get();
+            self.poll_duration.set(old + duration);
+        }
     }
 
     fn try_with<T>(f: impl FnOnce(Option<&LocalScheduler>) -> T) -> T {
@@ -571,6 +614,7 @@ impl LocalScheduler {
 
     fn suspend_shutdown(&self) {
         self.drain();
+        self.publish_poll_duration();
 
         let shared = &*self.shared;
 
@@ -589,6 +633,12 @@ impl LocalScheduler {
         }
 
         *suspended -= 1;
+    }
+
+    fn publish_poll_duration(&self) {
+        let poll_nanos = self.poll_duration.take().as_nanos();
+        let poll_nanos = poll_nanos.min(u64::MAX as u128) as u64;
+        self.shared.poll_duration.fetch_add(poll_nanos, Relaxed);
     }
 
     fn schedule(&self, task: Task) {

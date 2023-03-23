@@ -127,14 +127,17 @@ impl Db for Database {
     fn path_durability_untracked(&self, path: NormalPath) -> Durability {
         match path.lookup(self) {
             path::NormalPathData::Relative(path) => {
+                if path.components().any(|c| c.as_os_str() == "vendor") {
+                    return Durability::HIGH
+                }
+
                 if path.extension() == Some(OsStr::new("go")) {
                     Durability::LOW
                 } else {
                     Durability::MEDIUM
                 }
             }
-            path::NormalPathData::GoPath(_) => Durability::MEDIUM,
-            path::NormalPathData::GoRoot(_) => Durability::HIGH,
+            path::NormalPathData::GoPath(_) | path::NormalPathData::GoRoot(_) => Durability::HIGH,
         }
     }
 }

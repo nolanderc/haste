@@ -67,6 +67,7 @@ impl Severity {
 enum Attachment {
     Label(Label),
     Note(String),
+    Help(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -144,6 +145,10 @@ impl Diagnostic {
 
     pub fn note(self, note: impl ToString) -> Self {
         self.attach(Attachment::Note(note.to_string()))
+    }
+
+    pub fn help(self, help: impl ToString) -> Self {
+        self.attach(Attachment::Help(help.to_string()))
     }
 }
 
@@ -226,8 +231,11 @@ impl Attachment {
         use Style::*;
         match self {
             Attachment::Label(label) => label.format(parent_severity, sources, last, out),
-            Attachment::Note(note) => {
-                writeln!(out, "{Bold}{Green}note: {Default}{Bold}{note}{Default}")
+            Attachment::Note(text) => {
+                writeln!(out, "{Bold}{Cyan}note: {Default}{Bold}{text}{Default}")
+            }
+            Attachment::Help(text) => {
+                writeln!(out, "{Bold}{Green}help: {Default}{Bold}{text}{Default}")
             }
         }
     }
@@ -402,7 +410,7 @@ impl Diagnostic {
             for attachment in attachments {
                 let path = match attachment {
                     Attachment::Label(label) => label.span.path,
-                    Attachment::Note(_) => continue,
+                    Attachment::Note(_) | Attachment::Help(_) => continue,
                 };
 
                 if sources.insert(path) {

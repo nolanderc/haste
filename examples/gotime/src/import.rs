@@ -43,19 +43,18 @@ pub async fn resolve(
 
     let mut candidates = ArrayVec::<_, 4>::new();
 
-    let from_goroot = matches!(
-        go_mod.map(|path| path.lookup(db)),
-        Some(NormalPathData::GoRoot(_))
-    );
+    // check the standard library first
+    candidates.push(NormalPathData::GoRoot(Path::new("src").join(name).into()));
 
-    if !from_goroot {
-        candidates.push(NormalPathData::GoPath(Path::new("src").join(name).into()));
+    // then vendored dependencies
+    if let Some(mod_path) = go_mod {
+        let mod_dir = mod_path.lookup(db).parent().unwrap();
+        candidates.push(mod_dir.join("vendor").unwrap().join(name).unwrap());
     }
 
-    candidates.push(NormalPathData::GoRoot(Path::new("src").join(name).into()));
-    candidates.push(NormalPathData::GoRoot(
-        Path::new("src/vendor").join(name).into(),
-    ));
+    // and GOPATH last (if coming from the standard library we don't want to reduce its durability
+    // by depending on files outside the root directory)
+    candidates.push(NormalPathData::GoPath(Path::new("src").join(name).into()));
 
     for path in candidates {
         let path = NormalPath::insert(db, path);
@@ -64,10 +63,12 @@ pub async fn resolve(
         }
     }
 
-    resolve_import_go_list(db, name, go_mod).await
+    Err(error!("could not resolve the module `{import_name}`")
+        .help("make sure that all dependencies are vendored using `go vendor`"))
 }
 
 /// In case our logic fails to resolve an import we fall back to the reference Go compiler.
+#[allow(dead_code)]
 async fn resolve_import_go_list(
     db: &dyn crate::Db,
     name: &str,

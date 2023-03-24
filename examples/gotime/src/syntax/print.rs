@@ -369,10 +369,10 @@ fn write_node(
                     let mut previous = None;
                     for &item in nodes.indirect(list) {
                         let Node::ConstDecl(names, typ, values) = nodes.kinds[item] else {
-                        unreachable!()
-                    };
+                            unreachable!()
+                        };
                         write_const_spec(out, nodes, names, typ, values, previous)?;
-                        previous = Some(values);
+                        previous = values;
                         writeln!(out)?;
                     }
                     Ok(())
@@ -870,7 +870,7 @@ fn write_const_spec(
     nodes: &NodeStorage,
     names: NodeRange,
     typ: Option<TypeId>,
-    values: ExprRange,
+    values: Option<ExprRange>,
     previous_values: Option<ExprRange>,
 ) -> std::fmt::Result {
     write_node_list(out, nodes, names)?;
@@ -878,9 +878,11 @@ fn write_const_spec(
         write!(out, " ")?;
         write_node(out, nodes, typ.node)?;
     }
-    if Some(values) != previous_values {
-        write!(out, " = ")?;
-        write_node_list(out, nodes, values.nodes)?;
+    if values != previous_values {
+        if let Some(values) = values {
+            write!(out, " = ")?;
+            write_node_list(out, nodes, values.nodes)?;
+        }
     }
     Ok(())
 }

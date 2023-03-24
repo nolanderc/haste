@@ -543,6 +543,7 @@ impl Metrics {
 #[derive(Default)]
 struct Span {
     duration: Duration,
+    max_duration: Duration,
     count: usize,
 }
 
@@ -572,6 +573,7 @@ pub struct SpanGuard {
 }
 
 impl Drop for SpanGuard {
+    #[inline]
     fn drop(&mut self) {
         if cfg!(feature = "metrics") {
             METRICS.with(|metrics| {
@@ -580,25 +582,22 @@ impl Drop for SpanGuard {
                 let duration = start.elapsed();
                 let span = metrics.spans.entry(name).or_default();
                 span.duration += duration;
+                span.max_duration = duration.max(span.max_duration);
                 span.count += 1;
             })
         }
     }
 }
 
-fn print_metrics() {
+fn publish_metrics() {
     if cfg!(feature = "metrics") {
         METRICS.with(|metrics| {
             let mut metrics = metrics.borrow_mut();
-
-            let thread = std::thread::current();
-            let name = thread.name().unwrap_or("<unknown>");
-            print_metrics_impl(name, &metrics).unwrap();
-
             let mut global = GLOBAL_METRICS.lock().unwrap();
             for (name, span) in metrics.spans.drain() {
                 let global_span = global.spans.entry(name).or_default();
                 global_span.duration += span.duration;
+                global_span.max_duration = span.max_duration.max(global_span.max_duration);
                 global_span.count += span.count;
             }
         });
@@ -607,12 +606,17 @@ fn print_metrics() {
 
 fn print_global_metrics() {
     if cfg!(feature = "metrics") {
-        let global = GLOBAL_METRICS.lock().unwrap();
-        print_metrics_impl("global", &global).unwrap();
+        let mut global = GLOBAL_METRICS.lock().unwrap();
+        print_metrics_impl(&global).unwrap();
+        global.spans.clear();
     }
 }
 
-fn print_metrics_impl(name: &str, metrics: &Metrics) -> std::io::Result<()> {
+fn print_metrics_impl(metrics: &Metrics) -> std::io::Result<()> {
+    if metrics.spans.is_empty() {
+        return Ok(());
+    }
+
     use std::io::Write;
 
     let mut spans = metrics.spans.iter().collect::<Vec<_>>();
@@ -626,11 +630,73 @@ fn print_metrics_impl(name: &str, metrics: &Metrics) -> std::io::Result<()> {
     let stderr = std::io::stderr().lock();
     let mut writer = std::io::BufWriter::new(stderr);
 
-    writeln!(writer, "Metrics {:?}:", name)?;
+    let name_header = "name";
+
+    writeln!(
+        writer,
+        " {:>7}  {:>7}  {:>7}  {:>7}  {:<7}",
+        "total", "max", "average", "count", name_header
+    )?;
+
+    let mut longest_name = name_header.len();
+    for (name, _) in spans.iter() {
+        longest_name = name.len().max(longest_name);
+    }
+
+    writeln!(
+        writer,
+        " -------  -------  -------  -------  {}",
+        "-".repeat(longest_name),
+    )?;
+
     for (name, span) in spans {
-        writeln!(writer, " - {}: {:?} (x{})", name, span.duration, span.count)?;
+        let rate = span.duration / span.count as u32;
+        writeln!(
+            writer,
+            " {:>7}  {:>7}  {:>7}  {:>7}  {}",
+            PrettyDuration(span.duration),
+            PrettyDuration(span.max_duration),
+            PrettyDuration(rate),
+            span.count,
+            name,
+        )?;
     }
     writeln!(writer)?;
 
     Ok(())
+}
+
+struct PrettyDuration(Duration);
+
+impl std::fmt::Display for PrettyDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut count = self.0.as_nanos();
+        let mut unit = "ns";
+
+        if count >= 10000 {
+            count /= 1000;
+            unit = "µs";
+        }
+
+        if count >= 10000 {
+            count /= 1000;
+            unit = "ms";
+        }
+
+        if count >= 10000 {
+            count /= 1000;
+            unit = "s";
+        }
+
+        let mut buffer = [0u8; 32];
+        let mut writer = std::io::Cursor::new(&mut buffer[..]);
+
+        use std::io::Write;
+        write!(writer, "{count}{unit}").unwrap();
+
+        let written = writer.position() as usize;
+        let text = std::str::from_utf8(&buffer[..written]).unwrap();
+
+        f.pad(text)
+    }
 }

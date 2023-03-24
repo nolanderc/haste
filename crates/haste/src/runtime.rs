@@ -510,15 +510,6 @@ impl Runtime {
         // scheduled on a stopped executor)
         self.graph.clear();
     }
-
-    /// The total amount of time spent polling tasks on all threads during the last scope.
-    ///
-    /// This represents the amount of time spent doing actual work, and not overhead from
-    /// distributing tasks. This can therefore be used to measure the amount of overhead inherent
-    /// in synchronising all worker threads.
-    pub fn poll_duration(&self) -> Duration {
-        self.executor.poll_duration()
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

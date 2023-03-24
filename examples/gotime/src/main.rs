@@ -320,9 +320,8 @@ fn run(db: &mut Database, arguments: Arguments) {
     });
 
     let real = start.elapsed();
-    let total = db.storage.runtime().poll_duration();
     let cpu = process.elapsed();
-    eprintln!("real: {:?} (total: {:?}, cpu: {:?})", real, total, cpu);
+    eprintln!("real: {:?} (cpu: {:?})", real, cpu);
 
     let bytes = std::mem::take(db.bytes.get_mut());
     let lines = std::mem::take(db.lines.get_mut());

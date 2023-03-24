@@ -17,7 +17,13 @@ use crate::{
 use self::context::NamingContext;
 
 #[haste::storage]
-pub struct Storage(file_scope, package_scope, exported_decls, package_name, decl_symbols);
+pub struct Storage(
+    file_scope,
+    package_scope,
+    exported_decls,
+    package_name,
+    decl_symbols,
+);
 
 /// Uniquely identifies a declaration somewhere in the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,13 +133,16 @@ impl SubIndex {
                     Node::VarDecl(names, typ, exprs) => {
                         let col = self.col as usize;
                         let name = decl.nodes.indirect(names)[col];
-                        let expr = exprs.map(|exprs| decl.nodes.indirect(exprs)[col]);
+                        let expr = exprs.map(|exprs| {
+                            let exprs = decl.nodes.indirect(exprs);
+                            exprs[col.min(exprs.len() - 1)]
+                        });
                         SingleDecl::VarDecl(name, typ, expr)
                     }
                     Node::ConstDecl(names, typ, exprs) => {
                         let col = self.col as usize;
                         let name = decl.nodes.indirect(names)[col];
-                        let expr = decl.nodes.indirect(exprs)[col];
+                        let expr = decl.nodes.indirect(exprs.unwrap())[col];
                         SingleDecl::ConstDecl(name, typ, expr)
                     }
                     _ => unreachable!(),
@@ -278,7 +287,27 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                                 let sub = SubIndex { row, col: 0 };
                                 register(name, index, sub);
                             }
-                            Node::VarDecl(names, _, _) | Node::ConstDecl(names, _, _) => {
+                            Node::VarDecl(names, _, exprs) | Node::ConstDecl(names, _, exprs) => {
+                                if let Some(exprs) = exprs {
+                                    if names.length != exprs.nodes.length {
+                                        let is_call = exprs.nodes.length.get() == 1 && {
+                                            let expr = decl.nodes.indirect(exprs)[0];
+                                            let kind = decl.nodes.kinds[expr.node];
+                                            matches!(kind, Node::Call(_, _, _))
+                                        };
+
+                                        if !is_call {
+                                            let name_span = ast.range_span(index, names).unwrap();
+                                            let value_span = ast.range_span(index, exprs).unwrap();
+                                            return Err(error!(
+                                                "number of names and expressions must match"
+                                            )
+                                            .label(name_span, "")
+                                            .label(value_span, ""));
+                                        }
+                                    }
+                                }
+
                                 for (col, &name) in decl.nodes.indirect(names).iter().enumerate() {
                                     let col = col as u16;
                                     let sub = SubIndex { row, col };

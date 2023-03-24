@@ -55,6 +55,20 @@ impl File {
         };
         Span::new(self.source, self.span_ranges[absolute])
     }
+
+    pub fn node_span(&self, decl: Key<Decl>, node: impl Into<NodeId>) -> Span {
+        let decl = &self.declarations[decl];
+        let span = decl.nodes.spans[node.into()];
+        let absolute = decl.base_span.offset(span.relative());
+        Span::new(self.source, self.span_ranges[absolute])
+    }
+
+    pub fn range_span(&self, decl: Key<Decl>, range: impl Into<NodeRange>) -> Option<Span> {
+        let nodes = self.declarations[decl].nodes.indirect(range.into());
+        let first = *nodes.first()?;
+        let last = *nodes.last()?;
+        Some(self.node_span(decl, first).join(self.node_span(decl, last)))
+    }
 }
 
 /// References a span relative to the `base_span` in the closent containing declaration. If
@@ -515,7 +529,7 @@ pub enum Node {
     TypeList(NodeRange),
 
     /// A single const-declaration: `const a, b, c int = 1, 2, 3`
-    ConstDecl(NodeRange, Option<TypeId>, ExprRange),
+    ConstDecl(NodeRange, Option<TypeId>, Option<ExprRange>),
     /// A sequence of `ConstDecl`s
     ConstList(NodeRange),
 

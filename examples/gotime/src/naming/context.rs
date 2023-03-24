@@ -137,6 +137,8 @@ impl<'db> NamingContext<'db> {
     }
 
     fn resolve_node(&mut self, node: NodeId) {
+        // TODO: don't visit the same nodes twice (for example in multiline const decls)
+
         match self.nodes.kinds[node] {
             Node::Name(None) => {}
             Node::Name(Some(name)) => {
@@ -256,7 +258,7 @@ impl<'db> NamingContext<'db> {
                 if let Some(typ) = typ {
                     self.resolve_type(typ);
                 }
-                self.resolve_range(exprs);
+                self.resolve_range(exprs.unwrap());
                 for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
                     let Node::Name(Some(name)) = self.nodes.kinds[node] else { continue };
                     self.local_scope.insert_local(name, node, i as u16);

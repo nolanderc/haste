@@ -59,7 +59,6 @@ impl Task {
     where
         F: Future<Output = ()> + Send,
     {
-        TASK_COUNT.fetch_add(1, Relaxed);
         let ptr = Box::into_raw(task);
         Self { header: ptr.cast() }
     }
@@ -68,24 +67,12 @@ impl Task {
         unsafe { &*self.header }
     }
 
-    #[must_use]
-    pub fn poll(self) -> Option<Duration> {
+    pub fn poll(self) {
         let _guard = crate::enter_span("poll task");
 
         let header = self.header();
 
-        let start_poll_time = std::time::Instant::now();
-        let mut has_polled = false;
-
-        loop {
-            if !header.state.try_begin_poll() {
-                if has_polled {
-                    break;
-                } else {
-                    return None;
-                }
-            }
-
+        while header.state.try_begin_poll() {
             let waker = self.clone().into_waker();
             let mut cx = std::task::Context::from_waker(&waker);
 
@@ -98,18 +85,13 @@ impl Task {
                         break;
                     }
                     Poll::Pending => {
-                        PENDING_COUNT.fetch_add(1, Relaxed);
                         if header.state.end_poll_pending() {
                             break;
                         }
                     }
                 }
             }
-
-            has_polled = true;
         }
-
-        Some(start_poll_time.elapsed())
     }
 
     fn into_waker(self) -> Waker {

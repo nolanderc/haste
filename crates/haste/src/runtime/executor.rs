@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{
-            AtomicU32, AtomicU64, AtomicUsize,
+            AtomicU32, AtomicUsize,
             Ordering::{self, Acquire, Relaxed, Release},
         },
         Arc, Condvar, Mutex, Weak,
@@ -44,11 +44,6 @@ struct Shared {
     /// tasks may be spawned in the tokio runtime, as we cannot guarantee that they are dropped
     /// when `stop` is called.
     tokio_handle: tokio::runtime::Handle,
-
-    /// Total number of nanoseconds spent polling tasks. This represents the amount of effective
-    /// work performed by the executor. Everything else is considered runtime overhead. The value
-    /// is updated each time the executor shuts down.
-    poll_duration: CachePadded<AtomicU64>,
 
     injector: Injector,
     workers: Vec<WorkerState>,
@@ -155,7 +150,6 @@ impl Executor {
 
         let shared = Arc::new(Shared {
             tokio_handle,
-            poll_duration: CachePadded::new(AtomicU64::new(0)),
 
             injector: Injector::new(),
             workers: workers
@@ -251,8 +245,6 @@ impl Executor {
     pub fn start(&self) -> bool {
         let shared = &*self.shared;
 
-        self.shared.poll_duration.store(0, Relaxed);
-
         let result = shared.state.compare_exchange(
             State::Shutdown,
             State::Running,
@@ -316,19 +308,10 @@ impl Executor {
             *suspended_workers -= local.is_some() as usize;
         }
 
-        crate::print_metrics();
-
-        eprintln!("total tasks: {}", TASK_COUNT.swap(0, Relaxed));
-        eprintln!("poll count: {}", POLLED_COUNT.swap(0, Relaxed));
-        eprintln!("pending: {}", PENDING_COUNT.swap(0, Relaxed));
+        crate::publish_metrics();
+        crate::print_global_metrics();
 
         true
-    }
-
-    /// The amount of time spent polling tasks since the executor was last started.
-    pub fn poll_duration(&self) -> Duration {
-        let nanos = self.shared.poll_duration.load(Relaxed);
-        Duration::from_nanos(nanos)
     }
 
     fn terminate(&mut self) {
@@ -387,9 +370,6 @@ struct LocalScheduler {
     /// immediately awaits it. This way other threads don't immediately try to steal it, which in
     /// turn leads to better thread and cache locality and less contention on the stealers.
     reserved_next: Cell<Option<Task>>,
-
-    /// Duration spent in `Task::poll`. See `Shared::poll_duration`.
-    poll_duration: Cell<Duration>,
 }
 
 thread_local! {
@@ -402,7 +382,6 @@ impl LocalScheduler {
             shared,
             queue,
             reserved_next: Cell::new(None),
-            poll_duration: Cell::new(Duration::ZERO),
         }
     }
 
@@ -411,7 +390,6 @@ impl LocalScheduler {
             let _suspend_guard = CallOnDrop(|| {
                 // make sure we don't hold on to any dead state.
                 local.publish_reserved_tasks();
-                local.publish_poll_duration();
 
                 // When the worker exits, mark it as suspended so that the executor can terminate
                 // gracefully without waiting endlessly for this thread to complete:
@@ -422,7 +400,6 @@ impl LocalScheduler {
 
             while let Some(task) = local.next_task() {
                 local.poll_task(task);
-                POLLED_COUNT.fetch_add(1, Relaxed);
             }
         });
         self
@@ -485,16 +462,12 @@ impl LocalScheduler {
         });
 
         this.publish_reserved_tasks();
-        this.publish_poll_duration();
 
         (this, output)
     }
 
     fn poll_task(&self, task: Task) {
-        if let Some(duration) = task.poll() {
-            let old = self.poll_duration.get();
-            self.poll_duration.set(old + duration);
-        }
+        task.poll();
     }
 
     fn try_with<T>(f: impl FnOnce(Option<&LocalScheduler>) -> T) -> T {
@@ -638,9 +611,8 @@ impl LocalScheduler {
 
     fn suspend_shutdown(&self) {
         self.drain();
-        self.publish_poll_duration();
 
-        crate::print_metrics();
+        crate::publish_metrics();
 
         let shared = &*self.shared;
 
@@ -661,12 +633,6 @@ impl LocalScheduler {
         *suspended -= 1;
     }
 
-    fn publish_poll_duration(&self) {
-        let poll_nanos = self.poll_duration.take().as_nanos();
-        let poll_nanos = poll_nanos.min(u64::MAX as u128) as u64;
-        self.shared.poll_duration.fetch_add(poll_nanos, Relaxed);
-    }
-
     fn schedule(&self, task: Task) {
         if let Some(old) = self.reserved_next.replace(Some(task)) {
             self.schedule_stealable(old);
@@ -682,7 +648,3 @@ impl LocalScheduler {
         }
     }
 }
-
-static POLLED_COUNT: AtomicUsize = AtomicUsize::new(0);
-static TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);

@@ -121,6 +121,10 @@ impl<K, T> KeyVec<K, T> {
         // SAFETY: `KeySlice` is a `repr(transparent)` wrapper around `[T]`
         unsafe { std::mem::transmute(self.inner.as_mut_slice()) }
     }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
 }
 
 impl<K: KeyOps, T> KeyVec<K, T> {

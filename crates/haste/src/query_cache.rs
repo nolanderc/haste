@@ -501,6 +501,7 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
         let mut this = self.project();
 
         let _span_guard = this.span.enter();
+        let _guard = crate::enter_span(format!("poll {}", std::any::type_name::<Q>()));
 
         loop {
             match this.state.as_mut().project() {
@@ -516,7 +517,9 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
                         }
                     }
                 }
-                TaskStateProj::Exec(future) => break Future::poll(future, cx),
+                TaskStateProj::Exec(future) => {
+                    break Future::poll(future, cx);
+                }
             }
         }
     }

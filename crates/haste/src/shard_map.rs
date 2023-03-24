@@ -3,12 +3,13 @@ use std::{
     sync::RwLock,
 };
 
+use crossbeam_utils::CachePadded;
 use hashbrown::raw::RawTable;
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
 
 pub struct ShardMap<T, Hasher = BuildHasherDefault, const SHARDS: usize = 32> {
-    shards: [Shard<T>; SHARDS],
+    pub(crate) shards: Box<[CachePadded<Shard<T>>; SHARDS]>,
     hasher: Hasher,
 }
 
@@ -29,7 +30,7 @@ impl<T, Hasher, const SHARDS: usize> ShardMap<T, Hasher, SHARDS> {
         Hasher: Default,
     {
         Self {
-            shards: std::array::from_fn(|_| Shard::default()),
+            shards: Box::new(std::array::from_fn(|_| CachePadded::new(Shard::default()))),
             hasher: Default::default(),
         }
     }

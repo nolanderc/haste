@@ -174,15 +174,9 @@ pub async fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Resul
 pub async fn sources_in_dir(db: &dyn crate::Db, dir: NormalPath) -> Result<Arc<[NormalPath]>> {
     let entries = fs::list_dir(db, dir).await.as_deref()?;
 
-    let enabled = entries
-        .iter()
-        .map(|path| is_enabled_source_file(db, *path))
-        .try_join_all()
-        .await?;
-
     let mut sources = Vec::with_capacity(entries.len());
-    for (&entry, enabled) in entries.iter().zip(enabled) {
-        if enabled {
+    for &entry in entries {
+        if is_enabled_source_file(db, entry).await? {
             sources.push(entry);
         }
     }

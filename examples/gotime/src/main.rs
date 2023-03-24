@@ -38,6 +38,9 @@ mod syntax;
 mod token;
 mod util;
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[haste::storage]
 pub struct Storage(
     common::Text,
@@ -128,7 +131,7 @@ impl Db for Database {
         match path.lookup(self) {
             path::NormalPathData::Relative(path) => {
                 if path.components().any(|c| c.as_os_str() == "vendor") {
-                    return Durability::HIGH
+                    return Durability::HIGH;
                 }
 
                 if path.extension() == Some(OsStr::new("go")) {
@@ -155,7 +158,7 @@ struct Arguments {
 #[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
 struct CompileConfig {
     /// List of files or a directory which contains the main package.
-    #[clap(value_parser = parse_arc_path)]
+    #[clap(value_parser = parse_arc_path, required = true)]
     package: Vec<Arc<Path>>,
 }
 
@@ -408,7 +411,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
                                 let ast = syntax::parse_file(db, path.source).await.as_ref()?;
                                 let decl = &ast.declarations[path.index];
                                 let span = ast.span(Some(path.index), decl.nodes.spans[node]);
-                                Err(error.label(span, "referenced from here"))
+                                Err(error.clone().label(span, "referenced from here"))
                             }
                         }
                     });

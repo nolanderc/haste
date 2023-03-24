@@ -183,6 +183,8 @@ fn ingredient_impl(info: IngredientInfo) -> TokenStream {
         }
 
         impl haste::TrackedReference for #ident {
+            const MIGHT_CHANGE: bool = false;
+
             fn from_id(id: haste::Id) -> Self {
                 Self(id)
             }

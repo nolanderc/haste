@@ -1,14 +1,15 @@
 #![feature(type_alias_impl_trait)]
 #![feature(trivial_bounds)]
 #![feature(waker_getters)]
+#![feature(const_collections_with_hasher)]
 #![allow(clippy::uninlined_format_args)]
 
 mod arena;
 mod durability;
 pub mod fmt;
 mod input;
-pub mod interner;
 pub mod integer;
+pub mod interner;
 pub mod query_cache;
 mod revision;
 mod runtime;
@@ -16,7 +17,10 @@ mod shard_map;
 mod storage;
 pub mod util;
 
-use std::{future::Future, marker::PhantomData};
+use std::{
+    borrow::Cow, cell::RefCell, collections::HashMap, future::Future, marker::PhantomData,
+    sync::Mutex, time::Duration,
+};
 
 pub use durability::Durability;
 use futures_lite::FutureExt;
@@ -133,6 +137,9 @@ pub trait HasIngredient<T: Ingredient + ?Sized>: Storage {
 }
 
 pub trait TrackedReference {
+    /// Is the value pointed to by this reference mutable? (eg. an input)
+    const MIGHT_CHANGE: bool;
+
     fn from_id(id: Id) -> Self;
     fn id(self) -> Id;
 }
@@ -391,6 +398,8 @@ pub trait DatabaseExt: Database {
         <T::Container as ElementContainer>::Value: Sized,
         Self: WithStorage<T::Storage>,
     {
+        let _guard = crate::enter_span(format!("insert {}", std::any::type_name::<T>()));
+
         let (storage, _runtime) = self.storage();
         let container = storage.container();
         let id = container.insert(value);
@@ -404,6 +413,8 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainerRef + 'db,
         Self: WithStorage<T::Storage>,
     {
+        let _guard = crate::enter_span(format!("insert_ref {}", std::any::type_name::<T>()));
+
         let (storage, _runtime) = self.storage();
         let container = storage.container();
         let id = container.insert_ref(value);
@@ -417,19 +428,25 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainer + Container<Self> + 'db,
         Self: WithStorage<T::Storage>,
     {
+        let _guard = crate::enter_span(format!("lookup {}", std::any::type_name::<T>()));
+
         let (storage, runtime) = self.storage();
         let container = storage.container();
 
         let id = handle.id();
         let value = container.get_untracked(id);
-        runtime.register_dependency(
-            Dependency {
-                container: container.path(),
-                resource: id,
-                extra: 0,
-            },
-            TransitiveDependencies::CONSTANT,
-        );
+
+        if T::MIGHT_CHANGE {
+            runtime.register_dependency(
+                Dependency {
+                    container: container.path(),
+                    resource: id,
+                    extra: 0,
+                },
+                TransitiveDependencies::CONSTANT,
+            );
+        }
+
         value
     }
 
@@ -494,4 +511,126 @@ impl<'a> Scope<'a> {
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         self.runtime.block_on(f)
     }
+}
+
+struct Metrics {
+    /// For each span, its name, duration and count.
+    spans: HashMap<SpanName, Span, ConstHasher>,
+
+    /// For each active span, the time it was started and its name.
+    stack: Vec<(SpanName, std::time::Instant)>,
+}
+
+struct ConstHasher;
+
+impl std::hash::BuildHasher for ConstHasher {
+    type Hasher = ahash::AHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        ahash::AHasher::default()
+    }
+}
+
+impl Metrics {
+    const fn new() -> Self {
+        Self {
+            spans: HashMap::with_hasher(ConstHasher),
+            stack: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Span {
+    duration: Duration,
+    count: usize,
+}
+
+type SpanName = Cow<'static, str>;
+
+thread_local! {
+    static METRICS: RefCell<Metrics> = RefCell::new(Metrics::new());
+}
+
+static GLOBAL_METRICS: Mutex<Metrics> = Mutex::new(Metrics::new());
+
+#[inline]
+pub fn enter_span(name: impl Into<SpanName>) -> SpanGuard {
+    if cfg!(feature = "metrics") {
+        METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+            metrics.stack.push((name.into(), std::time::Instant::now()));
+        })
+    }
+
+    SpanGuard { _private: () }
+}
+
+#[must_use]
+pub struct SpanGuard {
+    _private: (),
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        if cfg!(feature = "metrics") {
+            METRICS.with(|metrics| {
+                let mut metrics = metrics.borrow_mut();
+                let (name, start) = metrics.stack.pop().expect("unbalanced number of spans");
+                let duration = start.elapsed();
+                let span = metrics.spans.entry(name).or_default();
+                span.duration += duration;
+                span.count += 1;
+            })
+        }
+    }
+}
+
+fn print_metrics() {
+    if cfg!(feature = "metrics") {
+        METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("<unknown>");
+            print_metrics_impl(name, &metrics).unwrap();
+
+            let mut global = GLOBAL_METRICS.lock().unwrap();
+            for (name, span) in metrics.spans.drain() {
+                let global_span = global.spans.entry(name).or_default();
+                global_span.duration += span.duration;
+                global_span.count += span.count;
+            }
+        });
+    }
+}
+
+fn print_global_metrics() {
+    if cfg!(feature = "metrics") {
+        let global = GLOBAL_METRICS.lock().unwrap();
+        print_metrics_impl("global", &global).unwrap();
+    }
+}
+
+fn print_metrics_impl(name: &str, metrics: &Metrics) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut spans = metrics.spans.iter().collect::<Vec<_>>();
+
+    spans.sort_by(|(a_name, a_span), (b_name, b_span)| {
+        (a_span.duration, a_name)
+            .cmp(&(b_span.duration, b_name))
+            .reverse()
+    });
+
+    let stderr = std::io::stderr().lock();
+    let mut writer = std::io::BufWriter::new(stderr);
+
+    writeln!(writer, "Metrics {:?}:", name)?;
+    for (name, span) in spans {
+        writeln!(writer, " - {}: {:?} (x{})", name, span.duration, span.count)?;
+    }
+    writeln!(writer)?;
+
+    Ok(())
 }

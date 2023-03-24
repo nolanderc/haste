@@ -132,7 +132,7 @@ const MAX_LOCAL_TASKS: usize = 256;
 
 impl Executor {
     pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
-        const ENV: &str = "HASTE_WORKER_THREADS";
+        const ENV: &str = "HASTE_WORKERS";
         let worker_count = std::env::var(ENV)
             .ok()
             .and_then(|var| match var.parse::<usize>() {
@@ -316,6 +316,12 @@ impl Executor {
             *suspended_workers -= local.is_some() as usize;
         }
 
+        crate::print_metrics();
+
+        eprintln!("total tasks: {}", TASK_COUNT.swap(0, Relaxed));
+        eprintln!("poll count: {}", POLLED_COUNT.swap(0, Relaxed));
+        eprintln!("pending: {}", PENDING_COUNT.swap(0, Relaxed));
+
         true
     }
 
@@ -333,6 +339,8 @@ impl Executor {
         for thread in self.threads.drain(..) {
             thread.join().unwrap();
         }
+
+        crate::print_global_metrics();
     }
 }
 
@@ -414,6 +422,7 @@ impl LocalScheduler {
 
             while let Some(task) = local.next_task() {
                 local.poll_task(task);
+                POLLED_COUNT.fetch_add(1, Relaxed);
             }
         });
         self
@@ -467,7 +476,7 @@ impl LocalScheduler {
                     stalled_count = stalled_count.saturating_add(1);
 
                     if stalled_count > max_stalled_count {
-                        std::thread::yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
                     } else {
                         std::hint::spin_loop();
                     }
@@ -631,6 +640,8 @@ impl LocalScheduler {
         self.drain();
         self.publish_poll_duration();
 
+        crate::print_metrics();
+
         let shared = &*self.shared;
 
         shared.suspended_workers_approx.fetch_add(1, Relaxed);
@@ -671,3 +682,7 @@ impl LocalScheduler {
         }
     }
 }
+
+static POLLED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);

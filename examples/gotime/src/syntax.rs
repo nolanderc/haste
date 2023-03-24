@@ -15,7 +15,7 @@ use crate::{
 #[haste::query]
 pub async fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<File> {
     let source = crate::source::source_text(db, path).await?;
-    self::parse::parse(db, &source, path).await
+    self::parse::parse(db, &source, path)
 }
 
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;

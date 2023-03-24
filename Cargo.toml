@@ -9,7 +9,7 @@ members = ["crates/*", "examples/*"]
 [profile.release]
 debug = true
 [profile.release.package."*"]
-opt-level = 3
+opt-level = 2
 
 
 # Always build proc-macros and build scripts with optimizations:

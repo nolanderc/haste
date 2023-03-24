@@ -59,6 +59,7 @@ impl Task {
     where
         F: Future<Output = ()> + Send,
     {
+        TASK_COUNT.fetch_add(1, Relaxed);
         let ptr = Box::into_raw(task);
         Self { header: ptr.cast() }
     }
@@ -69,30 +70,43 @@ impl Task {
 
     #[must_use]
     pub fn poll(self) -> Option<Duration> {
+        let _guard = crate::enter_span("poll task");
+
         let header = self.header();
 
-        if !header.state.try_begin_poll() {
-            return None;
-        }
-
-        let waker = self.clone().into_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-
         let start_poll_time = std::time::Instant::now();
+        let mut has_polled = false;
 
-        unsafe {
-            let future = header.future_ptr();
-            match (header.vtable.poll)(future, &mut cx) {
-                Poll::Ready(()) => {
-                    (header.vtable.drop)(future);
-                    header.state.end_poll_ready();
+        loop {
+            if !header.state.try_begin_poll() {
+                if has_polled {
+                    break;
+                } else {
+                    return None;
                 }
-                Poll::Pending => {
-                    if header.state.end_poll_pending() {
-                        self.schedule()
+            }
+
+            let waker = self.clone().into_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            unsafe {
+                let future = header.future_ptr();
+                match (header.vtable.poll)(future, &mut cx) {
+                    Poll::Ready(()) => {
+                        (header.vtable.drop)(future);
+                        header.state.end_poll_ready();
+                        break;
+                    }
+                    Poll::Pending => {
+                        PENDING_COUNT.fetch_add(1, Relaxed);
+                        if header.state.end_poll_pending() {
+                            break;
+                        }
                     }
                 }
             }
+
+            has_polled = true;
         }
 
         Some(start_poll_time.elapsed())
@@ -342,19 +356,26 @@ impl TaskState {
         // Clear the `IDLE` and `SCHEDULED` flags.
         let old = self.bits.fetch_and(!(IDLE | SCHEDULED), Acquire);
 
-        // the task must be idle, or we might have a race condition
-        old & (IDLE | FINISHED) == IDLE
+        if old & (IDLE | SCHEDULED) == SCHEDULED {
+            // the task is currently running, but we just cleared its scheduled flag.
+            // Thus, we try to reschedule it, if we succeed, we can poll it ourselves.
+            return self.try_wake();
+        }
+
+        // The task must be idle to guarantee only one thread polls the task at once.
+        // The task must also be scheduled, otherwise there's no point polling it.
+        old & (IDLE | SCHEDULED | FINISHED) == (IDLE | SCHEDULED)
     }
 
     /// At the end of a poll: the task is still pending.
     ///
-    /// Returns `true` if the task needs to be rescheduled.
+    /// Returns `false` if the task needs to be polled again.
     fn end_poll_pending(&self) -> bool {
         // mark the task as idle
         let now = self.bits.fetch_or(IDLE, Release);
 
-        // the task was woken while we polled it: we must re-schedule it
-        now & SCHEDULED != 0
+        // if the task was scheduled while we polled it we must poll it again
+        now & SCHEDULED == 0
     }
 
     /// At the end of a poll: the task has finished executing.
@@ -370,7 +391,7 @@ impl TaskState {
         // - if it is polling it will be rescheduled later
         // - if it is finished it does not need to be rescheduled
         // - if it is already scheduled we don't have to do it again
-        old & (IDLE | FINISHED | SCHEDULED) == IDLE
+        old & (IDLE | SCHEDULED | FINISHED) == IDLE
     }
 
     /// Attempt to drop the task.

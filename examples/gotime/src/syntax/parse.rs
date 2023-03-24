@@ -12,7 +12,9 @@ use crate::{
 
 use super::*;
 
-pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
+pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
+    let _guard = haste::enter_span("parse");
+
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -27,7 +29,7 @@ pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate
         data: Data::default(),
     };
 
-    match parser.file().await {
+    match parser.file() {
         Ok(file) => Ok(file),
         Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics)),
     }
@@ -109,7 +111,7 @@ struct NodeData {
     labels: Vec<StmtId>,
 }
 
-/// Tracks the length of the corresponding lists in `Tmp`.
+/// Tracks the length of the corresponding lists in `Data`.
 #[derive(Default, Clone, Copy)]
 struct Bases {
     spans: Base<Key<Span>>,
@@ -489,7 +491,7 @@ impl<'a> Parser<'a> {
 
     fn node_range_span(&self, range: NodeRange) -> FileRange {
         let first = range.start.get();
-        let last = first + range.length.get().saturating_sub(1) as u32;
+        let last = first + range.length.get().saturating_sub(1);
 
         let base = self.data.base.node_indirect;
         let first_id = self.data.node.indirect[first as usize - base];
@@ -536,19 +538,9 @@ impl<'a> Parser<'a> {
         Ok(range)
     }
 
-    async fn file(&mut self) -> Result<File> {
+    fn file(&mut self) -> Result<File> {
         let package = self.package()?;
         let imports = self.imports()?;
-
-        if !imports.is_empty() {
-            // prefetch the imports:
-            let dir = self.path.parent(self.db).unwrap();
-            if let Ok(go_mod) = crate::import::closest_go_mod(self.db, dir).await {
-                for import in imports.iter() {
-                    crate::import::resolve::prefetch(self.db, import.path.text, go_mod);
-                }
-            }
-        }
 
         let declarations = self.declarations()?;
         self.expect_eof()?;

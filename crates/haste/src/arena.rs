@@ -145,7 +145,10 @@ where
             panic!("out of memory");
         }
 
-        let new = current_len.saturating_mul(2).clamp(required, self.capacity);
+        let new = current_len
+            .saturating_mul(8)
+            .max(256)
+            .clamp(required.next_power_of_two(), self.capacity);
 
         // SAFETY: we know that `new` is in the range `[0, self.capacity]`. Thus `old_ptr` will
         // also lie within the reserved memory range, and we can safely commit it.

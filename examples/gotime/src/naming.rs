@@ -17,7 +17,7 @@ use crate::{
 use self::context::NamingContext;
 
 #[haste::storage]
-pub struct Storage(file_scope, package_scope, exported_decls, package_name);
+pub struct Storage(file_scope, package_scope, exported_decls, package_name, decl_symbols);
 
 /// Uniquely identifies a declaration somewhere in the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -462,6 +462,7 @@ pub struct Local {
 }
 
 /// For each node in the given decl, the symbol it references.
+#[haste::query]
 pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<HashMap<NodeId, Symbol>> {
     let path = id.path(db).await?;
     let ast = syntax::parse_file(db, path.source).await.as_ref()?;

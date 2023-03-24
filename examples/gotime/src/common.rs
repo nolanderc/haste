@@ -4,6 +4,8 @@ pub struct Text {
 }
 
 impl haste::TrackedReference for Text {
+    const MIGHT_CHANGE: bool = false;
+
     fn from_id(id: haste::Id) -> Self {
         Self { id }
     }

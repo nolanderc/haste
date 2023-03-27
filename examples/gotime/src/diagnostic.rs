@@ -251,6 +251,7 @@ impl Label {
     ) -> FmtResult<()> {
         use Style::*;
 
+        // TODO: support multiline snippets
         let range = self.span.range;
         let source = &sources[&self.span.path];
         let line = source.line_index(range.start.get());

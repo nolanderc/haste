@@ -8,14 +8,13 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{
-            AtomicU32, AtomicUsize,
+            AtomicU32,
             Ordering::{self, Acquire, Relaxed, Release},
         },
         Arc, Condvar, Mutex, Weak,
     },
     task::{Poll, RawWaker, RawWakerVTable, Waker},
     thread::JoinHandle,
-    time::Duration,
 };
 
 use crossbeam_utils::CachePadded;
@@ -25,6 +24,10 @@ use crate::util::CallOnDrop;
 use self::{injector::Injector, task::Task};
 
 pub use self::task::RawTask;
+
+const MAX_LOCAL_TASKS: usize = 256;
+
+const WORKERS_ENV: &str = "HASTE_WORKERS";
 
 pub struct Executor {
     /// State shared between all worker threads.
@@ -50,7 +53,7 @@ struct Shared {
     state: SharedState,
 
     /// Aprroximate number of threads that are currently suspended and waiting for work.
-    idle_workers_approx: AtomicUsize,
+    idle_workers_approx: AtomicU32,
     /// Suspended tasks which are waiting for more work hold this lock.
     idle_mutex: Mutex<()>,
     /// Notified when a suspended worker has more work available.
@@ -123,12 +126,9 @@ struct WorkerState {
 type LocalQueue = st3::lifo::Worker<Task>;
 type Stealer = st3::lifo::Stealer<Task>;
 
-const MAX_LOCAL_TASKS: usize = 256;
-
 impl Executor {
     pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
-        const ENV: &str = "HASTE_WORKERS";
-        let worker_count = std::env::var(ENV)
+        let worker_count = std::env::var(WORKERS_ENV)
             .ok()
             .and_then(|var| match var.parse::<usize>() {
                 Ok(count) => Some(count),
@@ -136,13 +136,12 @@ impl Executor {
                     tracing::warn!(
                         value = var,
                         %error,
-                        "could not parse the value of {ENV}"
+                        "could not parse the value of {WORKERS_ENV}"
                     );
                     None
                 }
             })
-            .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
-            .unwrap_or(8);
+            .unwrap_or_else(num_cpus::get_physical);
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))
@@ -161,7 +160,7 @@ impl Executor {
 
             state: SharedState::new(State::Shutdown),
 
-            idle_workers_approx: AtomicUsize::new(0),
+            idle_workers_approx: AtomicU32::new(0),
             idle_mutex: Mutex::new(()),
             wake_condition: Condvar::new(),
 
@@ -350,9 +349,12 @@ impl Shared {
     }
 
     fn try_wake_suspended(&self) {
-        if self.idle_workers_approx.load(Relaxed) != 0 {
+        let idle_count = self.idle_workers_approx.load(Relaxed) as usize;
+        let suspended_count = self.suspended_workers_approx.load(Relaxed) as usize;
+
+        if idle_count != 0 {
             self.wake_condition.notify_one();
-        } else if self.suspended_workers_approx.load(Relaxed) != 0 {
+        } else if suspended_count != 0 {
             self.start_condition.notify_one();
         }
     }
@@ -435,7 +437,7 @@ impl LocalScheduler {
 
             // number of times we have attempted to grab a task from the queue, but failed.
             let mut stalled_count: u32 = 0;
-            let max_stalled_count: u32 = 10;
+            let max_stalled_count: u32 = 100;
 
             loop {
                 if task_state.ready.load(Relaxed) != 0 {
@@ -453,7 +455,7 @@ impl LocalScheduler {
                     stalled_count = stalled_count.saturating_add(1);
 
                     if stalled_count > max_stalled_count {
-                        std::thread::sleep(Duration::from_millis(1));
+                        std::thread::yield_now();
                     } else {
                         std::hint::spin_loop();
                     }
@@ -565,11 +567,15 @@ impl LocalScheduler {
 
     fn next_task(&self) -> Option<Task> {
         for _ in 0..100 {
-            if self.shared.state.load(Relaxed) == State::Running {
-                if let Some(task) = self.try_next_task() {
-                    return Some(task);
-                }
+            if self.shared.state.load(Relaxed) != State::Running {
+                break;
             }
+
+            if let Some(task) = self.try_next_task() {
+                return Some(task);
+            }
+
+            std::hint::spin_loop();
         }
 
         self.suspend()

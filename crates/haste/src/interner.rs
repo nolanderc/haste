@@ -297,6 +297,7 @@ impl StringInterner {
 
         let len_before = table.len();
         drop(table);
+
         let mut table = shard.write().unwrap();
         let len_after = table.len();
 
@@ -306,12 +307,12 @@ impl StringInterner {
             }
         }
 
-        // add the value into the interner, returing its key
+        // add the value into the interner, returing its ID
         let range = self.allocate_range(string);
         let index = self.ranges.push(range);
-        let key = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
-        table.insert_entry(hash, key, self.hash_fn());
-        key
+        let id = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
+        table.insert_entry(hash, id, self.hash_fn());
+        id
     }
 
     fn allocate_range(&self, string: &str) -> StringRange {

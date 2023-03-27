@@ -235,6 +235,7 @@ pub struct Parameter {
 pub struct Variadic {}
 
 /// Contains information about all expressions and types in a declaration
+// TODO: use the same backing storage for all declarations
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeStorage {
     /// For each node, its location in the source file

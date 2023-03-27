@@ -18,6 +18,7 @@ impl Injector {
         }
     }
 
+    /// Inject a new task, returning the number of tasks available
     pub fn push(&self, task: Task) {
         self.approx_len.fetch_add(1, Relaxed);
         self.tasks.lock().unwrap().push(task);

@@ -1,6 +1,6 @@
 use std::{
     hash::{BuildHasher, Hash, Hasher},
-    sync::RwLock,
+    sync::{atomic::AtomicUsize, RwLock},
 };
 
 use crossbeam_utils::CachePadded;
@@ -8,14 +8,14 @@ use hashbrown::raw::RawTable;
 
 type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
 
-pub struct ShardMap<T, Hasher = BuildHasherDefault, const SHARDS: usize = 32> {
-    pub(crate) shards: Box<[CachePadded<Shard<T>>; SHARDS]>,
+pub struct ShardMap<T, Hasher = BuildHasherDefault> {
+    pub(crate) shards: Box<[CachePadded<Shard<T>>]>,
     hasher: Hasher,
 }
 
 pub type Shard<T> = RwLock<RawTable<T>>;
 
-impl<T, Hasher, const SHARDS: usize> Default for ShardMap<T, Hasher, SHARDS>
+impl<T, Hasher> Default for ShardMap<T, Hasher>
 where
     Hasher: Default,
 {
@@ -24,13 +24,37 @@ where
     }
 }
 
-impl<T, Hasher, const SHARDS: usize> ShardMap<T, Hasher, SHARDS> {
+static SHARDS: AtomicUsize = AtomicUsize::new(0);
+
+fn get_shard_count() -> usize {
+    let old = SHARDS.load(std::sync::atomic::Ordering::Relaxed);
+    if old != 0 {
+        return old;
+    }
+
+    let threads = num_cpus::get_physical();
+
+    let shard_count = (threads * threads).next_power_of_two();
+    SHARDS.store(shard_count, std::sync::atomic::Ordering::Relaxed);
+    shard_count
+}
+
+impl<T, Hasher> ShardMap<T, Hasher> {
     pub fn new() -> Self
     where
         Hasher: Default,
     {
+        let shard_count = get_shard_count();
+        let mut shards = Vec::with_capacity(shard_count);
+
+        for _ in 0..shard_count {
+            shards.push(CachePadded::new(Shard::default()));
+        }
+
+        assert!(shards.len().is_power_of_two());
+
         Self {
-            shards: Box::new(std::array::from_fn(|_| CachePadded::new(Shard::default()))),
+            shards: shards.into(),
             hasher: Default::default(),
         }
     }
@@ -45,9 +69,10 @@ impl<T, Hasher, const SHARDS: usize> ShardMap<T, Hasher, SHARDS> {
 
     pub fn shard_index(&self, hash: u64) -> usize {
         // get the highest bits of the hash to reduce the likelihood of hash collisions
-        let shard_bits = 8 * std::mem::size_of_val(&SHARDS) as u32 - SHARDS.leading_zeros();
+        let shards = self.shards.len();
+        let shard_bits = shards.ilog2();
         let shift_amount = (64 - 7) - shard_bits;
-        ((hash >> shift_amount) % (SHARDS as u64)) as usize
+        (hash as usize >> shift_amount) & (shards - 1)
     }
 
     pub fn shard(&self, hash: u64) -> &Shard<T> {

@@ -1,6 +1,7 @@
 use std::{borrow::Cow, ops::Range};
 
 use bstr::{BString, ByteSlice, ByteVec};
+use fxhash::FxHashMap;
 use haste::integer::NonMaxU32;
 use smallvec::SmallVec;
 
@@ -72,11 +73,11 @@ struct Parser<'a> {
     ///
     /// Any function that uses this data has to restore it to the state it were in before the call
     /// before returning.
-    data: Data,
+    data: Data<'a>,
 }
 
 #[derive(Default)]
-struct Data {
+struct Data<'a> {
     /// Keeps track of all spans in the file
     span_ranges: KeyVec<Key<Span>, FileRange>,
 
@@ -89,6 +90,10 @@ struct Data {
     /// When producing declarations that index into any of the lists in this struct, those indices
     /// should be relative to the ones in this struct so that they become position independent.
     base: Bases,
+
+    /// Known interned strings: often the same identifiers are used repeatedly within a single
+    /// file. By caching common interned strings we can reduce preassure on the interner.
+    interned_strings: FxHashMap<&'a str, Text>,
 }
 
 #[derive(Default)]
@@ -120,7 +125,7 @@ struct Bases {
     node_indirect: usize,
 }
 
-impl Data {
+impl Data<'_> {
     fn snapshot(&self) -> Bases {
         Bases {
             spans: Base::at(Key::from_index(self.span_ranges.len())),
@@ -2444,8 +2449,12 @@ impl<'a> Parser<'a> {
         if source == "_" {
             return Identifier { text: None, span };
         }
+
         let string = source.to_str().expect("identifier was not valid UTF-8");
-        let text = Some(Text::new(self.db, string));
+        let entry = self.data.interned_strings.entry(string);
+        let text = *entry.or_insert_with(|| Text::new(self.db, string));
+        let text = Some(text);
+
         Identifier { text, span }
     }
 }

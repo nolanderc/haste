@@ -26,6 +26,7 @@ st3 = "0.4.1"
 crossbeam-utils = "0.8.15"
 cpu-time = "1.0.0"
 fxhash = "0.2.1"
+num_cpus = "1.15.0"
 
 [dependencies.haste_macros]
 path = "../haste_macros"

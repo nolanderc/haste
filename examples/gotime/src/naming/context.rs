@@ -146,8 +146,7 @@ impl<'db> NamingContext<'db> {
                     self.resolved.insert(node, symbol);
                 } else {
                     self.emit(
-                        error!("could not find `{}` in `{}`", name, self.ast.source)
-                            .label(self.node_span(node), ""),
+                        error!("undefined reference to `{}`", name).label(self.node_span(node), ""),
                     );
                 }
             }

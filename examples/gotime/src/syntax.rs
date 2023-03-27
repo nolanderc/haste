@@ -620,7 +620,7 @@ pub enum Node {
     TypeList(NodeRange),
 
     /// A single const-declaration: `const a, b, c int = 1, 2, 3`
-    ConstDecl(NodeRange, Option<TypeId>, Option<ExprRange>),
+    ConstDecl(NodeRange, Option<TypeId>, ExprRange),
     /// A sequence of `ConstDecl`s
     ConstList(NodeRange),
 
@@ -753,6 +753,15 @@ pub enum ChannelKind {
     SendRecv,
     Send,
     Recv,
+}
+
+impl ChannelKind {
+    pub fn is_recv(self) -> bool {
+        match self {
+            ChannelKind::SendRecv | ChannelKind::Recv => true,
+            ChannelKind::Send => false,
+        }
+    }
 }
 
 /// Marks that the last call argument should be used as the variadic arguments
@@ -1034,9 +1043,7 @@ where
             Node::TypeDef(spec) | Node::TypeAlias(spec) => self.dfs(spec.inner),
             Node::ConstDecl(_, typ, exprs) => {
                 self.try_dfs(typ);
-                if let Some(exprs) = exprs {
-                    self.dfs_all(exprs);
-                }
+                self.dfs_all(exprs);
             }
             Node::VarDecl(_, typ, exprs) => {
                 self.try_dfs(typ);

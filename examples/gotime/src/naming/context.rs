@@ -266,7 +266,7 @@ impl<'db> NamingContext<'db> {
                 if let Some(typ) = typ {
                     self.resolve_type(typ);
                 }
-                self.resolve_range(exprs.unwrap());
+                self.resolve_range(exprs);
                 for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
                     let Node::Name(Some(name)) = self.nodes.kind(node) else { continue };
                     self.local_scope.insert_local(name, node, i as u16);

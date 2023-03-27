@@ -372,7 +372,7 @@ fn write_node(
                             unreachable!()
                         };
                         write_const_spec(out, nodes, names, typ, values, previous)?;
-                        previous = values;
+                        previous = Some(values);
                         writeln!(out)?;
                     }
                     Ok(())
@@ -868,7 +868,7 @@ fn write_const_spec(
     nodes: &NodeView,
     names: NodeRange,
     typ: Option<TypeId>,
-    values: Option<ExprRange>,
+    values: ExprRange,
     previous_values: Option<ExprRange>,
 ) -> std::fmt::Result {
     write_node_list(out, nodes, names)?;
@@ -876,11 +876,9 @@ fn write_const_spec(
         write!(out, " ")?;
         write_node(out, nodes, typ.node)?;
     }
-    if values != previous_values {
-        if let Some(values) = values {
-            write!(out, " = ")?;
-            write_node_list(out, nodes, values.nodes)?;
-        }
+    if Some(values) != previous_values {
+        write!(out, " = ")?;
+        write_node_list(out, nodes, values.nodes)?;
     }
     Ok(())
 }

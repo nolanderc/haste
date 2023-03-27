@@ -807,7 +807,7 @@ impl<'a> Parser<'a> {
             Some(typ) => self.emit_join(names, typ),
             None => self.emit_span(names),
         };
-        Ok(self.emit_node(Node::ConstDecl(names, typ, Some(values)), span))
+        Ok(self.emit_node(Node::ConstDecl(names, typ, values), span))
     }
 
     fn var_declaration(&mut self) -> Result<NodeId> {

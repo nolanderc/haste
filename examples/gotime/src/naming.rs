@@ -133,14 +133,19 @@ impl SubIndex {
                         let name = decl.nodes.indirect(names)[col];
                         let expr = exprs.map(|exprs| {
                             let exprs = decl.nodes.indirect(exprs);
-                            exprs[col.min(exprs.len() - 1)]
+                            if names.len() != exprs.len() {
+                                assert_eq!(exprs.len(), 1);
+                                AssignmentExpr::Destruct(exprs[0])
+                            } else {
+                                AssignmentExpr::Single(exprs[col])
+                            }
                         });
                         SingleDecl::VarDecl(name, typ, expr)
                     }
                     Node::ConstDecl(names, typ, exprs) => {
                         let col = self.col as usize;
                         let name = decl.nodes.indirect(names)[col];
-                        let expr = decl.nodes.indirect(exprs.unwrap())[col];
+                        let expr = decl.nodes.indirect(exprs)[col];
                         SingleDecl::ConstDecl(name, typ, expr)
                     }
                     _ => unreachable!(),
@@ -157,10 +162,24 @@ impl SubIndex {
 pub enum SingleDecl {
     TypeDef(syntax::TypeSpec),
     TypeAlias(syntax::TypeSpec),
-    VarDecl(NodeId, Option<TypeId>, Option<ExprId>),
+    VarDecl(NodeId, Option<TypeId>, Option<AssignmentExpr>),
     ConstDecl(NodeId, Option<TypeId>, ExprId),
     Function(FuncDecl),
     Method(FuncDecl),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignmentExpr {
+    Single(ExprId),
+    Destruct(ExprId),
+}
+
+impl AssignmentExpr {
+    pub fn get(self) -> ExprId {
+        match self {
+            AssignmentExpr::Single(expr) | AssignmentExpr::Destruct(expr) => expr,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -285,7 +304,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                                 let sub = SubIndex { row, col: 0 };
                                 register(name, index, sub);
                             }
-                            Node::VarDecl(names, _, exprs) | Node::ConstDecl(names, _, exprs) => {
+                            Node::VarDecl(names, _, exprs) => {
                                 if let Some(exprs) = exprs {
                                     if names.length != exprs.nodes.length {
                                         let is_call = exprs.nodes.length.get() == 1 && {
@@ -306,6 +325,14 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                                     }
                                 }
 
+                                for (col, &name) in decl.nodes.indirect(names).iter().enumerate() {
+                                    let col = col as u16;
+                                    let sub = SubIndex { row, col };
+                                    let Node::Name(Some(name)) = decl.nodes.kind(name) else { continue };
+                                    register(name, index, sub);
+                                }
+                            }
+                            Node::ConstDecl(names, _, _) => {
                                 for (col, &name) in decl.nodes.indirect(names).iter().enumerate() {
                                     let col = col as u16;
                                     let sub = SubIndex { row, col };
@@ -512,7 +539,7 @@ pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<HashMap<Node
                 context.resolve_type(typ);
             }
             if let Some(expr) = expr {
-                context.resolve_expr(expr);
+                context.resolve_expr(expr.get());
             }
         }
         SingleDecl::ConstDecl(_, typ, expr) => {

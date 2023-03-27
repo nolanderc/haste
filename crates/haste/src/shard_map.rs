@@ -32,7 +32,7 @@ fn get_shard_count() -> usize {
         return old;
     }
 
-    let threads = num_cpus::get_physical();
+    let threads = 1 + crate::runtime::executor::worker_threads();
 
     let shard_count = (threads * threads).next_power_of_two();
     SHARDS.store(shard_count, std::sync::atomic::Ordering::Relaxed);

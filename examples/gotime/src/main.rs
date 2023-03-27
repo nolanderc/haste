@@ -408,8 +408,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
                             Ok(_) => Ok(()),
                             Err(error) => {
                                 let ast = syntax::parse_file(db, path.source).await.as_ref()?;
-                                let decl = &ast.declarations[path.index];
-                                let span = ast.span(Some(path.index), decl.nodes.spans[node]);
+                                let span = ast.node_span(path.index, node);
                                 Err(error.clone().label(span, "referenced from here"))
                             }
                         }

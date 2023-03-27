@@ -142,7 +142,7 @@ impl FuncDecl {
     fn write_pretty(
         &self,
         out: &mut print::PrettyWriter<impl Write>,
-        nodes: &NodeStorage,
+        nodes: &NodeView,
         is_method: bool,
     ) -> std::fmt::Result {
         let inputs = nodes.indirect(self.signature.inputs());
@@ -173,7 +173,7 @@ impl FuncDecl {
 
 fn write_signature(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     inputs: &[NodeId],
     outputs: &[NodeId],
 ) -> std::fmt::Result {
@@ -208,7 +208,7 @@ fn write_signature(
 
 fn write_parameter(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     param: Parameter,
 ) -> std::fmt::Result {
     if let Some(name) = param.name {
@@ -234,7 +234,7 @@ fn write_list<W: Write, T>(
 
 fn write_node_list<W: Write>(
     out: &mut PrettyWriter<W>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     range: NodeRange,
 ) -> std::fmt::Result {
     let list = nodes.indirect(range);
@@ -243,7 +243,7 @@ fn write_node_list<W: Write>(
 
 fn write_block(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     block: Block,
 ) -> std::fmt::Result {
     let statements = nodes.indirect(block.statements.nodes);
@@ -266,7 +266,7 @@ fn write_block(
 
 fn write_case_statements(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     block: Block,
 ) -> std::fmt::Result {
     let statements = nodes.indirect(block.statements.nodes);
@@ -293,7 +293,7 @@ fn write_case_statements(
 
 fn write_node(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     mut node: NodeId,
 ) -> std::fmt::Result {
     macro_rules! recurse {
@@ -304,7 +304,7 @@ fn write_node(
     }
 
     loop {
-        break match nodes.kinds[node] {
+        break match nodes.kind(node) {
             Node::Name(None) => write!(out, "_"),
             Node::Name(Some(name)) => write!(out, "{name}"),
 
@@ -346,7 +346,7 @@ fn write_node(
                 writeln!(out, "type (")?;
                 out.indented(|out| {
                     for &item in nodes.indirect(list) {
-                        match nodes.kinds[item] {
+                        match nodes.kind(item) {
                             Node::TypeDef(spec) => write_type_spec(out, nodes, spec, false)?,
                             Node::TypeAlias(spec) => write_type_spec(out, nodes, spec, true)?,
                             _ => unreachable!(),
@@ -368,7 +368,7 @@ fn write_node(
                 out.indented(|out| {
                     let mut previous = None;
                     for &item in nodes.indirect(list) {
-                        let Node::ConstDecl(names, typ, values) = nodes.kinds[item] else {
+                        let Node::ConstDecl(names, typ, values) = nodes.kind(item) else {
                             unreachable!()
                         };
                         write_const_spec(out, nodes, names, typ, values, previous)?;
@@ -389,9 +389,9 @@ fn write_node(
                 writeln!(out, "const (")?;
                 out.indented(|out| {
                     for &item in nodes.indirect(list) {
-                        let Node::VarDecl(names, typ, values) = nodes.kinds[item] else {
-                        unreachable!()
-                    };
+                        let Node::VarDecl(names, typ, values) = nodes.kind(item) else {
+                            unreachable!()
+                        };
                         write_var_spec(out, nodes, names, typ, values)?;
                         writeln!(out)?;
                     }
@@ -486,7 +486,7 @@ fn write_node(
                 write!(out, "{:?}", rune)
             }
             Node::String(range) => {
-                let text = &nodes.string_buffer[range.indices()];
+                let text = &nodes.string(range);
                 write!(out, "{:?}", text)
             }
             Node::IntegerSmall(value) => write!(out, "{}", value),
@@ -522,12 +522,12 @@ fn write_node(
 
             Node::Binary(interleaved) => {
                 let binary_precedence = |interleaved: ExprRange| {
-                    let op_node = nodes.indirect(interleaved)[1].node;
-                    let Node::BinaryOp(op) = nodes.kinds[op_node] else { unreachable!() };
+                    let op_node = nodes.indirect(interleaved)[1];
+                    let Node::BinaryOp(op) = nodes.kind(op_node) else { unreachable!() };
                     op.precedence()
                 };
 
-                let expr_precedence = |expr: ExprId| match nodes.kinds[expr.node] {
+                let expr_precedence = |expr: ExprId| match nodes.kind(expr) {
                     Node::Binary(others) => binary_precedence(others),
                     _ => 123, // some large number
                 };
@@ -822,7 +822,7 @@ fn write_node(
 
 fn write_composite_literal(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     composite: CompositeRange,
 ) -> std::fmt::Result {
     write!(out, "{{")?;
@@ -854,7 +854,7 @@ impl std::fmt::Display for Identifier {
 
 fn write_type_spec(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     spec: TypeSpec,
     alias: bool,
 ) -> std::fmt::Result {
@@ -867,7 +867,7 @@ fn write_type_spec(
 
 fn write_const_spec(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     names: NodeRange,
     typ: Option<TypeId>,
     values: Option<ExprRange>,
@@ -889,7 +889,7 @@ fn write_const_spec(
 
 fn write_var_spec(
     out: &mut PrettyWriter<impl Write>,
-    nodes: &NodeStorage,
+    nodes: &NodeView,
     names: NodeRange,
     typ: Option<TypeId>,
     values: Option<ExprRange>,

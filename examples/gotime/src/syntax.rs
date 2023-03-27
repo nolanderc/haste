@@ -1,11 +1,13 @@
 pub mod parse;
 mod print;
 
+use std::{ops::Range, sync::Arc};
+
 use bstr::BStr;
 use haste::integer::{NonMaxU32, B32, U24};
 
 use crate::{
-    key::{Base, Key, KeySlice, KeyVec, Relative},
+    key::{Base, Key, KeyOps, KeySlice, KeyVec, Relative},
     path::NormalPath,
     span::{FileRange, Span},
     token::Token,
@@ -58,7 +60,7 @@ impl File {
 
     pub fn node_span(&self, decl: Key<Decl>, node: impl Into<NodeId>) -> Span {
         let decl = &self.declarations[decl];
-        let span = decl.nodes.spans[node.into()];
+        let span = decl.nodes.span(node.into());
         let absolute = decl.base_span.offset(span.relative());
         Span::new(self.source, self.span_ranges[absolute])
     }
@@ -123,7 +125,7 @@ pub struct Decl {
     pub kind: DeclKind,
 
     /// All syntax nodes that occur in the declaration
-    pub nodes: NodeStorage,
+    pub nodes: NodeView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -239,10 +241,10 @@ pub struct Variadic {}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeStorage {
     /// For each node, its location in the source file
-    pub spans: KeyList<NodeId, SpanId>,
+    pub spans: Box<[SpanId]>,
 
     /// For each node, its kind
-    pub kinds: KeyList<NodeId, Node>,
+    pub kinds: Box<[Node]>,
 
     /// Nodes may refer to multiple child nodes by referencing a range of children here.
     ///
@@ -254,26 +256,114 @@ pub struct NodeStorage {
     pub string_buffer: Box<BStr>,
 }
 
-pub trait IndirectRange {
-    type Output;
-    fn extract(self, indirect: &[NodeId]) -> &[Self::Output];
+#[derive(Clone)]
+pub struct NodeView {
+    /// The actual storage for the nodes.
+    storage: Arc<NodeStorage>,
+
+    nodes: ViewRange,
+    indirect: ViewRange,
+    strings: ViewRange,
 }
 
-impl NodeStorage {
+#[derive(Clone, Copy)]
+pub struct ViewRange {
+    start: u32,
+    end: u32,
+}
+
+impl From<Range<usize>> for ViewRange {
+    fn from(range: Range<usize>) -> Self {
+        Self {
+            start: range.start as u32,
+            end: range.end as u32,
+        }
+    }
+}
+
+impl ViewRange {
+    pub fn range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+impl PartialEq for NodeView {
+    fn eq(&self, other: &Self) -> bool {
+        self.kinds() == other.kinds()
+            && self.spans() == other.spans()
+            && self.view_indirect() == other.view_indirect()
+            && self.view_strings() == other.view_strings()
+    }
+}
+impl Eq for NodeView {}
+
+impl std::fmt::Debug for NodeView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeView")
+            .field("kinds", &self.kinds())
+            .field("indirect", &self.view_indirect())
+            .field("strings", &self.view_strings())
+            .finish()
+    }
+}
+
+impl std::hash::Hash for NodeView {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.kinds().hash(state);
+        self.spans().hash(state);
+        self.view_indirect().hash(state);
+        self.view_strings().hash(state);
+    }
+}
+
+impl NodeView {
+    fn kinds(&self) -> &[Node] {
+        &self.storage.kinds[self.nodes.range()]
+    }
+
+    fn spans(&self) -> &[SpanId] {
+        &self.storage.spans[self.nodes.range()]
+    }
+
+    fn view_indirect(&self) -> &[NodeId] {
+        &self.storage.indirect[self.indirect.range()]
+    }
+
+    fn view_strings(&self) -> &BStr {
+        &self.storage.string_buffer[self.strings.range()]
+    }
+
+    pub fn kind(&self, node: impl Into<NodeId>) -> Node {
+        self.kinds()[node.into().index()]
+    }
+
+    pub fn span(&self, node: impl Into<NodeId>) -> SpanId {
+        self.spans()[node.into().index()]
+    }
+
     pub fn indirect<R: IndirectRange>(&self, range: R) -> &[R::Output] {
-        range.extract(&self.indirect)
+        range.extract(&self.storage.indirect[self.indirect.range()])
+    }
+
+    pub fn string(&self, range: StringRange) -> &BStr {
+        &self.view_strings()[range.indices()]
     }
 
     pub fn parameter(&self, node: NodeId) -> Parameter {
-        match self.kinds[node] {
+        match self.kind(node) {
             Node::Parameter(parameter) => parameter,
             kind => unreachable!("expected a parameter but found {kind:?}"),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.kinds.len()
+        (self.nodes.end - self.nodes.start) as usize
     }
+}
+
+pub trait IndirectRange {
+    type Output;
+    fn extract(self, indirect: &[NodeId]) -> &[Self::Output];
 }
 
 /// References a node in the current declaration.
@@ -294,7 +384,7 @@ impl NodeId {
     }
 }
 
-impl crate::key::KeyOps for NodeId {
+impl KeyOps for NodeId {
     fn from_index(index: usize) -> Self {
         Self::new(index).expect("exhausted syntax node IDs")
     }

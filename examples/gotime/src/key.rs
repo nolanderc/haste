@@ -140,6 +140,14 @@ impl<K: KeyOps, T> KeyVec<K, T> {
 }
 
 impl<K, T> KeySlice<K, T> {
+    pub fn wrap(data: &[T]) -> &KeySlice<K, T> {
+        unsafe { std::mem::transmute(data) }
+    }
+
+    pub fn wrap_mut(data: &mut [T]) -> &mut KeySlice<K, T> {
+        unsafe { std::mem::transmute(data) }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -173,17 +181,17 @@ impl<K: KeyOps, T> std::ops::IndexMut<K> for KeySlice<K, T> {
     }
 }
 
-impl<K: KeyOps, T> std::ops::Index<std::ops::Range<K>> for KeySlice<K, T> {
-    type Output = [T];
+impl<K: KeyOps, T> std::ops::Index<std::ops::Range<Base<K>>> for KeySlice<K, T> {
+    type Output = KeySlice<Relative<K>, T>;
 
-    fn index(&self, range: std::ops::Range<K>) -> &Self::Output {
-        &self.data[range.start.index()..range.end.index()]
+    fn index(&self, range: std::ops::Range<Base<K>>) -> &Self::Output {
+        KeySlice::wrap(&self.data[range.start.0.index()..range.end.0.index()])
     }
 }
 
-impl<K: KeyOps, T> std::ops::IndexMut<std::ops::Range<K>> for KeySlice<K, T> {
-    fn index_mut(&mut self, range: std::ops::Range<K>) -> &mut Self::Output {
-        &mut self.data[range.start.index()..range.end.index()]
+impl<K: KeyOps, T> std::ops::IndexMut<std::ops::Range<Base<K>>> for KeySlice<K, T> {
+    fn index_mut(&mut self, range: std::ops::Range<Base<K>>) -> &mut Self::Output {
+        KeySlice::wrap_mut(&mut self.data[range.start.0.index()..range.end.0.index()])
     }
 }
 

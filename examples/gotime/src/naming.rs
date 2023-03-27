@@ -109,7 +109,7 @@ impl DeclPath {
             SingleDecl::TypeDef(spec) | SingleDecl::TypeAlias(spec) => spec.name.span,
             SingleDecl::Function(func) | SingleDecl::Method(func) => func.name.span,
             SingleDecl::VarDecl(name, _, _) | SingleDecl::ConstDecl(name, _, _) => {
-                decl.nodes.spans[name]
+                decl.nodes.span(name)
             }
         };
         ast.span(Some(self.index), id)
@@ -120,14 +120,14 @@ impl SubIndex {
     pub fn lookup_in(&self, decl: &syntax::Decl) -> SingleDecl {
         match decl.kind {
             DeclKind::Type(node) | DeclKind::Const(node) | DeclKind::Var(node) => {
-                let node = match decl.nodes.kinds[node] {
+                let node = match decl.nodes.kind(node) {
                     Node::TypeList(nodes) | Node::VarList(nodes) | Node::ConstList(nodes) => {
                         decl.nodes.indirect(nodes)[self.row as usize]
                     }
                     _ => node,
                 };
 
-                match decl.nodes.kinds[node] {
+                match decl.nodes.kind(node) {
                     Node::TypeDef(spec) => SingleDecl::TypeDef(spec),
                     Node::TypeAlias(spec) => SingleDecl::TypeAlias(spec),
                     Node::VarDecl(names, typ, exprs) => {
@@ -265,7 +265,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
             let index = Key::from_index(decl_index);
             match decl.kind {
                 DeclKind::Type(ref node) | DeclKind::Var(ref node) | DeclKind::Const(ref node) => {
-                    let nodes = match decl.nodes.kinds[*node] {
+                    let nodes = match decl.nodes.kind(*node) {
                         Node::TypeDef(_)
                         | Node::TypeAlias(_)
                         | Node::VarDecl { .. }
@@ -281,7 +281,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                     for (row, &node) in nodes.iter().enumerate() {
                         let row = row as u16;
 
-                        match decl.nodes.kinds[node] {
+                        match decl.nodes.kind(node) {
                             Node::TypeDef(spec) | Node::TypeAlias(spec) => {
                                 let Some(name) = spec.name.text else { continue };
                                 let sub = SubIndex { row, col: 0 };
@@ -292,7 +292,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                                     if names.length != exprs.nodes.length {
                                         let is_call = exprs.nodes.length.get() == 1 && {
                                             let expr = decl.nodes.indirect(exprs)[0];
-                                            let kind = decl.nodes.kinds[expr.node];
+                                            let kind = decl.nodes.kind(expr.node);
                                             matches!(kind, Node::Call(_, _, _))
                                         };
 
@@ -311,7 +311,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap
                                 for (col, &name) in decl.nodes.indirect(names).iter().enumerate() {
                                     let col = col as u16;
                                     let sub = SubIndex { row, col };
-                                    let Node::Name(Some(name)) = decl.nodes.kinds[name] else { continue };
+                                    let Node::Name(Some(name)) = decl.nodes.kind(name) else { continue };
                                     register(name, index, sub);
                                 }
                             }

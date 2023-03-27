@@ -89,7 +89,7 @@ struct Data<'a> {
 
     /// When producing declarations that index into any of the lists in this struct, those indices
     /// should be relative to the ones in this struct so that they become position independent.
-    base: Bases,
+    base: DeclBase,
 
     /// Known interned strings: often the same identifiers are used repeatedly within a single
     /// file. By caching common interned strings we can reduce preassure on the interner.
@@ -118,7 +118,7 @@ struct NodeData {
 
 /// Tracks the length of the corresponding lists in `Data`.
 #[derive(Default, Clone, Copy)]
-struct Bases {
+struct DeclBase {
     spans: Base<Key<Span>>,
     strings: usize,
     nodes: usize,
@@ -126,8 +126,8 @@ struct Bases {
 }
 
 impl Data<'_> {
-    fn snapshot(&self) -> Bases {
-        Bases {
+    fn snapshot(&self) -> DeclBase {
+        DeclBase {
             spans: Base::at(Key::from_index(self.span_ranges.len())),
             strings: self.strings.len(),
             nodes: self.node.kinds.len(),
@@ -174,7 +174,7 @@ impl Data<'_> {
     }
 
     fn set_node(&mut self, node: NodeId, kind: Node, span: SpanId) {
-        let index = node.index() - self.base.nodes;
+        let index = node.index() + self.base.nodes;
         self.node.kinds[index] = kind;
         self.node.spans[index] = span;
     }
@@ -499,8 +499,8 @@ impl<'a> Parser<'a> {
         let last = first + range.length.get().saturating_sub(1);
 
         let base = self.data.base.node_indirect;
-        let first_id = self.data.node.indirect[first as usize - base];
-        let last_id = self.data.node.indirect[last as usize - base];
+        let first_id = self.data.node.indirect[first as usize + base];
+        let last_id = self.data.node.indirect[last as usize + base];
 
         self.node_span(first_id).join(self.node_span(last_id))
     }
@@ -622,54 +622,71 @@ impl<'a> Parser<'a> {
             ));
         };
 
+        self.data.strings.clear();
+
         Ok(ImportPath { text, span })
     }
 
     fn declarations(&mut self) -> Result<Vec<Decl>> {
-        let mut declarations = Vec::new();
-        while self.peek().is_some() {
-            declarations.push(self.top_level_declaration()?);
-            self.expect(Token::SemiColon)?;
+        struct View {
+            nodes: ViewRange,
+            indirect: ViewRange,
+            strings: ViewRange,
         }
+
+        let mut kinds = Vec::new();
+
+        while self.peek().is_some() {
+            let start = self.data.snapshot();
+            self.data.base = start;
+            let kind = self.top_level_declaration()?;
+            let end = self.data.snapshot();
+
+            let view = View {
+                nodes: ViewRange::from(start.nodes..end.nodes),
+                indirect: ViewRange::from(start.node_indirect..end.node_indirect),
+                strings: ViewRange::from(start.strings..end.strings),
+            };
+
+            self.expect(Token::SemiColon)?;
+            kinds.push((start.spans, view, kind));
+        }
+
+        let storage = Arc::new(NodeStorage {
+            spans: std::mem::take(&mut self.data.node.spans).into(),
+            kinds: std::mem::take(&mut self.data.node.kinds).into(),
+            indirect: std::mem::take(&mut self.data.node.indirect).into(),
+            string_buffer: {
+                let bytes: BString = std::mem::take(&mut self.data.strings);
+                Vec::from(bytes).into_boxed_slice().into()
+            },
+        });
+
+        let declarations = kinds
+            .into_iter()
+            .map(|(base_span, view, kind)| Decl {
+                base_span,
+                kind,
+                nodes: NodeView {
+                    storage: storage.clone(),
+                    nodes: view.nodes,
+                    indirect: view.indirect,
+                    strings: view.strings,
+                },
+            })
+            .collect();
+
         Ok(declarations)
     }
 
-    fn wrap_decl(
-        &mut self,
-        parse_parts: impl FnOnce(&mut Parser) -> Result<DeclKind>,
-    ) -> Result<Decl> {
-        let base = self.data.snapshot();
-        let old_base = std::mem::replace(&mut self.data.base, base);
-        let result = parse_parts(self);
-        self.data.base = old_base;
-
-        let base_span = base.spans;
-        let nodes = NodeStorage {
-            spans: KeyList::from(self.data.node.spans.split_off(base.nodes)),
-            kinds: KeyList::from(self.data.node.kinds.split_off(base.nodes)),
-            indirect: self.data.node.indirect.split_off(base.node_indirect).into(),
-            string_buffer: {
-                let strings = self.data.strings.split_off(base.strings);
-                strings.into_boxed_slice().into()
-            },
-        };
-
-        let kind = result?;
-        Ok(Decl {
-            kind,
-            nodes,
-            base_span,
-        })
-    }
-
-    fn top_level_declaration(&mut self) -> Result<Decl> {
-        self.wrap_decl(|this| match () {
-            _ if this.peek_is(Token::Func) => this.func_declaration(),
-            _ if this.peek_is(Token::Type) => this.type_declaration().map(DeclKind::Type),
-            _ if this.peek_is(Token::Const) => this.const_declaration().map(DeclKind::Const),
-            _ if this.peek_is(Token::Var) => this.var_declaration().map(DeclKind::Var),
-            _ => Err(this.emit_unexpected_token()),
-        })
+    fn top_level_declaration(&mut self) -> Result<DeclKind> {
+        match () {
+            _ if self.peek_is(Token::Func) => self.func_declaration(),
+            _ if self.peek_is(Token::Type) => self.type_declaration().map(DeclKind::Type),
+            _ if self.peek_is(Token::Const) => self.const_declaration().map(DeclKind::Const),
+            _ if self.peek_is(Token::Var) => self.var_declaration().map(DeclKind::Var),
+            _ => Err(self.emit_unexpected_token()),
+        }
     }
 
     fn multi_declaration(

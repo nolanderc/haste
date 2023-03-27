@@ -126,22 +126,26 @@ struct WorkerState {
 type LocalQueue = st3::lifo::Worker<Task>;
 type Stealer = st3::lifo::Stealer<Task>;
 
+pub fn worker_threads() -> usize {
+    if let Ok(var) = std::env::var(WORKERS_ENV) {
+        match var.parse::<usize>() {
+            Ok(count) => return count,
+            Err(error) => {
+                tracing::warn!(
+                    value = var,
+                    %error,
+                    "could not parse the value of {WORKERS_ENV}"
+                );
+            }
+        }
+    }
+
+    num_cpus::get_physical().saturating_sub(1)
+}
+
 impl Executor {
     pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
-        let worker_count = std::env::var(WORKERS_ENV)
-            .ok()
-            .and_then(|var| match var.parse::<usize>() {
-                Ok(count) => Some(count),
-                Err(error) => {
-                    tracing::warn!(
-                        value = var,
-                        %error,
-                        "could not parse the value of {WORKERS_ENV}"
-                    );
-                    None
-                }
-            })
-            .unwrap_or_else(num_cpus::get_physical);
+        let worker_count = worker_threads();
 
         let workers = (0..worker_count + 1)
             .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))

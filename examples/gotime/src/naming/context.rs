@@ -14,7 +14,7 @@ pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
     ast: &'db syntax::File,
     decl: Key<syntax::Decl>,
-    nodes: &'db syntax::NodeStorage,
+    nodes: &'db syntax::NodeView,
     package: FileSet,
 
     local_scope: LocalScope,
@@ -83,7 +83,7 @@ impl<'db> NamingContext<'db> {
 
             self.labels.reserve(body.labels.len());
             for &label in self.nodes.indirect(body.labels) {
-                match self.nodes.kinds[label.node] {
+                match self.nodes.kind(label) {
                     Node::Label(name, _stmt) => {
                         let Some(name) = name.text else {
                             self.emit(error!("labels may not be blank").label(self.span(name.span), ""));
@@ -139,7 +139,7 @@ impl<'db> NamingContext<'db> {
     fn resolve_node(&mut self, node: NodeId) {
         // TODO: don't visit the same nodes twice (for example in multiline const decls)
 
-        match self.nodes.kinds[node] {
+        match self.nodes.kind(node) {
             Node::Name(None) => {}
             Node::Name(Some(name)) => {
                 if let Some(symbol) = self.find_symbol(name) {
@@ -259,7 +259,7 @@ impl<'db> NamingContext<'db> {
                 }
                 self.resolve_range(exprs.unwrap());
                 for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(Some(name)) = self.nodes.kinds[node] else { continue };
+                    let Node::Name(Some(name)) = self.nodes.kind(node) else { continue };
                     self.local_scope.insert_local(name, node, i as u16);
                 }
             }
@@ -271,7 +271,7 @@ impl<'db> NamingContext<'db> {
                     self.resolve_range(exprs);
                 }
                 for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(name) = self.nodes.kinds[node] else {
+                    let Node::Name(name) = self.nodes.kind(node) else {
                         self.emit(error!("variable declaration must bind to an identifier")
                             .label(self.node_span(node), "expected an identifier"));
                         continue;
@@ -351,7 +351,7 @@ impl<'db> NamingContext<'db> {
                 if let (Some(bindings), Some(kind)) = (bindings, kind) {
                     if kind.is_define() {
                         let mut get_name = |expr: ExprId| {
-                            if let Node::Name(name) = self.nodes.kinds[expr.node] {
+                            if let Node::Name(name) = self.nodes.kind(expr.node) {
                                 name
                             } else {
                                 self.emit(
@@ -439,7 +439,7 @@ impl<'db> NamingContext<'db> {
 
                 if kind.is_define() {
                     let mut get_name = |expr: ExprId| {
-                        if let Node::Name(name) = self.nodes.kinds[expr.node] {
+                        if let Node::Name(name) = self.nodes.kind(expr) {
                             name
                         } else {
                             self.emit(
@@ -480,7 +480,7 @@ impl<'db> NamingContext<'db> {
                 let indirect = self.nodes.indirect(pairs);
                 for pair in indirect.chunks_exact(2) {
                     let &[key, value] = pair else { unreachable!() };
-                    if !matches!(self.nodes.kinds[key.node], Node::Name(_)) {
+                    if !matches!(self.nodes.kind(key), Node::Name(_)) {
                         self.resolve_expr(key);
                     }
                     self.resolve_expr(value);
@@ -521,7 +521,7 @@ impl<'db> NamingContext<'db> {
     }
 
     fn node_span(&self, node: impl Into<NodeId>) -> Span {
-        self.span(self.nodes.spans[node.into()])
+        self.span(self.nodes.span(node))
     }
 
     fn emit(&mut self, diagnostic: Diagnostic) {

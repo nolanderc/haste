@@ -442,16 +442,14 @@ fn write_node(
                 write!(out, "{name} ")?;
                 write_node(out, nodes, typ.node)?;
                 if let Some(tag) = tag {
-                    write!(out, " ")?;
-                    write_node(out, nodes, tag.node)?;
+                    write!(out, " {tag:?}")?;
                 }
                 Ok(())
             }
             Node::EmbeddedField(_name, typ, tag) => {
                 write_node(out, nodes, typ.node)?;
                 if let Some(tag) = tag {
-                    write!(out, " ")?;
-                    write_node(out, nodes, tag.node)?;
+                    write!(out, " {tag:?}")?;
                 }
                 Ok(())
             }

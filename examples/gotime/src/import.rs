@@ -88,20 +88,21 @@ async fn resolve_import_go_list(
     Ok(FileSet::insert(db, FileSetData::Directory(dir_path)))
 }
 
+#[haste::query]
+#[clone]
 pub async fn closest_go_mod(
     db: &dyn crate::Db,
-    mut path: NormalPath,
+    path: NormalPath,
 ) -> Result<Option<NormalPath>> {
-    loop {
-        let mod_path = path.join(db, "go.mod").unwrap();
+    let mod_path = path.join(db, "go.mod").unwrap();
 
-        if fs::is_file(db, mod_path).await {
-            return Ok(Some(mod_path));
-        }
-
-        let Some(parent) = path.parent(db) else { return Ok(None) };
-        path = parent;
+    if fs::is_file(db, mod_path).await {
+        return Ok(Some(mod_path));
     }
+
+    let Some(parent) = path.parent(db) else { return Ok(None) };
+
+    closest_go_mod(db, parent).await
 }
 
 /// A set of files which together represent an entire package.

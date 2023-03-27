@@ -553,9 +553,9 @@ pub enum Node {
     /// A list of fields
     Struct(NodeRange),
     /// `<name> <type> <tag?>`
-    Field(Identifier, TypeId, Option<ExprId>),
+    Field(Identifier, TypeId, Option<Text>),
     /// `<name> <tag?>`
-    EmbeddedField(Identifier, TypeId, Option<ExprId>),
+    EmbeddedField(Identifier, TypeId, Option<Text>),
 
     /// A list of methods and types
     Interface(NodeRange),
@@ -925,4 +925,206 @@ pub struct Identifier {
     pub text: Option<Text>,
     /// References a span in the closest enclosing scope.
     pub span: SpanId,
+}
+
+impl NodeView {
+    pub fn visit_children(&self, node: impl Into<NodeId>, visit: impl FnMut(NodeId)) {
+        let mut visitor = Visitor {
+            kinds: self.kinds(),
+            indirect: self.view_indirect(),
+            visit,
+        };
+        visitor.dfs(node);
+    }
+}
+
+struct Visitor<'a, F> {
+    kinds: &'a [Node],
+    indirect: &'a [NodeId],
+    visit: F,
+}
+
+impl<'a, F> Visitor<'a, F>
+where
+    F: FnMut(NodeId),
+{
+    #[inline(always)]
+    fn dfs(&mut self, curr: impl Into<NodeId>) {
+        self.dfs_impl(curr.into())
+    }
+
+    #[inline(always)]
+    fn try_dfs(&mut self, maybe: Option<impl Into<NodeId>>) {
+        if let Some(node) = maybe {
+            self.dfs_impl(node.into())
+        }
+    }
+
+    #[inline(always)]
+    fn dfs_all(&mut self, range: impl Into<NodeRange>) {
+        for node in &self.indirect[range.into().indices()] {
+            self.dfs_impl(*node);
+        }
+    }
+
+    #[inline(never)]
+    fn dfs_impl(&mut self, curr: NodeId) {
+        (self.visit)(curr);
+
+        match self.kinds[curr.index()] {
+            Node::Name(_) => {}
+            Node::Selector(base, _) => self.dfs(base),
+            Node::Parameter(parameter) => self.dfs(parameter.typ),
+            Node::Pointer(inner) => self.dfs(inner),
+            Node::Array(len, typ) => {
+                self.try_dfs(len);
+                self.dfs(typ);
+            }
+            Node::Slice(typ) => self.dfs(typ),
+            Node::Map(key, value) => {
+                self.dfs(key);
+                self.dfs(value);
+            }
+            Node::Channel(_, typ) => self.dfs(typ),
+            Node::FunctionType(signature) => self.dfs_all(signature.inputs_and_outputs()),
+            Node::Struct(fields) => self.dfs_all(fields),
+            Node::Field(_, typ, _) | Node::EmbeddedField(_, typ, _) => self.dfs(typ),
+            Node::Interface(elements) => self.dfs_all(elements),
+            Node::MethodElement(_, signature) => self.dfs_all(signature.inputs_and_outputs()),
+            Node::IntegerSmall(_)
+            | Node::FloatSmall(_)
+            | Node::ImaginarySmall(_)
+            | Node::Rune(_)
+            | Node::String(_) => {}
+            Node::Call(target, args, _) => {
+                self.dfs(target);
+                self.dfs_all(args);
+            }
+            Node::Composite(typ, composite) => {
+                self.dfs(typ);
+                self.dfs_composite(composite);
+            }
+            Node::CompositeLiteral(composite) => self.dfs_composite(composite),
+            Node::TypeAssertion(expr, typ) => {
+                self.dfs(expr);
+                self.try_dfs(typ);
+            }
+            Node::Unary(_, expr) => self.dfs(expr),
+            Node::Binary(exprs) => self.dfs_all(exprs),
+            Node::BinaryOp(_) => todo!(),
+            Node::Function(signature, body) => {
+                self.dfs_all(signature.inputs_and_outputs());
+                self.dfs_all(body.block.statements);
+            }
+            Node::Index(target, index) => {
+                self.dfs(target);
+                self.dfs(index);
+            }
+            Node::SliceIndex(arr, start, end) => {
+                self.dfs(arr);
+                self.try_dfs(start);
+                self.try_dfs(end);
+            }
+            Node::SliceCapacity(arr, start, end, cap) => {
+                self.dfs(arr);
+                self.try_dfs(start);
+                self.dfs(end);
+                self.dfs(cap);
+            }
+            Node::TypeDef(spec) | Node::TypeAlias(spec) => self.dfs(spec.inner),
+            Node::ConstDecl(_, typ, exprs) => {
+                self.try_dfs(typ);
+                if let Some(exprs) = exprs {
+                    self.dfs_all(exprs);
+                }
+            }
+            Node::VarDecl(_, typ, exprs) => {
+                self.try_dfs(typ);
+                if let Some(exprs) = exprs {
+                    self.dfs_all(exprs);
+                }
+            }
+            Node::TypeList(list) | Node::ConstList(list) | Node::VarList(list) => {
+                self.dfs_all(list)
+            }
+            Node::Block(block) => self.dfs_all(block.statements),
+            Node::Label(_, stmt) => self.dfs(stmt),
+            Node::Return(expr) => self.try_dfs(expr),
+            Node::ReturnMulti(exprs) => self.dfs_all(exprs),
+            Node::Assign(targets, exprs) => {
+                self.dfs_all(targets);
+                self.dfs_all(exprs);
+            }
+            Node::AssignOp(target, _, expr) => {
+                self.dfs(target);
+                self.dfs(expr);
+            }
+            Node::Increment(expr) | Node::Decrement(expr) => self.dfs(expr),
+            Node::Send(send) => {
+                self.dfs(send.channel);
+                self.dfs(send.value);
+            }
+            Node::Go(expr) => self.dfs(expr),
+            Node::Defer(expr) => self.dfs(expr),
+            Node::Break(_) => todo!(),
+            Node::Continue(_) => todo!(),
+            Node::Goto(_) => todo!(),
+            Node::If(init, cond, block, els) => {
+                self.try_dfs(init);
+                self.dfs(cond);
+                self.dfs_all(block.statements);
+                self.try_dfs(els);
+            }
+            Node::Select(cases) => self.dfs_all(cases),
+            Node::SelectSend(send, block) => {
+                self.dfs(send.channel);
+                self.dfs(send.value);
+                self.dfs_all(block.statements);
+            }
+            Node::SelectRecv(bindings, _, expr, block) => {
+                if let Some(bindings) = bindings {
+                    self.dfs(bindings.value);
+                    self.try_dfs(bindings.success);
+                }
+                self.dfs(expr);
+                self.dfs_all(block.statements);
+            }
+            Node::SelectDefault(block) => self.dfs_all(block.statements),
+            Node::Switch(init, cond, cases) => {
+                self.try_dfs(init);
+                self.try_dfs(cond);
+                self.dfs_all(cases);
+            }
+            Node::TypeSwitch(_, expr) => self.dfs(expr),
+            Node::SwitchCase(exprs, block) => {
+                if let Some(exprs) = exprs {
+                    self.dfs_all(exprs);
+                }
+                self.dfs_all(block.statements);
+            }
+            Node::Fallthrough => todo!(),
+            Node::For(init, cond, post, block) => {
+                self.try_dfs(init);
+                self.try_dfs(cond);
+                self.try_dfs(post);
+                self.dfs_all(block.statements);
+            }
+            Node::ForRangePlain(expr, block) => {
+                self.dfs(expr);
+                self.dfs_all(block.statements);
+            }
+            Node::ForRange(first, second, _, list, block) => {
+                self.dfs(first);
+                self.try_dfs(second);
+                self.dfs(list);
+                self.dfs_all(block.statements);
+            }
+        }
+    }
+
+    fn dfs_composite(&mut self, composite: CompositeRange) {
+        match composite {
+            CompositeRange::Value(exprs) | CompositeRange::KeyValue(exprs) => self.dfs_all(exprs),
+        }
+    }
 }

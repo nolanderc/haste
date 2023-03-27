@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use syn::spanned::Spanned;
 
@@ -40,7 +40,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     let storage_path = &args.storage;
 
     let vis = &query_fn.vis;
-    let ident = &query_fn.sig.ident;
+    let ident = syn::Ident::new(&query_fn.sig.ident.to_string(), Span::call_site());
 
     let InputData {
         db_ident,

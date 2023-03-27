@@ -4,7 +4,6 @@
 #![allow(clippy::useless_format)]
 #![allow(clippy::uninlined_format_args)]
 
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -13,6 +12,7 @@ use std::sync::Arc;
 
 use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::Durability;
 use notify::Watcher;
 use path::NormalPath;
@@ -36,6 +36,7 @@ mod source;
 mod span;
 mod syntax;
 mod token;
+mod typing;
 mod util;
 
 #[global_allocator]
@@ -51,11 +52,18 @@ pub struct Storage(
     import::FileSet,
     import::file_set,
     import::sources_in_dir,
+    import::closest_go_mod,
     compile,
     compile_package_files,
 );
 
-#[haste::database(Storage, fs::Storage, process::Storage, naming::Storage)]
+#[haste::database(
+    Storage,
+    fs::Storage,
+    process::Storage,
+    naming::Storage,
+    typing::Storage
+)]
 pub struct Database {
     storage: haste::DatabaseStorage<Self>,
     bytes: AtomicUsize,
@@ -88,6 +96,7 @@ pub trait Db:
     + haste::WithStorage<fs::Storage>
     + haste::WithStorage<process::Storage>
     + haste::WithStorage<naming::Storage>
+    + haste::WithStorage<typing::Storage>
 {
     /// Notifies the database that the filesystem is being accessed.
     fn touch_path(&self, path: NormalPath) {
@@ -216,8 +225,8 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
         })
         .unwrap();
 
-    let mut watched = HashSet::new();
-    let mut changes = HashSet::new();
+    let mut watched = HashSet::default();
+    let mut changes = HashSet::default();
 
     let cwd = std::env::current_dir().unwrap();
 
@@ -400,23 +409,18 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
 
     for ((_name, path), symbols) in package_scope.iter().zip(decls.iter()) {
         for (&node, &symbol) in symbols.iter() {
-            match symbol {
-                naming::Symbol::Decl(decl) => {
-                    let symbols = naming::decl_symbols(db, decl);
-                    futures.push(async move {
-                        match symbols.await {
-                            Ok(_) => Ok(()),
-                            Err(error) => {
-                                let ast = syntax::parse_file(db, path.source).await.as_ref()?;
-                                let span = ast.node_span(path.index, node);
-                                Err(error.clone().label(span, "referenced from here"))
-                            }
+            if let naming::Symbol::Global(naming::GlobalSymbol::Decl(decl)) = symbol {
+                let symbols = naming::decl_symbols(db, decl);
+                futures.push(async move {
+                    match symbols.await {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+                            let span = ast.node_span(path.index, node);
+                            Err(error.clone().label(span, "referenced from here"))
                         }
-                    });
-                }
-                naming::Symbol::Package(_)
-                | naming::Symbol::Local(_)
-                | naming::Symbol::Builtin(_) => {}
+                    }
+                });
             }
         }
     }

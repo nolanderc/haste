@@ -6,6 +6,7 @@ use haste::integer::NonMaxU32;
 use smallvec::SmallVec;
 
 use crate::{
+    error,
     key::KeyOps,
     token::{SpannedToken, Token, TokenSet},
     Diagnostic,
@@ -1190,11 +1191,26 @@ impl<'a> Parser<'a> {
             typ = self.emit_type(Node::Pointer(typ), span);
         }
 
-        let tag = self.try_string()?;
+        let tag = match self.try_expect(Token::String) {
+            None => None,
+            Some(token) => {
+                let (range, span) = self.parse_string_token(token)?;
+                let bytes = self.data.string_bytes(range);
+                let text = match std::str::from_utf8(bytes) {
+                    Ok(string) => Text::new(self.db, string),
+                    Err(_) => {
+                        return Err(self.emit(
+                            error!("tag is not valid UTF-8").label(self.get_span(span), ""),
+                        ));
+                    }
+                };
+                self.data.pop_string(range.start.get());
+                Some(text)
+            }
+        };
 
         for ident in idents {
-            let end_span = tag.map(|tag| tag.node).unwrap_or(typ.node);
-            let span = self.emit_join(ident, end_span);
+            let span = self.emit_join(ident, typ);
 
             let kind = if is_embedded {
                 Node::EmbeddedField(ident, typ, tag)
@@ -2401,15 +2417,6 @@ impl<'a> Parser<'a> {
         }
 
         Ok((rune, span))
-    }
-
-    fn try_string(&mut self) -> Result<Option<ExprId>> {
-        if let Some(token) = self.try_expect(Token::String) {
-            let (range, span) = self.parse_string_token(token)?;
-            Ok(Some(self.emit_expr(Node::String(range), span)))
-        } else {
-            Ok(None)
-        }
     }
 
     fn string(&mut self) -> Result<(StringRange, SpanId)> {

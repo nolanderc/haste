@@ -1,7 +1,5 @@
 mod context;
 
-use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::{
     common::Text,
     error,
@@ -11,7 +9,7 @@ use crate::{
     path::NormalPath,
     span::Span,
     syntax::{self, DeclKind, ExprId, FuncDecl, Node, NodeId, SpanId, TypeId},
-    Diagnostic, Result,
+    Diagnostic, HashMap, HashSet, Result,
 };
 
 use self::context::NamingContext;
@@ -50,7 +48,7 @@ impl DeclId {
         Ok(scope.get(&self.name).copied())
     }
 
-    async fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
+    pub async fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
         match self.try_get_path(db).await? {
             Some(path) => Ok(path),
             None => {
@@ -393,12 +391,18 @@ pub async fn package_name(db: &dyn crate::Db, files: FileSet) -> Result<Text> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Symbol {
-    /// Refers to a package.
+    /// Refers to a symbol defined in the local scope.
+    Local(Local),
+    /// Refers to a symbol elsewhere in the program.
+    Global(GlobalSymbol),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GlobalSymbol {
+    /// Refers to a specific package.
     Package(FileSet),
     /// Refers to a declaration elsewhere in the program.
     Decl(DeclId),
-    /// Refers to a symbol defined in the local scope.
-    Local(Local),
     /// Refers to a builtin identifier (eg. `int`, `bool`, `true`, `len`, `iota`, etc.).
     Builtin(Builtin),
 }

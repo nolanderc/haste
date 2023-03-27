@@ -6,7 +6,6 @@ pub(crate) use self::macros::*;
 use std::{fmt::Write, sync::Arc};
 
 use bstr::{BStr, ByteSlice};
-use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::DatabaseExt;
 use smallvec::SmallVec;
 
@@ -14,6 +13,7 @@ use crate::{
     path::NormalPath,
     source::{line_starts, source_text},
     span::Span,
+    HashMap, HashSet,
 };
 
 pub type Result<T, E = Diagnostic> = std::result::Result<T, E>;

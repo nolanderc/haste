@@ -1,4 +1,3 @@
-use fxhash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 
 use crate::common::Text;
@@ -6,9 +5,9 @@ use crate::import::FileSet;
 use crate::key::Key;
 use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
-use crate::{error, Diagnostic, Result};
+use crate::{error, Diagnostic, Result, HashMap};
 
-use super::{Builtin, DeclId, DeclPath, FileMember, Local, Symbol};
+use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, Symbol};
 
 pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
@@ -158,9 +157,19 @@ impl<'db> NamingContext<'db> {
                     return;
                 };
 
-                if let Some(Symbol::Package(package)) = self.resolved.get(&base) {
+                let resolved = self.resolved.get(&base);
+                if let Some(Symbol::Global(GlobalSymbol::Package(package))) = resolved {
+                    if !name.get(self.db).starts_with(char::is_uppercase) {
+                        self.emit(
+                            error!("`{name}` exists but is private")
+                                .label(self.node_span(node), ""),
+                        );
+                        return;
+                    }
+
                     let decl = DeclId::new(*package, name);
-                    self.resolved.insert(node, Symbol::Decl(decl));
+                    let symbol = Symbol::Global(GlobalSymbol::Decl(decl));
+                    self.resolved.insert(node, symbol);
                 }
             }
             Node::Parameter(param) => {
@@ -496,21 +505,21 @@ impl<'db> NamingContext<'db> {
 
         if let Some(member) = self.file_scope.get(&name) {
             let symbol = match *member {
-                FileMember::Import(package, _) => Symbol::Package(package),
-                FileMember::Decl(id) => Symbol::Decl(id),
+                FileMember::Import(package, _) => GlobalSymbol::Package(package),
+                FileMember::Decl(id) => GlobalSymbol::Decl(id),
             };
-            return Some(symbol);
+            return Some(Symbol::Global(symbol));
         }
 
         if self.package_scope.contains_key(&name) {
-            return Some(Symbol::Decl(DeclId {
+            return Some(Symbol::Global(GlobalSymbol::Decl(DeclId {
                 package: self.package,
                 name,
-            }));
+            })));
         }
 
         if let Some(builtin) = Builtin::lookup(name.get(self.db)) {
-            return Some(Symbol::Builtin(builtin));
+            return Some(Symbol::Global(GlobalSymbol::Builtin(builtin)));
         }
 
         None

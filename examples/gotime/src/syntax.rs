@@ -222,6 +222,10 @@ impl Signature {
         let length = U24::new(u32::from(self.inputs.unsigned_abs() + self.outputs)).unwrap();
         NodeRange { start, length }
     }
+
+    pub fn is_variadic(&self) -> bool {
+        self.inputs < 0
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -710,6 +714,31 @@ pub enum CompositeRange {
     Value(ExprRange),
     /// A list of interleaved key-value pairs
     KeyValue(ExprRange),
+}
+
+impl CompositeRange {
+    pub fn len(self) -> usize {
+        match self {
+            CompositeRange::Value(exprs) => exprs.len(),
+            CompositeRange::KeyValue(exprs) => exprs.len() / 2,
+        }
+    }
+
+    pub fn keys(self, nodes: &NodeView) -> impl Iterator<Item = ExprId> + ExactSizeIterator + '_ {
+        let exprs = match self {
+            CompositeRange::Value(_) => &[],
+            CompositeRange::KeyValue(exprs) => nodes.indirect(exprs),
+        };
+        exprs.iter().step_by(2).copied()
+    }
+
+    pub fn values(self, nodes: &NodeView) -> impl Iterator<Item = ExprId> + ExactSizeIterator + '_ {
+        let (step, exprs) = match self {
+            CompositeRange::Value(exprs) => (1, nodes.indirect(exprs)),
+            CompositeRange::KeyValue(exprs) => (2, nodes.indirect(exprs)),
+        };
+        exprs.iter().step_by(step).copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

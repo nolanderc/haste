@@ -50,3 +50,20 @@ impl<'a, T> Fallible for &'a crate::Result<T> {
         }
     }
 }
+
+pub fn fmt_tuple<T>(items: &[T]) -> impl Display + '_
+where
+    T: Display,
+{
+    display_fn(move |f| {
+        write!(f, "(")?;
+        for (i, item) in items.iter().enumerate() {
+            if i != 0 {
+                write!(f, ", ")?;
+            }
+            T::fmt(item, f)?;
+        }
+        write!(f, ")")?;
+        Ok(())
+    })
+}

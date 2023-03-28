@@ -490,6 +490,9 @@ impl<'db> NamingContext<'db> {
                 for pair in indirect.chunks_exact(2) {
                     let &[key, value] = pair else { unreachable!() };
                     if !matches!(self.nodes.kind(key), Node::Name(_)) {
+                        // TODO: always resolve the name (in case we have a map initializer).
+                        // However, if there is an error, delay its resolution until type-checking
+                        // (in case we have a struct initializer).
                         self.resolve_expr(key);
                     }
                     self.resolve_expr(value);

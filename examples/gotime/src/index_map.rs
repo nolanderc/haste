@@ -194,3 +194,16 @@ where
         self.entries.hash(state)
     }
 }
+
+impl<K, V> FromIterator<(K, V)> for IndexMap<K, V>
+where
+    K: Hash + Eq,
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let mut this = Self::new();
+        for (key, value) in iter {
+            this.insert(key, value);
+        }
+        this
+    }
+}

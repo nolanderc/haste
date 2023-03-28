@@ -3,6 +3,7 @@
 #![allow(clippy::manual_is_ascii_check)]
 #![allow(clippy::useless_format)]
 #![allow(clippy::uninlined_format_args)]
+#![allow(clippy::collapsible_if)]
 
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
@@ -14,6 +15,7 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::Durability;
+use index_map::IndexMap;
 use notify::Watcher;
 use path::NormalPath;
 use util::future::IteratorExt;
@@ -26,6 +28,7 @@ mod common;
 mod diagnostic;
 mod env;
 mod fs;
+mod hir;
 mod import;
 mod index_map;
 mod key;
@@ -319,11 +322,17 @@ fn run(db: &mut Database, arguments: Arguments) {
                 eprintln!("output: {:#?}", output);
             }
             Err(diagnostic) => {
+                let mut hasher = fxhash::FxHasher::default();
+                std::hash::Hash::hash(&diagnostic, &mut hasher);
+                let hash = std::hash::Hasher::finish(&hasher);
+
                 let mut string = String::with_capacity(4096);
                 scope.block_on(diagnostic.write(db, &mut string)).unwrap();
                 BufWriter::new(std::io::stderr().lock())
                     .write_all(string.as_bytes())
                     .unwrap();
+
+                eprintln!("hash: {:x}", hash);
             }
         }
     });
@@ -378,6 +387,8 @@ struct Package {
 
     // For each file, the list of packages it imports.
     import_names: Vec<Vec<Text>>,
+
+    signatures: IndexMap<Text, typing::Type>,
 }
 
 #[haste::query]
@@ -399,6 +410,22 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .start_all();
 
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
+
+    let mut futures = Vec::new();
+    for &name in package_scope.keys() {
+        let decl = naming::DeclId::new(files, name);
+        let signature = typing::signature(db, naming::GlobalSymbol::Decl(decl));
+        futures.push(async move {
+            let signature = match signature.await? {
+                typing::Signature::Type(typ) | typing::Signature::Value(typ) => typ,
+                typing::Signature::Package(_) => unreachable!("packages are not declarations"),
+            };
+            // eprintln!("{decl:?}: {signature}");
+            Ok((name, signature))
+        });
+    }
+    let signatures = futures.try_join_all().await?.into_iter().collect();
+
     let decls = package_scope
         .keys()
         .map(|&name| naming::decl_symbols(db, naming::DeclId::new(files, name)))
@@ -440,12 +467,12 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
-    // resolve all errors in other packages
     packages.try_join_all().await?;
 
     Ok(Arc::new(Package {
         name: package_name,
         files,
         import_names,
+        signatures,
     }))
 }

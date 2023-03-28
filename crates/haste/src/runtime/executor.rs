@@ -318,6 +318,10 @@ impl Executor {
     }
 
     fn terminate(&mut self) {
+        if std::thread::panicking() {
+            self.stop();
+        }
+
         self.shared.state.store(State::Terminated, Ordering::SeqCst);
         self.shared.start_condition.notify_all();
         self.shared.wake_condition.notify_all();

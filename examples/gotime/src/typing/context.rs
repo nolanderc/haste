@@ -2,6 +2,7 @@ use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
     error,
+    index_map::IndexMap,
     naming::{self, DeclId, DeclPath},
     syntax::{self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView},
     typing::{Field, TypeClass},
@@ -16,7 +17,7 @@ use super::{
 pub(super) struct TypingContext<'db> {
     pub db: &'db dyn crate::Db,
     pub ast: &'db syntax::File,
-    pub references: &'db HashMap<NodeId, naming::Symbol>,
+    pub references: &'db IndexMap<NodeId, naming::Symbol>,
     pub nodes: &'db NodeView,
 
     pub path: DeclPath,
@@ -330,7 +331,7 @@ impl<'db> TypingContext<'db> {
                 let base_type = self.infer_expr(ExprId::new(base)).await?;
 
                 Err(
-                    error!("cannot access field or method `{name}` of type `{base_type}`")
+                    error!("TODO: access field or method `{name}` of type `{base_type}`")
                         .label(self.node_span(expr), ""),
                 )
             }
@@ -970,7 +971,7 @@ impl<'db> TypingContext<'db> {
 
         match target_type.lookup(self.db) {
             TypeKind::Builtin(builtin) => {
-                Err(error!("call builtin {builtin:?}").label(self.node_span(call_expr), ""))
+                Err(error!("TODO: call builtin {builtin:?}").label(self.node_span(call_expr), ""))
             }
             TypeKind::Function(func) => {
                 let arg_exprs = self.nodes.indirect(args);
@@ -1041,11 +1042,11 @@ impl<'db> TypingContext<'db> {
     /// Determines if the two types are ordered.
     fn is_ordered(&self, lhs: Type, rhs: Type) -> bool {
         if self.is_assignable(lhs, rhs) {
-            if lhs.lookup(self.db).is_ordered(self.db) {
+            if lhs.lookup(self.db).is_ordered() {
                 return true;
             }
         } else if self.is_assignable(rhs, lhs) {
-            if rhs.lookup(self.db).is_ordered(self.db) {
+            if rhs.lookup(self.db).is_ordered() {
                 return true;
             }
         }

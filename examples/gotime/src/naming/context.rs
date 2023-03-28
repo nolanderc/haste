@@ -1,27 +1,27 @@
 use smallvec::SmallVec;
 
 use crate::common::Text;
-use crate::import::FileSet;
+use crate::index_map::IndexMap;
 use crate::key::Key;
 use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
-use crate::{error, Diagnostic, Result, HashMap};
+use crate::{error, Diagnostic, HashMap, Result};
 
-use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, Symbol};
+use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, PackageId, Symbol};
 
 pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
     ast: &'db syntax::File,
     decl: Key<syntax::Decl>,
     nodes: &'db syntax::NodeView,
-    package: FileSet,
+    package: PackageId,
 
     local_scope: LocalScope,
-    file_scope: &'db HashMap<Text, FileMember>,
-    package_scope: &'db HashMap<Text, DeclPath>,
+    file_scope: &'db IndexMap<Text, FileMember>,
+    package_scope: &'db IndexMap<Text, DeclPath>,
 
     diagnostics: Option<Diagnostic>,
-    resolved: HashMap<NodeId, Symbol>,
+    resolved: IndexMap<NodeId, Symbol>,
     labels: HashMap<Text, StmtId>,
 }
 
@@ -30,14 +30,12 @@ impl<'db> NamingContext<'db> {
         db: &'db dyn crate::Db,
         ast: &'db crate::syntax::File,
         decl: Key<syntax::Decl>,
-        package: FileSet,
+        package: PackageId,
     ) -> Result<NamingContext<'db>> {
         let file_scope = super::file_scope(db, ast.source);
-        let package_scope = super::package_scope(db, package);
+        let package_scope = super::package_scope(db, package.files);
 
         let nodes = &ast.declarations[decl].nodes;
-        let mut resolved = HashMap::default();
-        resolved.reserve(nodes.len());
 
         Ok(Self {
             db,
@@ -51,12 +49,12 @@ impl<'db> NamingContext<'db> {
             local_scope: LocalScope::with_capacity(nodes.len()),
 
             diagnostics: None,
-            resolved,
+            resolved: IndexMap::with_capacity(nodes.len()),
             labels: HashMap::default(),
         })
     }
 
-    pub fn finish(mut self) -> Result<HashMap<NodeId, Symbol>> {
+    pub fn finish(mut self) -> Result<IndexMap<NodeId, Symbol>> {
         if let Some(diagnostic) = self.diagnostics {
             return Err(diagnostic);
         }

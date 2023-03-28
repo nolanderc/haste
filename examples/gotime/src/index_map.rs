@@ -33,14 +33,14 @@ impl<K, V> IndexMap<K, V> {
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<(K, V)>
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>
     where
         K: Hash + Eq,
     {
         let hash = hash64(&key);
 
         if let Some(index) = self.find(hash, &key) {
-            return Some(std::mem::replace(&mut self.entries[index], (key, value)));
+            return Some(std::mem::replace(&mut self.entries[index].1, value));
         }
 
         self.insert_no_check(hash, key, value);
@@ -56,6 +56,16 @@ impl<K, V> IndexMap<K, V> {
         self.lookup
             .insert(hash, index as u32, Self::hash_fn(&self.entries));
         index
+    }
+
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: Borrow<K>,
+        K: Hash + Eq,
+    {
+        let key = key.borrow();
+        let hash = hash64(key);
+        self.find(hash, key).is_some()
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -79,7 +89,7 @@ impl<K, V> IndexMap<K, V> {
         self.find(hash, key)
     }
 
-    pub fn get_index<Q>(&self, index: usize) -> &V {
+    pub fn get_index(&self, index: usize) -> &V {
         &self.entries[index].1
     }
 
@@ -135,6 +145,10 @@ impl<K, V> IndexMap<K, V> {
 
     pub fn values(&self) -> impl Iterator<Item = &'_ V> {
         self.entries.iter().map(|(_, value)| value)
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
     }
 }
 

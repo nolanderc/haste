@@ -322,17 +322,11 @@ fn run(db: &mut Database, arguments: Arguments) {
                 eprintln!("output: {:#?}", output);
             }
             Err(diagnostic) => {
-                let mut hasher = fxhash::FxHasher::default();
-                std::hash::Hash::hash(&diagnostic, &mut hasher);
-                let hash = std::hash::Hasher::finish(&hasher);
-
                 let mut string = String::with_capacity(4096);
                 scope.block_on(diagnostic.write(db, &mut string)).unwrap();
                 BufWriter::new(std::io::stderr().lock())
                     .write_all(string.as_bytes())
                     .unwrap();
-
-                eprintln!("hash: {:x}", hash);
             }
         }
     });
@@ -395,7 +389,7 @@ struct Package {
 #[clone]
 async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Result<Arc<Package>> {
     let asts = files.lookup(db).parse(db).await?;
-    let package_name = naming::package_name(db, files).await?;
+    let package = naming::PackageId::from_files(db, files).await?;
 
     let resolved = asts
         .iter()
@@ -413,7 +407,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
 
     let mut futures = Vec::new();
     for &name in package_scope.keys() {
-        let decl = naming::DeclId::new(files, name);
+        let decl = naming::DeclId::new(package, name);
         let signature = typing::signature(db, naming::GlobalSymbol::Decl(decl));
         futures.push(async move {
             let signature = match signature.await? {
@@ -428,7 +422,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
 
     let decls = package_scope
         .keys()
-        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(files, name)))
+        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(package, name)))
         .try_join_all()
         .await?;
 
@@ -470,7 +464,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     packages.try_join_all().await?;
 
     Ok(Arc::new(Package {
-        name: package_name,
+        name: package.name,
         files,
         import_names,
         signatures,

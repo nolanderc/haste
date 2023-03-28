@@ -5,8 +5,7 @@ use smallvec::SmallVec;
 use crate::{
     common::Text,
     error,
-    import::FileSet,
-    naming::{self, AssignmentExpr, Builtin, DeclId},
+    naming::{self, AssignmentExpr, Builtin, DeclId, PackageId},
     syntax::{self, NodeId},
     Result,
 };
@@ -85,7 +84,7 @@ impl TypeClass {
     pub fn is_untyped(self) -> bool {
         self.contains(Self::UNTYPED)
     }
-    
+
     pub fn is_integer(self) -> bool {
         self.contains(Self::INTEGER)
     }
@@ -202,7 +201,7 @@ impl TypeKind {
         }
     }
 
-    pub fn is_ordered(&self, db: &dyn crate::Db) -> bool {
+    pub fn is_ordered(&self) -> bool {
         self.class().contains(TypeClass::TRIVIALLY_ORDERED)
     }
 
@@ -418,7 +417,7 @@ impl std::fmt::Display for TypeKind {
                     write!(f, " }}")
                 }
             }
-            TypeKind::Declared(decl) => write!(f, "{:?}.{}", decl.package, decl.name),
+            TypeKind::Declared(decl) => write!(f, "{}.{}", decl.package.name, decl.name),
         }
     }
 }
@@ -454,7 +453,7 @@ impl std::fmt::Display for FunctionType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Signature {
-    Package(FileSet),
+    Package(PackageId),
     Type(Type),
     Value(Type),
 }

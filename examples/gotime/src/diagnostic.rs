@@ -112,7 +112,7 @@ impl Diagnostic {
             list.push(other);
             return;
         }
-
+        
         *self = Self::combine([self.clone(), other])
     }
 
@@ -130,7 +130,7 @@ impl Diagnostic {
                 Inner::Combine(_) => {}
             }
         }
-
+        
         Diagnostic::new(Inner::Attachment(self, [attachment].into()))
     }
 

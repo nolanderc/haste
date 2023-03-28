@@ -9,7 +9,7 @@ use crate::{
     path::NormalPath,
     span::Span,
     syntax::{self, DeclKind, ExprId, FuncDecl, Node, NodeId, SpanId, TypeId},
-    Diagnostic, HashMap, HashSet, Result,
+    Diagnostic, HashSet, Result,
 };
 
 use self::context::NamingContext;
@@ -27,13 +27,26 @@ pub struct Storage(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclId {
     /// The package where the decl is found.
-    pub package: FileSet,
+    pub package: PackageId,
     /// The name of the decl.
     pub name: Text,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackageId {
+    pub files: FileSet,
+    pub name: Text,
+}
+
+impl PackageId {
+    pub async fn from_files(db: &dyn crate::Db, files: FileSet) -> Result<Self> {
+        let name = package_name(db, files).await?;
+        Ok(Self { files, name })
+    }
+}
+
 impl DeclId {
-    pub fn new(package: FileSet, name: Text) -> Self {
+    pub fn new(package: PackageId, name: Text) -> Self {
         Self { package, name }
     }
 
@@ -44,7 +57,7 @@ impl DeclId {
     }
 
     async fn try_get_path(self, db: &dyn crate::Db) -> Result<Option<DeclPath>> {
-        let scope = package_scope(db, self.package).await.as_ref()?;
+        let scope = package_scope(db, self.package.files).await.as_ref()?;
         Ok(scope.get(&self.name).copied())
     }
 
@@ -52,7 +65,7 @@ impl DeclId {
         match self.try_get_path(db).await? {
             Some(path) => Ok(path),
             None => {
-                let package = package_name(db, self.package).await?;
+                let package = package_name(db, self.package.files).await?;
                 Err(error!("`{}` is not a member of `{}`", self.name, package))
             }
         }
@@ -185,7 +198,7 @@ impl AssignmentExpr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileMember {
     /// Refers to an imported package.
-    Import(FileSet, SpanId),
+    Import(PackageId, SpanId),
     /// Refers to a specific decl in another file.
     Decl(DeclId),
 }
@@ -200,11 +213,14 @@ impl FileMember {
 }
 
 #[haste::query]
-pub async fn file_scope(db: &dyn crate::Db, path: NormalPath) -> Result<HashMap<Text, FileMember>> {
+pub async fn file_scope(
+    db: &dyn crate::Db,
+    path: NormalPath,
+) -> Result<IndexMap<Text, FileMember>> {
     let ast = syntax::parse_file(db, path).await.as_ref()?;
     let resolved_imports = import::resolve_imports(db, ast).await?;
 
-    let mut scope = HashMap::default();
+    let mut scope = IndexMap::default();
     let mut register = |name: Text, member: FileMember| {
         if let Some(previous) = scope.insert(name, member) {
             return Err(async move {
@@ -216,21 +232,29 @@ pub async fn file_scope(db: &dyn crate::Db, path: NormalPath) -> Result<HashMap<
         Ok(())
     };
 
-    for (import, &package) in ast.imports.iter().zip(resolved_imports.iter()) {
+    for (import, &files) in ast.imports.iter().zip(resolved_imports.iter()) {
+        let package_name = package_name(db, files).await?;
+        let package = PackageId {
+            files,
+            name: package_name,
+        };
+
         let name = match import.name {
-            syntax::PackageName::Inherit => package_name(db, package).await?,
+            syntax::PackageName::Inherit => package_name,
             syntax::PackageName::Name(ident) => {
                 let Some(name) = ident.text else { continue };
                 name
             }
             syntax::PackageName::Implicit => {
-                let exported = exported_decls(db, package).await.as_ref()?;
+                let exported = exported_decls(db, files).await.as_ref()?;
+
                 for &name in exported.iter() {
                     let decl = DeclId { package, name };
                     if let Err(error) = register(name, FileMember::Decl(decl)) {
                         return Err(error.await);
                     }
                 }
+
                 continue;
             }
         };
@@ -259,10 +283,10 @@ pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<Te
 
 /// Get all names defined within a single package.
 #[haste::query]
-pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<HashMap<Text, DeclPath>> {
+pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMap<Text, DeclPath>> {
     let asts = files.lookup(db).parse(db).await?;
 
-    let mut scope = HashMap::default();
+    let mut scope = IndexMap::default();
     let mut conflicts = IndexMap::default();
 
     let init_name = Text::new(db, "init");
@@ -427,7 +451,7 @@ pub enum Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GlobalSymbol {
     /// Refers to a specific package.
-    Package(FileSet),
+    Package(PackageId),
     /// Refers to a declaration elsewhere in the program.
     Decl(DeclId),
     /// Refers to a builtin identifier (eg. `int`, `bool`, `true`, `len`, `iota`, etc.).
@@ -523,7 +547,7 @@ pub struct Local {
 
 /// For each node in the given decl, the symbol it references.
 #[haste::query]
-pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<HashMap<NodeId, Symbol>> {
+pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<NodeId, Symbol>> {
     let path = id.path(db).await?;
     let ast = syntax::parse_file(db, path.source).await.as_ref()?;
     let decl = &ast.declarations[path.index];

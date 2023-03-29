@@ -735,7 +735,7 @@ impl CompositeRange {
     pub fn values(self, nodes: &NodeView) -> impl Iterator<Item = ExprId> + ExactSizeIterator + '_ {
         let (step, exprs) = match self {
             CompositeRange::Value(exprs) => (1, nodes.indirect(exprs)),
-            CompositeRange::KeyValue(exprs) => (2, nodes.indirect(exprs)),
+            CompositeRange::KeyValue(exprs) => (2, &nodes.indirect(exprs)[1..]),
         };
         exprs.iter().step_by(step).copied()
     }

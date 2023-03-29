@@ -112,7 +112,7 @@ impl Diagnostic {
             list.push(other);
             return;
         }
-        
+
         *self = Self::combine([self.clone(), other])
     }
 
@@ -130,7 +130,7 @@ impl Diagnostic {
                 Inner::Combine(_) => {}
             }
         }
-        
+
         Diagnostic::new(Inner::Attachment(self, [attachment].into()))
     }
 
@@ -254,24 +254,45 @@ impl Label {
         // TODO: support multiline snippets
         let range = self.span.range;
         let source = &sources[&self.span.path];
-        let line = source.line_index(range.start.get());
-        let line_range = source.line_range(line);
-        let line_text = BStr::new(source.text[line_range.clone()].trim_end());
 
-        let gutter_width = 1 + (1 + line).ilog10() as usize;
+        let start_line = source.line_index(range.start.get());
+        let end_line = source.line_index(range.end.get());
+
+        let start_line_range = source.line_range(start_line);
+        let end_line_range = source.line_range(end_line);
+
+        let start_line_text = BStr::new(source.text[start_line_range.clone()].trim_end());
+        let end_line_text = BStr::new(source.text[end_line_range.clone()].trim_end());
+
+        let gutter_width = 1 + (1 + end_line).ilog10() as usize;
         let gutter = " ".repeat(gutter_width);
 
-        let column = range.start.get() as usize - line_range.start;
-        let underline_offset = line_text[..column]
+        let start_column = range.start.get() as usize - start_line_range.start;
+        let end_column = range.end.get() as usize - end_line_range.start;
+
+        let start_end_column = if start_line == end_line {
+            end_column
+        } else {
+            start_line_text.len()
+        };
+
+        let start_underline = start_line_text[..start_column]
             .chars()
             .map(|ch| match ch {
                 '\t' => "\t",
                 _ => " ",
             })
+            .chain(start_line_text[start_column..start_end_column].chars().map(|_| "^"))
             .collect::<String>();
 
-        let underline_width = (range.end.get() - range.start.get()) as usize;
-        let underline = "^".repeat(underline_width.max(1));
+        let end_underline = end_line_text[..end_column]
+            .chars()
+            .map(|_| "^")
+            .chain(end_line_text[end_column..].chars().map(|ch| match ch {
+                '\t' => "\t",
+                _ => " ",
+            }))
+            .collect::<String>();
 
         let severity = parent_severity.style();
 
@@ -280,26 +301,48 @@ impl Label {
             "{Bold}{Blue}{}-->{Default} {Italic}{Underline}{Dim}{}:{}{Default}",
             gutter,
             source.display_path,
-            line + 1
+            start_line + 1
         )?;
         writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
-        writeln!(out, "{Bold}{Blue}{} |{Default} {}", line + 1, line_text)?;
+        writeln!(
+            out,
+            "{Bold}{Blue}{} |{Default} {}",
+            start_line + 1,
+            start_line_text
+        )?;
+
+        let mid_gutter = if start_line == end_line { '|' } else { ':' };
+
         write!(
             out,
-            "{Bold}{Blue}{} |{Default} {severity}{}{}",
-            gutter, underline_offset, underline
+            "{Bold}{Blue}{} {mid_gutter}{Default} {severity}{}",
+            gutter, start_underline
         )?;
+
+        if start_line != end_line {
+            writeln!(
+                out,
+                "\n{Bold}{Blue}{} |{Default} {}",
+                end_line + 1,
+                end_line_text
+            )?;
+            write!(
+                out,
+                "{Bold}{Blue}{} |{Default} {severity}{}",
+                gutter, end_underline
+            )?;
+        }
+
         if self.text.is_empty() {
             writeln!(out)?;
         } else {
             writeln!(out, " {}", self.text)?;
         }
-        write!(out, "{Default}")?;
 
         if !last {
             writeln!(out, "{Bold}{Blue}{} |{Default}", gutter)?;
         } else {
-            writeln!(out)?;
+            writeln!(out, "{Default}")?;
         }
 
         Ok(())

@@ -13,7 +13,7 @@ use crate::{
 use self::context::TypingContext;
 
 #[haste::storage]
-pub struct Storage(Type, signature, type_check_body);
+pub struct Storage(Type, signature, type_check_body, underlying_type);
 
 #[haste::intern(Type)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,6 +178,10 @@ impl TypeKind {
         matches!(self, Self::Untyped(ConstantKind::String) | Self::String)
     }
 
+    pub fn is_declared(&self) -> bool {
+        matches!(self, Self::Declared(_))
+    }
+
     pub fn is_nillable(&self) -> bool {
         self.class().contains(TypeClass::NILLABLE)
     }
@@ -288,6 +292,12 @@ pub struct Field {
     pub typ: Type,
     pub tag: Option<Text>,
     pub embedded: bool,
+}
+
+impl StructType {
+    pub fn get_field(&self, name: Text) -> Option<&Field> {
+        self.fields.iter().find(|field| field.name == Some(name))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -458,6 +468,14 @@ pub enum Signature {
     Value(Type),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InferredType {
+    /// The expression is a value.
+    Value(Type),
+    /// The expression is a type.
+    Type(Type),
+}
+
 /// Get the type of the given symbol
 #[haste::query]
 #[clone]
@@ -490,8 +508,12 @@ async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
             ctx.resolve_precise(typ).await.map(Signature::Value)
         }
 
-        naming::SingleDecl::VarDecl(_, _, Some(AssignmentExpr::Single(expr)))
-        | naming::SingleDecl::ConstDecl(_, _, expr) => {
+        naming::SingleDecl::ConstDecl(_, _, expr) => {
+            let typ = ctx.infer_expr(expr).await?;
+            Ok(Signature::Value(typ))
+        }
+
+        naming::SingleDecl::VarDecl(_, _, Some(AssignmentExpr::Single(expr))) => {
             let typ = ctx.infer_expr(expr).await?;
             match typ.value_type(db) {
                 Err(error) => Err(error.label(ctx.node_span(expr), "could not infer type")),
@@ -592,7 +614,7 @@ pub struct TypingInfo {
     /// For each syntax node, its type (only `ExprId` and `TypeId`).
     nodes: crate::HashMap<NodeId, Type>,
     /// The type of local variables.
-    locals: crate::HashMap<naming::Local, Type>,
+    locals: crate::HashMap<naming::Local, InferredType>,
 }
 
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
@@ -685,5 +707,26 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
             }
             ctx.finish()
         }
+    }
+}
+
+#[haste::query]
+#[clone]
+async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
+    let &TypeKind::Declared(decl) = typ.lookup(db) else { return Ok(typ) };
+
+    let mut ctx = TypingContext::new(db, decl).await?;
+    let path = ctx.path;
+
+    let declaration = &ctx.ast.declarations[path.index];
+
+    match path.sub.lookup_in(declaration) {
+        naming::SingleDecl::TypeDef(spec) | naming::SingleDecl::TypeAlias(spec) => {
+            let inner = ctx.resolve_precise(spec.inner).await?;
+            underlying_type(db, inner).await
+        }
+
+        _ => Err(error!("expected a type, but found a value")
+            .label(path.span_in_ast(ctx.ast), "defined here")),
     }
 }

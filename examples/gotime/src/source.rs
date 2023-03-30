@@ -7,12 +7,7 @@ use crate::{fs, path::NormalPath, Result, Storage};
 /// Get the source text for some file.
 pub async fn source_text(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<BStr>> {
     let bytes = fs::read(db, path).await?;
-    let ptr: *const [u8] = Arc::into_raw(bytes);
-    let ptr: *const BStr = ptr as *const BStr;
-
-    // SAFETY: `BStr` is a `#[repr(transparent)]` wrapper around a `[u8]`, so they have the same
-    // memory layout, which makes this transmute safe.
-    unsafe { Ok(Arc::from_raw(ptr)) }
+    Ok(crate::util::bstr_arc(bytes))
 }
 
 /// Get the indices where each line starts in a file.

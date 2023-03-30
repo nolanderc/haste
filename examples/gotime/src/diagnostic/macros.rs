@@ -5,6 +5,13 @@ mod exported {
             $crate::Diagnostic::error(format!($($fmt)*))
         };
     }
+
+    macro_rules! bug {
+        ($($fmt:tt)*) => {
+            $crate::Diagnostic::bug(format!($($fmt)*))
+        };
+    }
 }
 
 pub(crate) use error;
+pub(crate) use bug;

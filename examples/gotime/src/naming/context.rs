@@ -72,7 +72,18 @@ impl<'db> NamingContext<'db> {
 
         let parameters = signature.inputs_and_outputs();
         for &node in self.nodes.indirect(parameters) {
-            self.resolve_node(node);
+            let param = self.nodes.parameter(node);
+            self.resolve_type(param.typ);
+        }
+
+        for &node in self.nodes.indirect(parameters) {
+            let param = self.nodes.parameter(node);
+            if let Some(name) = param.name {
+                if let Some(name) = name.text {
+                    // bind the name to the function scope
+                    self.local_scope.insert_local(name, node, 0);
+                }
+            }
         }
 
         if let Some(body) = body {
@@ -170,20 +181,13 @@ impl<'db> NamingContext<'db> {
                     self.resolved.insert(node, symbol);
                 }
             }
-            Node::Parameter(param) => {
-                if let Some(name) = param.name {
-                    if let Some(name) = name.text {
-                        // bind the name to the function scope
-                        self.local_scope.insert_local(name, node, 0);
-                    }
-                }
-                self.resolve_type(param.typ);
-            }
+
+            Node::Parameter(_) => unreachable!(),
 
             Node::Pointer(typ) => self.resolve_type(typ),
-            Node::Array(expr, typ) => {
-                if let Some(expr) = expr {
-                    self.resolve_expr(expr);
+            Node::Array(len, typ) => {
+                if let Some(len) = len {
+                    self.resolve_expr(len);
                 }
                 self.resolve_type(typ);
             }

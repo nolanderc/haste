@@ -221,3 +221,15 @@ where
         this
     }
 }
+
+impl<K, V, Q> std::ops::Index<&Q> for IndexMap<K, V>
+where
+    Q: Borrow<K>,
+    K: Hash + Eq,
+{
+    type Output = V;
+
+    fn index(&self, index: &Q) -> &Self::Output {
+        self.get(index).unwrap()
+    }
+}

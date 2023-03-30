@@ -172,6 +172,13 @@ impl NormalPathData {
             Self::GoRoot(_) => Self::GoRoot(new),
         }
     }
+
+    pub fn as_goroot(&self) -> Option<&Path> {
+        match self {
+            Self::GoRoot(path) => Some(path),
+            _ => None,
+        }
+    }
 }
 
 enum RelativeError {

@@ -2,18 +2,19 @@ use futures::{future::BoxFuture, FutureExt};
 use smallvec::smallvec;
 
 use crate::{
+    diagnostic::bug,
     error,
     index_map::IndexMap,
     naming::{self, DeclId, DeclPath},
     span::Span,
-    syntax::{self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView},
+    syntax::{self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, TypeId},
     typing::{Field, TypeClass},
     HashMap, Result,
 };
 
 use super::{
-    ConstantKind, FunctionType, InferredType, InterfaceMethod, InterfaceType, Signature,
-    StructType, Type, TypeKind, TypeList,
+    eval::EvalContext, ConstantKind, FunctionType, InferredType, InterfaceMethod, InterfaceType,
+    Signature, StructType, Type, TypeKind, TypeList,
 };
 
 pub(super) struct TypingContext<'db> {
@@ -22,12 +23,10 @@ pub(super) struct TypingContext<'db> {
     pub references: &'db IndexMap<NodeId, naming::Symbol>,
     pub nodes: &'db NodeView,
 
+    pub decl: DeclId,
     pub path: DeclPath,
 
-    /// Types of all expressions and types.
-    pub node_types: HashMap<NodeId, Type>,
-    /// Types of all local variables.
-    pub local_types: HashMap<naming::Local, InferredType>,
+    pub types: super::TypingInfo,
 }
 
 impl<'db> TypingContext<'db> {
@@ -42,20 +41,20 @@ impl<'db> TypingContext<'db> {
             ast,
             references,
             nodes,
+            decl,
             path,
-            node_types: HashMap::default(),
-            local_types: HashMap::default(),
+            types: super::TypingInfo {
+                nodes: IndexMap::with_capacity(nodes.len()),
+                locals: IndexMap::new(),
+            },
         })
     }
 
     pub fn finish(self) -> Result<super::TypingInfo> {
-        Ok(super::TypingInfo {
-            nodes: self.node_types,
-            locals: self.local_types,
-        })
+        Ok(self.types)
     }
 
-    async fn lookup_type(&self, typ: syntax::TypeId) -> Result<Option<Type>> {
+    async fn lookup_type(&self, typ: TypeId) -> Result<Option<Type>> {
         let Some(inferred) = self.lookup_node(typ.node).await? else { return Ok(None) };
         match inferred {
             InferredType::Type(typ) => Ok(Some(typ)),
@@ -69,7 +68,7 @@ impl<'db> TypingContext<'db> {
     async fn lookup_node(&self, node: NodeId) -> Result<Option<InferredType>> {
         let Some(&symbol) = self.references.get(&node) else { return Ok(None) };
         match symbol {
-            naming::Symbol::Local(local) => Ok(self.local_types.get(&local).copied()),
+            naming::Symbol::Local(local) => Ok(self.types.locals.get(&local).copied()),
             naming::Symbol::Global(global) => match super::signature(self.db, global).await? {
                 Signature::Value(typ) => Ok(Some(InferredType::Value(typ))),
                 Signature::Type(typ) => Ok(Some(InferredType::Type(typ))),
@@ -80,23 +79,31 @@ impl<'db> TypingContext<'db> {
     }
 
     /// Resolve the given type, but only fetch the needed dependencies.
-    pub async fn resolve_precise(&mut self, typ: syntax::TypeId) -> Result<Type> {
+    pub async fn resolve_precise(&mut self, typ: TypeId) -> Result<Type> {
         self.resolve_type_impl(typ).await
     }
 
     /// Get the type represented by the given syntax tree.
-    pub fn resolve_type(&mut self, typ: syntax::TypeId) -> BoxFuture<Result<Type>> {
+    pub fn resolve_type(&mut self, typ: TypeId) -> BoxFuture<Result<Type>> {
         self.resolve_type_impl(typ).boxed()
     }
 
-    async fn resolve_type_impl(&mut self, typ: syntax::TypeId) -> Result<Type> {
+    async fn resolve_type_impl(&mut self, typ: TypeId) -> Result<Type> {
+        let resolved = self.resolve_type_raw(typ).await?;
+        self.types
+            .nodes
+            .insert(typ.node, InferredType::Type(resolved));
+        Ok(resolved)
+    }
+
+    async fn resolve_type_raw(&mut self, typ: TypeId) -> Result<Type> {
         let node = typ.node;
         match self.nodes.kind(node) {
             Node::Name(name) => match self.lookup_type(typ).await? {
                 Some(typ) => Ok(typ),
                 None => {
                     let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                    Err(error!("unresolved type {name}").label(self.node_span(typ), ""))
+                    Err(error!("unresolved type `{name}`").label(self.node_span(typ), ""))
                 }
             },
             Node::Selector(_, _) => {
@@ -111,12 +118,18 @@ impl<'db> TypingContext<'db> {
                 let inner = self.resolve_type(inner).await?;
                 Ok(TypeKind::Pointer(inner).insert(self.db))
             }
-            Node::Array(len, inner) => {
+            Node::Array(len_expr, inner) => {
                 let inner_type = self.resolve_type(inner).await?;
 
-                if let Some(len) = len {
-                    let len = self.evaluate_integer(len).await?;
-                    Ok(TypeKind::Array(len, inner_type).insert(self.db))
+                if let Some(len_expr) = len_expr {
+                    let len = self.evaluate_integer(len_expr).await?;
+                    match u64::try_from(len) {
+                        Ok(len) => Ok(TypeKind::Array(len, inner_type).insert(self.db)),
+                        Err(_) => Err(error!("array length cannot be negative").label(
+                            self.node_span(len_expr),
+                            format!("this evaluates to `{len}`"),
+                        )),
+                    }
                 } else {
                     Err(error!("cannot infer length of array").label(self.node_span(node), ""))
                 }
@@ -166,7 +179,11 @@ impl<'db> TypingContext<'db> {
                                 embedded: matches!(kind, syntax::Node::EmbeddedField { .. }),
                             });
                         }
-                        _ => unreachable!("not a field"),
+                        _ => {
+                            return Err(
+                                bug!("not a field").label(self.node_span(node), "expected a field")
+                            )
+                        }
                     }
                 }
 
@@ -199,7 +216,10 @@ impl<'db> TypingContext<'db> {
                             let signature = self.resolve_signature(signature).await?;
                             methods.push(InterfaceMethod { name, signature });
                         }
-                        _ => unreachable!("not a field"),
+                        _ => {
+                            return Err(bug!("not a method")
+                                .label(self.node_span(node), "expected a method"))
+                        }
                     }
                 }
 
@@ -339,6 +359,12 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn infer_expr_impl(&mut self, expr: ExprId) -> Result<InferredType> {
+        let inferred = self.infer_expr_raw(expr).await?;
+        self.types.nodes.insert(expr.node, inferred);
+        Ok(inferred)
+    }
+
+    async fn infer_expr_raw(&mut self, expr: ExprId) -> Result<InferredType> {
         use InferredType::Value;
 
         match self.nodes.kind(expr) {
@@ -346,38 +372,34 @@ impl<'db> TypingContext<'db> {
                 Some(typ) => Ok(typ),
                 None => {
                     let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                    Err(error!("unresolved reference {name}").label(self.node_span(expr), ""))
+                    Err(bug!("unresolved reference `{name}`").label(self.node_span(expr), ""))
                 }
             },
             Node::Selector(base, ident) => {
                 if let Some(typ) = self.lookup_node(expr.node).await? {
+                    // qualified identifier
                     return Ok(typ);
                 }
-
-                let base_type = self.infer_expr(ExprId::new(base)).await?;
-                let core_type = if base_type.lookup(self.db).is_declared() {
-                    super::underlying_type(self.db, base_type).await?
-                } else {
-                    base_type
-                };
 
                 let Some(name) = ident.text else {
                     return Err(error!("selector name must not be blank")
                         .label(self.ast.span(Some(self.path.index), ident.span), ""))
                 };
 
-                match core_type.lookup(self.db) {
-                    TypeKind::Struct(strukt) => {
-                        let Some(field) = strukt.get_field(name) else {
-                            return Err(error!("no field `{name}` found for `{base_type}`")
-                                .label(self.ast.span(Some(self.path.index), ident.span), ""))
-                        };
-                        Ok(Value(field.typ))
+                let base_type = self.infer_expr(ExprId::new(base)).await?;
+
+                let selection = super::resolve_selector(self.db, base_type, name).await?;
+
+                if let Some(selection) = selection {
+                    match selection {
+                        super::Selection::Element(typ) => Ok(Value(typ)),
+                        super::Selection::Method(_) => todo!("method selection"),
                     }
-                    _ => Err(error!(
-                        "cannot access field or method `{name}` of type `{base_type}`"
+                } else {
+                    Err(
+                        error!("no field or method `{name}` found for `{base_type}`")
+                            .label(self.node_span(expr), ""),
                     )
-                    .label(self.node_span(expr), "")),
                 }
             }
 
@@ -444,7 +466,8 @@ impl<'db> TypingContext<'db> {
             Node::Unary(op, arg) => match op {
                 syntax::UnaryOperator::Plus => {
                     let arg_type = self.infer_expr(arg).await?;
-                    if !arg_type.lookup(self.db).is_numeric() {
+                    let arg_class = arg_type.lookup(self.db).underlying_class(self.db).await?;
+                    if !arg_class.is_numeric() {
                         return Err(error!("the operator `+` expected a numeric type")
                             .label(self.node_span(arg), format!("this has type `{arg_type}`")));
                     }
@@ -452,7 +475,8 @@ impl<'db> TypingContext<'db> {
                 }
                 syntax::UnaryOperator::Minus => {
                     let arg_type = self.infer_expr(arg).await?;
-                    if !arg_type.lookup(self.db).is_signed() {
+                    let arg_class = arg_type.lookup(self.db).underlying_class(self.db).await?;
+                    if !arg_class.is_signed() {
                         return Err(error!("the operator `-` expected a signed numeric type")
                             .label(self.node_span(arg), format!("this has type `{arg_type}`")));
                     }
@@ -460,7 +484,8 @@ impl<'db> TypingContext<'db> {
                 }
                 syntax::UnaryOperator::Xor => {
                     let arg_type = self.infer_expr(arg).await?;
-                    if !arg_type.lookup(self.db).is_integer() {
+                    let arg_class = arg_type.lookup(self.db).underlying_class(self.db).await?;
+                    if !arg_class.is_integer() {
                         return Err(error!("the operator `^` expected an integer")
                             .label(self.node_span(arg), format!("this has type `{arg_type}`")));
                     }
@@ -468,7 +493,8 @@ impl<'db> TypingContext<'db> {
                 }
                 syntax::UnaryOperator::Not => {
                     let arg_type = self.infer_expr(arg).await?;
-                    if !arg_type.lookup(self.db).is_bool() {
+                    let core_type = super::underlying_type(self.db, arg_type).await?;
+                    if !core_type.lookup(self.db).is_bool() {
                         return Err(error!("`!` expected a `bool`")
                             .label(self.node_span(arg), format!("this has type `{arg_type}`")));
                     }
@@ -512,171 +538,7 @@ impl<'db> TypingContext<'db> {
                     }
                 }
             },
-            Node::Binary(interleaved) => {
-                use syntax::BinaryOperator as BinOp;
-
-                let interleaved = self.nodes.indirect(interleaved);
-
-                let lhs_span = |this: &Self, index: usize| {
-                    this.node_span(interleaved[0])
-                        .join(this.node_span(interleaved[2 * index]))
-                };
-
-                let mut lhs = self.infer_expr(interleaved[0]).await?;
-                for (index, pair) in interleaved[1..].chunks_exact(2).enumerate() {
-                    let Node::BinaryOp(op) = self.nodes.kind(pair[0]) else { unreachable!() };
-                    let rhs = self.infer_expr(pair[1]).await?;
-
-                    match op {
-                        BinOp::LogicalOr | BinOp::LogicalAnd => {
-                            if lhs.lookup(self.db).is_bool() && rhs.lookup(self.db).is_bool() {
-                                lhs = Type::untyped_bool(self.db);
-                                continue;
-                            }
-                            return Err(error!("incompatible types for `{op}`")
-                                .label(
-                                    self.node_span(pair[0]),
-                                    "expected both operands to be of type `bool`",
-                                )
-                                .label(
-                                    lhs_span(self, index),
-                                    format!("this is found to be of type `{lhs}`"),
-                                )
-                                .label(
-                                    self.node_span(pair[1]),
-                                    format!("this is found to be of type `{rhs}`"),
-                                ));
-                        }
-                        BinOp::Equal | BinOp::NotEqual => {
-                            if self.is_comparable(lhs, rhs).await? {
-                                lhs = Type::untyped_bool(self.db);
-                                continue;
-                            }
-                            return Err(error!("the operands are not comparable")
-                                .label(self.node_span(pair[0]), "in this comparison")
-                                .label(
-                                    lhs_span(self, index),
-                                    format!("this is found to be of type `{lhs}`"),
-                                )
-                                .label(
-                                    self.node_span(pair[1]),
-                                    format!("this is found to be of type `{rhs}`"),
-                                ));
-                        }
-                        BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
-                            if self.is_ordered(lhs, rhs).await? {
-                                lhs = Type::untyped_bool(self.db);
-                                continue;
-                            }
-                            return Err(error!("the operands cannot be ordered")
-                                .label(self.node_span(pair[0]), "in this comparison")
-                                .label(
-                                    lhs_span(self, index),
-                                    format!("this is found to be of type `{lhs}`"),
-                                )
-                                .label(
-                                    self.node_span(pair[1]),
-                                    format!("this is found to be of type `{rhs}`"),
-                                ));
-                        }
-
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::BitOr
-                        | BinOp::BitXor
-                        | BinOp::Mul
-                        | BinOp::Div
-                        | BinOp::Rem
-                        | BinOp::BitAnd
-                        | BinOp::BitNand => {
-                            let lhs_kind = lhs.lookup(self.db);
-                            let rhs_kind = rhs.lookup(self.db);
-
-                            let lhs_class = lhs_kind.class();
-                            let rhs_class = rhs_kind.class();
-
-                            let classes = match op {
-                                BinOp::Add => TypeClass::NUMERIC | TypeClass::STRING,
-                                BinOp::Sub | BinOp::Mul | BinOp::Div => TypeClass::NUMERIC,
-                                BinOp::Rem
-                                | BinOp::BitOr
-                                | BinOp::BitXor
-                                | BinOp::BitAnd
-                                | BinOp::BitNand => TypeClass::INTEGER,
-                                _ => unreachable!(),
-                            };
-
-                            let overlap = lhs_class.intersection(rhs_class);
-
-                            if overlap.intersects(classes) {
-                                if lhs == rhs || lhs_class.is_untyped() || rhs_class.is_untyped() {
-                                    lhs = if lhs_class.is_untyped() && rhs_class.is_untyped() {
-                                        let order = [
-                                            TypeClass::COMPLEX,
-                                            TypeClass::FLOAT,
-                                            TypeClass::RUNE,
-                                            TypeClass::INTEGER,
-                                        ];
-
-                                        'order: {
-                                            for order in order {
-                                                if lhs_class.contains(order) {
-                                                    break 'order lhs;
-                                                }
-                                                if rhs_class.contains(order) {
-                                                    break 'order rhs;
-                                                }
-                                            }
-
-                                            lhs
-                                        }
-                                    } else if lhs_class.is_untyped() {
-                                        rhs
-                                    } else {
-                                        lhs
-                                    };
-                                    continue;
-                                }
-                            }
-
-                            return Err(error!("incompatible types for `{op}`")
-                                .label(
-                                    self.node_span(pair[0]),
-                                    "both operands must be of the same type",
-                                )
-                                .label(
-                                    lhs_span(self, index),
-                                    format!("this is found to be of type `{lhs}`"),
-                                )
-                                .label(
-                                    self.node_span(pair[1]),
-                                    format!("this is found to be of type `{rhs}`"),
-                                ));
-                        }
-
-                        BinOp::ShiftLeft | BinOp::ShiftRight => {
-                            let lhs_class = lhs.lookup(self.db).class();
-                            let rhs_class = rhs.lookup(self.db).class();
-
-                            if lhs_class.is_integer() && rhs_class.is_integer() {
-                                continue;
-                            }
-
-                            return Err(error!("incompatible types for `{op}`")
-                                .label(self.node_span(pair[0]), "both operands must be integers")
-                                .label(
-                                    lhs_span(self, index),
-                                    format!("this is found to be of type `{lhs}`"),
-                                )
-                                .label(
-                                    self.node_span(pair[1]),
-                                    format!("this is found to be of type `{rhs}`"),
-                                ));
-                        }
-                    }
-                }
-                Ok(Value(lhs))
-            }
+            Node::Binary(interleaved) => self.infer_binary_expr(interleaved).await,
             Node::BinaryOp(_) => unreachable!("handled by `Node::Binary`"),
 
             Node::Function(signature, body) => {
@@ -786,7 +648,7 @@ impl<'db> TypingContext<'db> {
             | Node::EmbeddedField(_, _, _)
             | Node::Interface(_)
             | Node::MethodElement(_, _) => {
-                let typ = self.resolve_type(syntax::TypeId::new(expr.node)).await?;
+                let typ = self.resolve_type(TypeId::new(expr.node)).await?;
                 Ok(InferredType::Type(typ))
             }
 
@@ -829,10 +691,188 @@ impl<'db> TypingContext<'db> {
         }
     }
 
+    async fn infer_binary_expr(&mut self, interleaved: ExprRange) -> Result<InferredType> {
+        use syntax::BinaryOperator as BinOp;
+
+        let interleaved = self.nodes.indirect(interleaved);
+
+        let lhs_span = |this: &Self, index: usize| {
+            this.node_span(interleaved[0])
+                .join(this.node_span(interleaved[2 * index]))
+        };
+
+        let mut lhs = self.infer_expr(interleaved[0]).await?;
+        for (index, pair) in interleaved[1..].chunks_exact(2).enumerate() {
+            let Node::BinaryOp(op) = self.nodes.kind(pair[0]) else { unreachable!() };
+            let mut rhs = self.infer_expr(pair[1]).await?;
+
+            match op {
+                BinOp::LogicalOr | BinOp::LogicalAnd => {
+                    if lhs.lookup(self.db).is_bool() && rhs.lookup(self.db).is_bool() {
+                        lhs = Type::untyped_bool(self.db);
+                        continue;
+                    }
+                    return Err(error!("incompatible types for `{op}`")
+                        .label(
+                            self.node_span(pair[0]),
+                            "expected both operands to be of type `bool`",
+                        )
+                        .label(
+                            lhs_span(self, index),
+                            format!("this is found to be of type `{lhs}`"),
+                        )
+                        .label(
+                            self.node_span(pair[1]),
+                            format!("this is found to be of type `{rhs}`"),
+                        ));
+                }
+                BinOp::Equal | BinOp::NotEqual => {
+                    if self.is_comparable(lhs, rhs).await? {
+                        lhs = Type::untyped_bool(self.db);
+                        continue;
+                    }
+                    return Err(error!("the operands are not comparable")
+                        .label(self.node_span(pair[0]), "in this comparison")
+                        .label(
+                            lhs_span(self, index),
+                            format!("this is found to be of type `{lhs}`"),
+                        )
+                        .label(
+                            self.node_span(pair[1]),
+                            format!("this is found to be of type `{rhs}`"),
+                        ));
+                }
+                BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
+                    if self.is_ordered(lhs, rhs).await? {
+                        lhs = Type::untyped_bool(self.db);
+                        continue;
+                    }
+                    return Err(error!("the operands cannot be ordered")
+                        .label(self.node_span(pair[0]), "in this comparison")
+                        .label(
+                            lhs_span(self, index),
+                            format!("this is found to be of type `{lhs}`"),
+                        )
+                        .label(
+                            self.node_span(pair[1]),
+                            format!("this is found to be of type `{rhs}`"),
+                        ));
+                }
+
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::BitAnd
+                | BinOp::BitNand => {
+                    let mut lhs_kind = lhs.lookup(self.db);
+                    let mut rhs_kind = rhs.lookup(self.db);
+
+                    if lhs_kind.is_untyped() {
+                        if !rhs_kind.is_untyped() && self.can_convert(rhs, lhs).await? {
+                            lhs_kind = rhs_kind;
+                            lhs = rhs;
+                        }
+                    } else {
+                        if rhs_kind.is_untyped() && self.can_convert(lhs, rhs).await? {
+                            rhs_kind = lhs_kind;
+                            rhs = lhs;
+                        }
+                    }
+
+                    let lhs_class = lhs_kind.underlying_class(self.db).await?;
+                    let rhs_class = rhs_kind.underlying_class(self.db).await?;
+
+                    let classes = match op {
+                        BinOp::Add => TypeClass::NUMERIC | TypeClass::STRING,
+                        BinOp::Sub | BinOp::Mul | BinOp::Div => TypeClass::NUMERIC,
+                        BinOp::Rem
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::BitAnd
+                        | BinOp::BitNand => TypeClass::INTEGER,
+                        _ => unreachable!(),
+                    };
+
+                    let overlap = lhs_class.intersection(rhs_class);
+
+                    if overlap.intersects(classes) {
+                        if lhs == rhs || lhs_class.is_untyped() || rhs_class.is_untyped() {
+                            lhs = if lhs_class.is_untyped() && rhs_class.is_untyped() {
+                                let order = [
+                                    TypeClass::COMPLEX,
+                                    TypeClass::FLOAT,
+                                    TypeClass::RUNE,
+                                    TypeClass::INTEGER,
+                                ];
+
+                                'order: {
+                                    for order in order {
+                                        if lhs_class.contains(order) {
+                                            break 'order lhs;
+                                        }
+                                        if rhs_class.contains(order) {
+                                            break 'order rhs;
+                                        }
+                                    }
+
+                                    lhs
+                                }
+                            } else if lhs_class.is_untyped() {
+                                rhs
+                            } else {
+                                lhs
+                            };
+                            continue;
+                        }
+                    }
+
+                    return Err(error!("incompatible types for `{op}`")
+                        .label(
+                            self.node_span(pair[0]),
+                            "both operands must be of the same type",
+                        )
+                        .label(
+                            lhs_span(self, index),
+                            format!("this is found to be of type `{lhs}`"),
+                        )
+                        .label(
+                            self.node_span(pair[1]),
+                            format!("this is found to be of type `{rhs}`"),
+                        ));
+                }
+
+                BinOp::ShiftLeft | BinOp::ShiftRight => {
+                    let lhs_class = lhs.lookup(self.db).class();
+                    let rhs_class = rhs.lookup(self.db).class();
+
+                    if lhs_class.is_integer() && rhs_class.is_integer() {
+                        continue;
+                    }
+
+                    return Err(error!("incompatible types for `{op}`")
+                        .label(self.node_span(pair[0]), "both operands must be integers")
+                        .label(
+                            lhs_span(self, index),
+                            format!("this is found to be of type `{lhs}`"),
+                        )
+                        .label(
+                            self.node_span(pair[1]),
+                            format!("this is found to be of type `{rhs}`"),
+                        ));
+                }
+            }
+        }
+        Ok(InferredType::Value(lhs))
+    }
+
     async fn infer_composite_init(
         &mut self,
         expr: ExprId,
-        typ: syntax::TypeId,
+        typ: TypeId,
         composite: syntax::CompositeRange,
     ) -> Result<Type> {
         let expected = match self.nodes.kind(typ) {
@@ -1050,12 +1090,36 @@ impl<'db> TypingContext<'db> {
             .label(self.node_span(index), "not representable by an `int`"))
     }
 
-    async fn evaluate_integer(&mut self, expr: ExprId) -> Result<u64> {
-        let _typ = self.infer_expr(expr).await?;
+    async fn evaluate_integer(&mut self, expr: ExprId) -> Result<i64> {
+        let typ = self.infer_expr(expr).await?;
+        let kind = typ.lookup(self.db);
+        let class = kind.class();
+
+        if !class.contains(TypeClass::INTEGER) {
+            return Err(error!("expected a constant integer expression")
+                .label(self.node_span(expr), format!("this has type `{typ}`")));
+        }
+
+        if !class.contains(TypeClass::UNTYPED) {
+            return Err(error!("expected a constant integer expression")
+                .label(self.node_span(expr), "must be a constant"));
+        }
+
         match self.nodes.kind(expr) {
-            Node::IntegerSmall(value) => Ok(value),
-            _ => Err(error!("could not evaluate expression")
-                .label(self.node_span(expr), "must be a constant")),
+            Node::IntegerSmall(value) => Ok(value.try_into().expect("handle large integers")),
+            _ => Ok(self.eval_context().eval(expr).await?.integer()),
+        }
+    }
+
+    fn eval_context(&self) -> EvalContext {
+        EvalContext {
+            decl: self.decl,
+            path: self.path,
+            db: self.db,
+            ast: self.ast,
+            nodes: self.nodes,
+            references: self.references,
+            types: &self.types,
         }
     }
 
@@ -1091,13 +1155,139 @@ impl<'db> TypingContext<'db> {
             }
         };
 
+        let arg_exprs = self.nodes.indirect(args);
+
         match target_type.lookup(self.db) {
             TypeKind::Builtin(builtin) => {
-                Err(error!("TODO: call builtin {builtin:?}").label(self.node_span(call_expr), ""))
+                let out = match builtin {
+                    super::BuiltinFunction::Close => todo!("builtin close"),
+                    super::BuiltinFunction::Copy => todo!("builtin copy"),
+
+                    super::BuiltinFunction::Append => todo!("builtin append"),
+                    super::BuiltinFunction::Delete => todo!("bulitin delete"),
+
+                    super::BuiltinFunction::Complex => todo!("builtin complex"),
+                    super::BuiltinFunction::Imag => todo!("builtin imag"),
+                    super::BuiltinFunction::Real => todo!("builtin real"),
+
+                    super::BuiltinFunction::Cap => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!("`cap` expects a single argument (collection)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let typ = self.infer_expr(arg_exprs[0]).await?;
+                        if let Some(cap_typ) = typ.lookup(self.db).capacity(self.db) {
+                            cap_typ
+                        } else {
+                            return Err(error!(
+                                "cannot only get capacity of arrays, slices and channels"
+                            )
+                            .label(
+                                self.node_span(arg_exprs[0]),
+                                format!("this has type `{typ}`"),
+                            ));
+                        }
+                    }
+                    super::BuiltinFunction::Len => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!("`len` expects a single argument (collection)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let typ = self.infer_expr(arg_exprs[0]).await?;
+                        if let Some(len_typ) = typ.lookup(self.db).length(self.db) {
+                            len_typ
+                        } else {
+                            return Err(error!("cannot only get length of strings, arrays, slices, maps and channels")
+                                .label(self.node_span(arg_exprs[0]), format!("this has type `{typ}`")));
+                        }
+                    }
+
+                    super::BuiltinFunction::Make => {
+                        if arg_exprs.is_empty() {
+                            return Err(error!("`make` expects a type as its argument")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let typ = self.resolve_type(TypeId::new(arg_exprs[0].node)).await?;
+
+                        async fn check_make_parameter(
+                            this: &mut TypingContext<'_>,
+                            expr: ExprId,
+                            name: &str,
+                        ) -> Result<()> {
+                            let typ = this.infer_expr(expr).await?;
+                            if !typ.lookup(this.db).is_integer() {
+                                return Err(error!("{name} must be an integer").label(
+                                    this.node_span(expr),
+                                    format!("this is of type `{typ}`"),
+                                ));
+                            }
+                            Ok(())
+                        }
+
+                        match typ.lookup(self.db) {
+                            TypeKind::Slice(_) => {
+                                if arg_exprs.len() > 3 {
+                                    return Err(error!("`make` accepts at most 3 arguments (type, length, capacity)")
+                                        .label(self.node_span(call_expr), ""));
+                                }
+                                if let Some(&len) = arg_exprs.get(1) {
+                                    check_make_parameter(self, len, "slice length").await?;
+                                }
+                                if let Some(&cap) = arg_exprs.get(2) {
+                                    check_make_parameter(self, cap, "slice capacity").await?;
+                                }
+                            }
+
+                            TypeKind::Map(_, _) => {
+                                if arg_exprs.len() > 2 {
+                                    return Err(error!(
+                                        "`make` accepts at most 2 arguments (type, capacity)"
+                                    )
+                                    .label(self.node_span(call_expr), ""));
+                                }
+                                if let Some(&len) = arg_exprs.get(1) {
+                                    check_make_parameter(self, len, "map capacity").await?;
+                                }
+                            }
+
+                            TypeKind::Channel(_, _) => {
+                                if arg_exprs.len() > 2 {
+                                    return Err(error!(
+                                        "`make` accepts at most 2 arguments (type, capacity)"
+                                    )
+                                    .label(self.node_span(call_expr), ""));
+                                }
+                                if let Some(&len) = arg_exprs.get(1) {
+                                    check_make_parameter(self, len, "channel capacity").await?;
+                                }
+                            }
+
+                            _ => {
+                                return Err(error!("cannot `make` the type `{typ}`")
+                                    .label(self.node_span(call_expr), ""))
+                            }
+                        }
+
+                        typ
+                    }
+                    super::BuiltinFunction::New => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!("`new` expects a single type as its argument")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let typ = self.resolve_type(TypeId::new(arg_exprs[0].node)).await?;
+                        TypeKind::Pointer(typ).insert(self.db)
+                    }
+
+                    _ => {
+                        return Err(bug!("TODO: call builtin {builtin:?}")
+                            .label(self.node_span(call_expr), ""))
+                    }
+                };
+
+                Ok(smallvec![out])
             }
             TypeKind::Function(func) => {
-                let arg_exprs = self.nodes.indirect(args);
-
                 if args.len() == 1 && func.inputs > 1 {
                     let arg_call = arg_exprs[0];
                     if let Node::Call(arg_target, arg_args, arg_spread) = self.nodes.kind(arg_call)
@@ -1106,13 +1296,13 @@ impl<'db> TypingContext<'db> {
                             .infer_function_call_boxed(arg_call, arg_target, arg_args, arg_spread)
                             .await?;
 
-                        if types.len() != args.len() {
+                        if !func.enough_arguments(types.len()) {
                             return Err(
                                 self.emit_invalid_argument_count(target, func, args, call_expr)
                             );
                         }
 
-                        for (&expected, arg) in func.inputs().iter().zip(types) {
+                        for (expected, arg) in func.inputs().zip(types) {
                             self.check_assignable(expected, arg, arg_call).await?;
                         }
 
@@ -1120,11 +1310,11 @@ impl<'db> TypingContext<'db> {
                     }
                 }
 
-                if func.inputs != args.len() {
+                if !func.enough_arguments(args.len()) {
                     return Err(self.emit_invalid_argument_count(target, func, args, call_expr));
                 }
 
-                for (&expected, &arg) in func.inputs().iter().zip(arg_exprs) {
+                for (expected, &arg) in func.inputs().zip(arg_exprs) {
                     self.check_expr(arg, expected).await?;
                 }
 
@@ -1145,7 +1335,11 @@ impl<'db> TypingContext<'db> {
         error!("invalid number of arguments")
             .label(
                 self.node_span(target),
-                format!("this function expected {} arguments", func.inputs),
+                format!(
+                    "this function expected {} arguments{}",
+                    func.required_inputs().len(),
+                    if func.variadic { " (or more)" } else { "" }
+                ),
             )
             .label(
                 self.range_span(args)
@@ -1233,22 +1427,29 @@ impl<'db> TypingContext<'db> {
             (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => true,
 
             (TypeKind::Interface(interface), _) => {
-                if interface.methods.is_empty() {
-                    // all types implement the trivial empty interface
-                    return Ok(true);
+                self.is_interface_satisfied(interface, source).await?
+            }
+
+            _ => {
+                let target_core = super::underlying_type(self.db, target).await?;
+
+                let target_core_kind = target_core.lookup(self.db);
+
+                if let TypeKind::Interface(interface) = target_core_kind {
+                    if self.is_interface_satisfied(interface, source).await? {
+                        return Ok(true);
+                    }
                 }
 
-                return Err(error!(
-                    "TODO: determine if `{source}` implements the interface `{target}`"
-                ));
-            }
-            _ => {
                 if !target_kind.is_declared() || !source_kind.is_declared() {
-                    let target_core = super::underlying_type(self.db, target).await?;
                     let source_core = super::underlying_type(self.db, source).await?;
                     if target_core == source_core {
                         return Ok(true);
                     }
+                }
+
+                if self.is_arbitrary_type(target_kind) {
+                    return Ok(true);
                 }
 
                 false
@@ -1256,6 +1457,26 @@ impl<'db> TypingContext<'db> {
         };
 
         Ok(assignable)
+    }
+
+    async fn is_interface_satisfied(
+        &self,
+        interface: &InterfaceType,
+        source: Type,
+    ) -> Result<bool> {
+        if interface.methods.is_empty() {
+            // all types trivially implement the empty interface
+            return Ok(true);
+        }
+
+        Err(bug!(
+            "TODO: determine if `{source}` implements the interface `{interface}`"
+        ))
+    }
+
+    fn is_arbitrary_type(&self, kind: &TypeKind) -> bool {
+        let TypeKind::Declared(decl) = kind else { return false };
+        super::is_unsafe_decl(self.db, *decl, "ArbitraryType")
     }
 
     /// Can the `source` type be represented by the `target` type?
@@ -1318,6 +1539,19 @@ impl<'db> TypingContext<'db> {
         let target_kind = target.lookup(self.db);
         let source_kind = source.lookup(self.db);
 
+        let target_class = target_kind.class();
+        let source_class = source_kind.class();
+
+        let common_class = target_class.intersection(source_class);
+
+        if common_class.intersects(TypeClass::INTEGER | TypeClass::FLOAT) {
+            return Ok(true);
+        }
+
+        if common_class.intersects(TypeClass::COMPLEX) {
+            return Ok(true);
+        }
+
         match source_kind {
             TypeKind::String | TypeKind::Untyped(ConstantKind::String) => match target_kind {
                 TypeKind::Slice(inner) => Ok(matches!(
@@ -1327,8 +1561,19 @@ impl<'db> TypingContext<'db> {
                 _ => Ok(false),
             },
             TypeKind::Slice(inner) => match inner.lookup(self.db) {
-                TypeKind::Uint8 | TypeKind::Int32 => Ok(matches!(target_kind, TypeKind::String)),
-                _ => Ok(false),
+                TypeKind::Uint8 | TypeKind::Int32 if matches!(target_kind, TypeKind::String) => {
+                    Ok(true)
+                }
+                _ => {
+                    if let TypeKind::Pointer(pointer) = target_kind {
+                        match pointer.lookup(self.db) {
+                            TypeKind::Array(_, element) if element == inner => return Ok(true),
+                            _ => {}
+                        }
+                    }
+
+                    Ok(false)
+                }
             },
             _ => Ok(false),
         }

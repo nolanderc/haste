@@ -4,6 +4,8 @@
 #![allow(clippy::useless_format)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::comparison_chain)]
 
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};

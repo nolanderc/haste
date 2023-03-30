@@ -1,19 +1,32 @@
 mod context;
+mod eval;
 
+use std::sync::Arc;
+
+use bstr::BStr;
 use smallvec::SmallVec;
 
 use crate::{
     common::Text,
     error,
+    index_map::IndexMap,
     naming::{self, AssignmentExpr, Builtin, DeclId, PackageId},
     syntax::{self, NodeId},
     Result,
 };
 
-use self::context::TypingContext;
+use self::{context::TypingContext, eval::EvalContext};
 
 #[haste::storage]
-pub struct Storage(Type, signature, type_check_body, underlying_type);
+pub struct Storage(
+    Type,
+    signature,
+    type_check_body,
+    underlying_type_for_decl,
+    const_value,
+    selector_candidates,
+    resolve_selector,
+);
 
 #[haste::intern(Type)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,6 +101,14 @@ impl TypeClass {
     pub fn is_integer(self) -> bool {
         self.contains(Self::INTEGER)
     }
+
+    pub fn is_signed(self) -> bool {
+        self.contains(Self::SIGNED)
+    }
+
+    pub fn is_numeric(self) -> bool {
+        self.intersects(Self::NUMERIC)
+    }
 }
 
 impl TypeKind {
@@ -150,8 +171,19 @@ impl TypeKind {
         }
     }
 
+    pub async fn underlying_class(&self, db: &dyn crate::Db) -> Result<TypeClass> {
+        if let Self::Declared(decl) = self {
+            Ok(underlying_type_for_decl(db, *decl)
+                .await?
+                .lookup(db)
+                .class())
+        } else {
+            Ok(self.class())
+        }
+    }
+
     pub fn is_numeric(&self) -> bool {
-        self.class().contains(TypeClass::NUMERIC)
+        self.class().intersects(TypeClass::NUMERIC)
     }
 
     pub fn is_signed(&self) -> bool {
@@ -211,6 +243,36 @@ impl TypeKind {
 
     pub fn is_untyped(&self) -> bool {
         self.class().contains(TypeClass::UNTYPED)
+    }
+
+    pub fn length(&self, db: &dyn crate::Db) -> Option<Type> {
+        match self {
+            Self::Pointer(inner) if matches!(inner.lookup(db), TypeKind::Array(_, _)) => {
+                Some(Self::Untyped(ConstantKind::Integer).insert(db))
+            }
+            Self::Array(_, _) => Some(Self::Untyped(ConstantKind::Integer).insert(db)),
+
+            Self::Untyped(ConstantKind::String)
+            | Self::String
+            | Self::Slice(_)
+            | Self::Map(_, _)
+            | Self::Channel(_, _) => Some(Self::Int.insert(db)),
+
+            _ => None,
+        }
+    }
+
+    pub fn capacity(&self, db: &dyn crate::Db) -> Option<Type> {
+        match self {
+            Self::Pointer(inner) if matches!(inner.lookup(db), TypeKind::Array(_, _)) => {
+                Some(Self::Untyped(ConstantKind::Integer).insert(db))
+            }
+            Self::Array(_, _) => Some(Self::Untyped(ConstantKind::Integer).insert(db)),
+
+            Self::Slice(_) | Self::Channel(_, _) => Some(Self::Int.insert(db)),
+
+            _ => None,
+        }
     }
 }
 
@@ -272,12 +334,32 @@ pub struct FunctionType {
 }
 
 impl FunctionType {
-    pub fn inputs(&self) -> &[Type] {
-        &self.types[..self.inputs]
+    pub fn inputs(&self) -> impl Iterator<Item = Type> + '_ {
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            if let Some(typ) = self.types.get(i) {
+                i += 1;
+                return Some(*typ)
+            }
+
+            if self.variadic {
+                self.types.last().copied()
+            } else {
+                None
+            }
+        })
     }
 
     pub fn outputs(&self) -> &[Type] {
         &self.types[self.inputs..]
+    }
+
+    pub fn required_inputs(&self) -> &[Type] {
+        &self.types[..self.inputs - self.variadic as usize]
+    }
+
+    fn enough_arguments(&self, len: usize) -> bool {
+        len >= self.required_inputs().len()
     }
 }
 
@@ -379,67 +461,39 @@ impl std::fmt::Display for TypeKind {
             TypeKind::Channel(syntax::ChannelKind::Send, inner) => write!(f, "chan<- {inner}"),
             TypeKind::Channel(syntax::ChannelKind::Recv, inner) => write!(f, "<-chan {inner}"),
             TypeKind::Function(func) => func.fmt(f),
-            TypeKind::Struct(strukt) => {
-                write!(f, "struct {{")?;
-
-                for (i, field) in strukt.fields.iter().enumerate() {
-                    if i == 0 {
-                        write!(f, " ")?;
-                    } else {
-                        write!(f, "; ")?;
-                    }
-
-                    if field.embedded {
-                        write!(f, "{}", field.typ)?;
-                    } else if let Some(name) = field.name {
-                        write!(f, "{} {}", name, field.typ)?;
-                    } else {
-                        write!(f, "_ {}", field.typ)?;
-                    }
-
-                    if let Some(tag) = field.tag {
-                        write!(f, " {:?}", tag)?;
-                    }
-                }
-
-                if strukt.fields.is_empty() {
-                    write!(f, "}}")
-                } else {
-                    write!(f, " }}")
-                }
-            }
-            TypeKind::Interface(interface) => {
-                write!(f, "interface {{")?;
-
-                for (i, method) in interface.methods.iter().enumerate() {
-                    if i == 0 {
-                        write!(f, " ")?;
-                    } else {
-                        write!(f, "; ")?;
-                    }
-
-                    method.signature.fmt(f)?;
-                }
-
-                if interface.methods.is_empty() {
-                    write!(f, "}}")
-                } else {
-                    write!(f, " }}")
-                }
-            }
-            TypeKind::Declared(decl) => write!(f, "{}.{}", decl.package.name, decl.name),
+            TypeKind::Struct(strukt) => strukt.fmt(f),
+            TypeKind::Interface(interface) => interface.fmt(f),
+            TypeKind::Declared(decl) => decl.fmt(f),
         }
     }
 }
 
 impl std::fmt::Display for FunctionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "func(")?;
-        for (i, input) in self.inputs().iter().enumerate() {
+        self.fmt_with_name(f, None)
+    }
+}
+
+impl FunctionType {
+    fn fmt_with_name(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        name: Option<Text>,
+    ) -> std::fmt::Result {
+        if let Some(name) = name {
+            write!(f, "func {name}(")?;
+        } else {
+            write!(f, "func(")?;
+        }
+
+        for i in 0..self.inputs {
             if i != 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", input)?;
+            if self.variadic && i == self.inputs - 1 {
+                write!(f, "...")?;
+            }
+            write!(f, "{}", self.types[i])?;
         }
         write!(f, ")")?;
 
@@ -461,6 +515,60 @@ impl std::fmt::Display for FunctionType {
     }
 }
 
+impl std::fmt::Display for StructType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "struct {{")?;
+
+        for (i, field) in self.fields.iter().enumerate() {
+            if i == 0 {
+                write!(f, " ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+
+            if field.embedded {
+                write!(f, "{}", field.typ)?;
+            } else if let Some(name) = field.name {
+                write!(f, "{} {}", name, field.typ)?;
+            } else {
+                write!(f, "_ {}", field.typ)?;
+            }
+
+            if let Some(tag) = field.tag {
+                write!(f, " {:?}", tag)?;
+            }
+        }
+
+        if self.fields.is_empty() {
+            write!(f, "}}")
+        } else {
+            write!(f, " }}")
+        }
+    }
+}
+
+impl std::fmt::Display for InterfaceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interface {{")?;
+
+        for (i, method) in self.methods.iter().enumerate() {
+            if i == 0 {
+                write!(f, " ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+
+            method.signature.fmt_with_name(f, Some(method.name))?;
+        }
+
+        if self.methods.is_empty() {
+            write!(f, "}}")
+        } else {
+            write!(f, " }}")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Signature {
     Package(PackageId),
@@ -474,6 +582,15 @@ pub enum InferredType {
     Value(Type),
     /// The expression is a type.
     Type(Type),
+}
+
+impl InferredType {
+    pub fn value(self) -> Type {
+        match self {
+            InferredType::Value(typ) => typ,
+            InferredType::Type(_) => unreachable!("expected a value but found a type"),
+        }
+    }
 }
 
 /// Get the type of the given symbol
@@ -612,9 +729,9 @@ fn builtin_signature(db: &dyn crate::Db, builtin: Builtin) -> Signature {
 #[derive(Debug, PartialEq, Eq, Default)]
 pub struct TypingInfo {
     /// For each syntax node, its type (only `ExprId` and `TypeId`).
-    nodes: crate::HashMap<NodeId, Type>,
+    nodes: IndexMap<NodeId, InferredType>,
     /// The type of local variables.
-    locals: crate::HashMap<naming::Local, InferredType>,
+    locals: IndexMap<naming::Local, InferredType>,
 }
 
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
@@ -710,11 +827,14 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
     }
 }
 
-#[haste::query]
-#[clone]
 async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
     let &TypeKind::Declared(decl) = typ.lookup(db) else { return Ok(typ) };
+    underlying_type_for_decl(db, decl).await
+}
 
+#[haste::query]
+#[clone]
+async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
 
@@ -729,4 +849,166 @@ async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
         _ => Err(error!("expected a type, but found a value")
             .label(path.span_in_ast(ctx.ast), "defined here")),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstValue {
+    Bool(bool),
+    Integer(i64),
+    String(Arc<BStr>),
+}
+
+impl std::fmt::Display for ConstValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConstValue::Bool(value) => value.fmt(f),
+            ConstValue::Integer(value) => value.fmt(f),
+            ConstValue::String(value) => write!(f, "{:?}", value),
+        }
+    }
+}
+
+impl ConstValue {
+    fn bool(&self) -> bool {
+        match self {
+            ConstValue::Bool(value) => *value,
+            _ => unreachable!("expected a boolean but found `{self}`"),
+        }
+    }
+
+    fn integer(&self) -> i64 {
+        match self {
+            ConstValue::Integer(value) => *value,
+            _ => unreachable!("expected an integer but found `{self}`"),
+        }
+    }
+
+    fn try_order(&self, other: &ConstValue) -> std::cmp::Ordering {
+        match (self, other) {
+            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => lhs.cmp(rhs),
+            _ => unreachable!("cannot compare `{self}` and `{other}`"),
+        }
+    }
+}
+
+#[haste::query]
+#[clone]
+async fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
+    let mut ctx = EvalContext::new(db, decl).await?;
+    let path = ctx.path;
+    let declaration = &ctx.ast.declarations[path.index];
+    match path.sub.lookup_in(declaration) {
+        naming::SingleDecl::ConstDecl(_, _, expr) => ctx.eval(expr).await,
+
+        naming::SingleDecl::TypeDef(_) | naming::SingleDecl::TypeAlias(_) => {
+            Err(error!("cannot evaluate constant")
+                .label(path.span_in_ast(ctx.ast), "this is a type, not a value"))
+        }
+
+        naming::SingleDecl::VarDecl(_, _, _) => Err(error!("cannot evaluate constant")
+            .label(path.span_in_ast(ctx.ast), "variables are not constant")),
+
+        naming::SingleDecl::Function(_) | naming::SingleDecl::Method(_) => {
+            Err(error!("cannot evaluate constant").label(
+                path.span_in_ast(ctx.ast),
+                "cannot evaluate during compile-time",
+            ))
+        }
+    }
+}
+
+fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &str) -> bool {
+    use crate::import::FileSetData;
+    use std::ffi::OsStr;
+
+    if decl.name.get(db) != name || decl.package.name.get(db) != "unsafe" {
+        return false;
+    }
+
+    let FileSetData::Directory(dir) = decl.package.files.lookup(db) else {return false};
+
+    let Some(suffix) = dir.lookup(db).as_goroot() else { return false };
+
+    if suffix != OsStr::new("src/unsafe") {
+        return false;
+    }
+
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Selection {
+    /// A field or interface method.
+    Element(Type),
+    /// A function with a receiver elsewhere in the package.
+    Method(Type),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SelectionCandidate {
+    depth: u32,
+    selection: SmallVec<[Selection; 2]>,
+}
+
+#[haste::query]
+#[clone]
+async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
+    let candidates = selector_candidates(db, typ).await.as_ref()?;
+    let Some(candidate) = candidates.get(&name) else { return Ok(None) };
+
+    if candidate.selection.len() > 1 {
+        return Err(error!(
+            "ambiguous selection `{typ}.{name}`: multiple alternatives ({:?})",
+            candidate.selection
+        ));
+    }
+
+    Ok(Some(candidate.selection[0]))
+}
+
+#[haste::query]
+async fn selector_candidates(
+    db: &dyn crate::Db,
+    mut typ: Type,
+) -> Result<IndexMap<Text, SelectionCandidate>> {
+    let mut candidates = IndexMap::<Text, SelectionCandidate>::new();
+
+    let mut add_candidate = |name: Text, depth: u32, selection: Selection| {
+        let old = candidates.get_or_insert_with(name, || SelectionCandidate {
+            depth: u32::MAX,
+            selection: SmallVec::new(),
+        });
+
+        if depth < old.depth {
+            old.depth = depth;
+            old.selection.clear();
+            old.selection.push(selection);
+        } else if depth == old.depth {
+            old.selection.push(selection);
+        }
+    };
+
+    if let TypeKind::Declared(decl) = typ.lookup(db) {
+        tracing::warn!("TODO: enumerate methods for `{typ}`");
+        typ = underlying_type_for_decl(db, *decl).await?;
+    }
+
+    match typ.lookup(db) {
+        TypeKind::Struct(strukt) => {
+            for field in strukt.fields.iter() {
+                if let Some(name) = field.name {
+                    add_candidate(name, 0, Selection::Element(field.typ));
+                }
+            }
+        }
+        TypeKind::Interface(interface) => {
+            for method in interface.methods.iter() {
+                let signature = TypeKind::Function(method.signature.clone()).insert(db);
+                add_candidate(method.name, 0, Selection::Element(signature));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(candidates)
 }

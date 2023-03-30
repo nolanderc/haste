@@ -53,12 +53,14 @@ struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Severity {
     Error,
+    Bug,
 }
 
 impl Severity {
     fn style(self) -> Style {
         match self {
             Severity::Error => Style::Red,
+            Severity::Bug => Style::Purple,
         }
     }
 }
@@ -88,6 +90,15 @@ impl Diagnostic {
     pub fn error(text: impl ToString) -> Self {
         Self::new(Inner::Message(Message {
             severity: Severity::Error,
+            text: text.to_string(),
+            attachments: SmallVec::new(),
+        }))
+    }
+
+    /// Create a new bug message
+    pub fn bug(text: impl ToString) -> Self {
+        Self::new(Inner::Message(Message {
+            severity: Severity::Bug,
             text: text.to_string(),
             attachments: SmallVec::new(),
         }))
@@ -185,6 +196,7 @@ impl Diagnostic {
             Inner::Message(message) => {
                 let severity_text = match message.severity {
                     Severity::Error => "error",
+                    Severity::Bug => "bug",
                 };
                 let severity_style = message.severity.style();
                 let bold = Style::Bold;
@@ -282,7 +294,11 @@ impl Label {
                 '\t' => "\t",
                 _ => " ",
             })
-            .chain(start_line_text[start_column..start_end_column].chars().map(|_| "^"))
+            .chain(
+                start_line_text[start_column..start_end_column]
+                    .chars()
+                    .map(|_| "^"),
+            )
             .collect::<String>();
 
         let end_underline = end_line_text[..end_column]
@@ -354,11 +370,12 @@ enum Style {
     Default,
 
     Red,
+    Green,
     Yellow,
     Blue,
+    Purple,
     Cyan,
     Gray,
-    Green,
 
     Bold,
     Italic,
@@ -374,6 +391,7 @@ impl std::fmt::Display for Style {
             Style::Green => write!(f, "\x1b[32m"),
             Style::Yellow => write!(f, "\x1b[33m"),
             Style::Blue => write!(f, "\x1b[34m"),
+            Style::Purple => write!(f, "\x1b[35m"),
             Style::Cyan => write!(f, "\x1b[36m"),
             Style::Gray => write!(f, "\x1b[37m"),
             Style::Bold => write!(f, "\x1b[1m"),

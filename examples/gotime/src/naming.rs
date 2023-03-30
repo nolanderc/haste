@@ -72,6 +72,12 @@ impl DeclId {
     }
 }
 
+impl std::fmt::Display for DeclId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.package.name, self.name)
+    }
+}
+
 /// Identifies a declaration in a specific file.
 ///
 /// This is not position independent, and should be used sparingly.
@@ -514,8 +520,8 @@ define_builtin! {
     Uintptr = "uintptr",
     Rune = "rune",
     String = "string",
-    True = "true",
 
+    True = "true",
     False = "false",
     Iota = "iota",
     Nil = "nil",

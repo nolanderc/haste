@@ -1,4 +1,9 @@
-use std::fmt::{Debug, Display, Formatter};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    sync::Arc,
+};
+
+use bstr::BStr;
 
 pub mod future;
 
@@ -66,4 +71,13 @@ where
         write!(f, ")")?;
         Ok(())
     })
+}
+
+pub fn bstr_arc(bytes: Arc<[u8]>) -> Arc<BStr> {
+    let ptr: *const [u8] = Arc::into_raw(bytes);
+    let ptr: *const BStr = ptr as *const BStr;
+
+    // SAFETY: `BStr` is a `#[repr(transparent)]` wrapper around a `[u8]`, so they have the same
+    // memory layout, which makes this transmute safe.
+    unsafe { Arc::from_raw(ptr) }
 }

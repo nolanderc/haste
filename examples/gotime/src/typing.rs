@@ -20,7 +20,7 @@ use self::{context::TypingContext, eval::EvalContext};
 #[haste::storage]
 pub struct Storage(
     Type,
-    signature,
+    decl_signature,
     type_check_body,
     underlying_type_for_decl,
     const_value,
@@ -274,6 +274,27 @@ impl TypeKind {
             _ => None,
         }
     }
+
+    pub fn bits(&self) -> Option<u32> {
+        match self {
+            TypeKind::Int => Some(64),
+            TypeKind::Int8 => Some(8),
+            TypeKind::Int16 => Some(16),
+            TypeKind::Int32 => Some(32),
+            TypeKind::Int64 => Some(64),
+            TypeKind::Uint => Some(64),
+            TypeKind::Uint8 => Some(8),
+            TypeKind::Uint16 => Some(16),
+            TypeKind::Uint32 => Some(32),
+            TypeKind::Uint64 => Some(64),
+            TypeKind::Uintptr => Some(64),
+            TypeKind::Float32 => Some(32),
+            TypeKind::Float64 => Some(64),
+            TypeKind::Complex64 => Some(64),
+            TypeKind::Complex128 => Some(128),
+            _ => None,
+        }
+    }
 }
 
 impl Type {
@@ -337,13 +358,14 @@ impl FunctionType {
     pub fn inputs(&self) -> impl Iterator<Item = Type> + '_ {
         let mut i = 0;
         std::iter::from_fn(move || {
-            if let Some(typ) = self.types.get(i) {
+            if i < self.inputs {
+                let typ = self.types[i];
                 i += 1;
-                return Some(*typ)
+                return Some(typ);
             }
 
             if self.variadic {
-                self.types.last().copied()
+                Some(self.types[self.inputs - 1])
             } else {
                 None
             }
@@ -354,12 +376,20 @@ impl FunctionType {
         &self.types[self.inputs..]
     }
 
-    pub fn required_inputs(&self) -> &[Type] {
-        &self.types[..self.inputs - self.variadic as usize]
+    pub fn required_inputs(&self) -> usize {
+        self.inputs - self.variadic as usize
     }
 
     fn enough_arguments(&self, len: usize) -> bool {
-        len >= self.required_inputs().len()
+        len >= self.required_inputs()
+    }
+
+    fn without_receiver(&self) -> FunctionType {
+        FunctionType {
+            types: self.types[1..].into(),
+            inputs: self.inputs - 1,
+            variadic: self.variadic,
+        }
     }
 }
 
@@ -594,8 +624,6 @@ impl InferredType {
 }
 
 /// Get the type of the given symbol
-#[haste::query]
-#[clone]
 pub async fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Result<Signature> {
     match symbol {
         naming::GlobalSymbol::Package(package) => Ok(Signature::Package(package)),
@@ -604,6 +632,8 @@ pub async fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Resu
     }
 }
 
+#[haste::query]
+#[clone]
 async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
@@ -854,7 +884,7 @@ async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Ty
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstValue {
     Bool(bool),
-    Integer(i64),
+    Integer(i128),
     String(Arc<BStr>),
 }
 
@@ -876,7 +906,7 @@ impl ConstValue {
         }
     }
 
-    fn integer(&self) -> i64 {
+    fn integer(&self) -> i128 {
         match self {
             ConstValue::Integer(value) => *value,
             _ => unreachable!("expected an integer but found `{self}`"),
@@ -921,7 +951,7 @@ fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &str) -> bool {
     use crate::import::FileSetData;
     use std::ffi::OsStr;
 
-    if decl.name.get(db) != name || decl.package.name.get(db) != "unsafe" {
+    if decl.name.base.get(db) != name || decl.package.name.get(db) != "unsafe" {
         return false;
     }
 
@@ -952,7 +982,11 @@ struct SelectionCandidate {
 
 #[haste::query]
 #[clone]
-async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
+async fn resolve_selector(db: &dyn crate::Db, mut typ: Type, name: Text) -> Result<Option<Selection>> {
+    if let TypeKind::Pointer(inner) = typ.lookup(db) {
+        typ = *inner;
+    }
+
     let candidates = selector_candidates(db, typ).await.as_ref()?;
     let Some(candidate) = candidates.get(&name) else { return Ok(None) };
 
@@ -988,9 +1022,18 @@ async fn selector_candidates(
         }
     };
 
-    if let TypeKind::Declared(decl) = typ.lookup(db) {
-        tracing::warn!("TODO: enumerate methods for `{typ}`");
-        typ = underlying_type_for_decl(db, *decl).await?;
+    if let &TypeKind::Declared(decl) = typ.lookup(db) {
+        let methods = naming::method_set(db, decl).await?;
+
+        for &method in methods.iter() {
+            let method_type = match decl_signature(db, method).await? {
+                Signature::Value(typ) => typ,
+                _ => unreachable!("methods must be values"),
+            };
+            add_candidate(method.name.base, 0, Selection::Method(method_type));
+        }
+
+        typ = underlying_type_for_decl(db, decl).await?;
     }
 
     match typ.lookup(db) {
@@ -998,6 +1041,10 @@ async fn selector_candidates(
             for field in strukt.fields.iter() {
                 if let Some(name) = field.name {
                     add_candidate(name, 0, Selection::Element(field.typ));
+                }
+
+                if field.embedded {
+                    tracing::warn!("resolve embedded fields");
                 }
             }
         }

@@ -7,7 +7,7 @@ use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
 use crate::{error, Diagnostic, HashMap, Result};
 
-use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, PackageId, Symbol};
+use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, PackageId, Symbol, DeclName};
 
 pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
@@ -17,8 +17,8 @@ pub struct NamingContext<'db> {
     package: PackageId,
 
     local_scope: LocalScope,
-    file_scope: &'db IndexMap<Text, FileMember>,
-    package_scope: &'db IndexMap<Text, DeclPath>,
+    file_scope: &'db IndexMap<DeclName, FileMember>,
+    package_scope: &'db IndexMap<DeclName, DeclPath>,
 
     diagnostics: Option<Diagnostic>,
     resolved: IndexMap<NodeId, Symbol>,
@@ -176,7 +176,7 @@ impl<'db> NamingContext<'db> {
                         return;
                     }
 
-                    let decl = DeclId::new(*package, name);
+                    let decl = DeclId::new_plain(*package, name);
                     let symbol = Symbol::Global(GlobalSymbol::Decl(decl));
                     self.resolved.insert(node, symbol);
                 }
@@ -485,21 +485,19 @@ impl<'db> NamingContext<'db> {
     }
 
     fn resolve_composite(&mut self, composite: syntax::CompositeRange) {
-        match composite {
-            syntax::CompositeRange::Value(values) => self.resolve_range(values),
-            syntax::CompositeRange::KeyValue(pairs) => {
-                let indirect = self.nodes.indirect(pairs);
-                for pair in indirect.chunks_exact(2) {
-                    let &[key, value] = pair else { unreachable!() };
-                    if !matches!(self.nodes.kind(key), Node::Name(_)) {
-                        // TODO: always resolve the name (in case we have a map initializer).
-                        // However, if there is an error, delay its resolution until type-checking
-                        // (in case we have a struct initializer).
-                        self.resolve_expr(key);
-                    }
-                    self.resolve_expr(value);
+        for key in composite.keys(self.nodes) {
+            if let Node::Name(Some(name)) = self.nodes.kind(key) {
+                // this might be the name of a field, so might not exist in the current scope.
+                if let Some(symbol) = self.find_symbol(name) {
+                    self.resolved.insert(key.node, symbol);
                 }
+            } else {
+                self.resolve_expr(key);
             }
+        }
+
+        for value in composite.values(self.nodes) {
+            self.resolve_expr(value);
         }
     }
 
@@ -508,7 +506,9 @@ impl<'db> NamingContext<'db> {
             return Some(Symbol::Local(node));
         }
 
-        if let Some(member) = self.file_scope.get(&name) {
+        let decl_name = DeclName::plain(name);
+
+        if let Some(member) = self.file_scope.get(&decl_name) {
             let symbol = match *member {
                 FileMember::Import(package, _) => GlobalSymbol::Package(package),
                 FileMember::Decl(id) => GlobalSymbol::Decl(id),
@@ -516,10 +516,10 @@ impl<'db> NamingContext<'db> {
             return Some(Symbol::Global(symbol));
         }
 
-        if self.package_scope.contains_key(&name) {
+        if self.package_scope.contains_key(&decl_name) {
             return Some(Symbol::Global(GlobalSymbol::Decl(DeclId {
                 package: self.package,
-                name,
+                name: decl_name,
             })));
         }
 

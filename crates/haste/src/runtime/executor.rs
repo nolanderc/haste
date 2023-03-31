@@ -82,6 +82,7 @@ enum State {
     Shutdown = 0,
     Running = 1,
     Terminated = 2,
+    Panicked = 3,
 }
 
 impl SharedState {
@@ -183,7 +184,7 @@ impl Executor {
             let result = std::thread::Builder::new()
                 .name(format!("haste-worker-{index}"))
                 .spawn(move || {
-                    local.run();
+                    local.run(index);
                 });
 
             match result {
@@ -266,7 +267,8 @@ impl Executor {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
-        if result.is_err() {
+
+        if matches!(result, Err(State::Shutdown | State::Terminated)) {
             return false;
         }
 
@@ -297,18 +299,14 @@ impl Executor {
             let worker_count = shared.workers.len();
             let mut suspended_workers = shared.suspended_workers.lock().unwrap();
 
-            // we might hold one of the workers, which we need to account for
-            let local = match self.local.lock() {
-                Ok(local) => local,
-                Err(poison) => poison.into_inner(),
-            };
-            *suspended_workers += local.is_some() as usize;
+            // we hold one of the workers, which we need to account for
+            *suspended_workers += 1;
 
             while *suspended_workers != worker_count {
                 suspended_workers = shared.suspended_condition.wait(suspended_workers).unwrap();
             }
 
-            *suspended_workers -= local.is_some() as usize;
+            *suspended_workers -= 1;
         }
 
         crate::publish_metrics();
@@ -318,16 +316,12 @@ impl Executor {
     }
 
     fn terminate(&mut self) {
-        if std::thread::panicking() {
-            self.stop();
-        }
-
         self.shared.state.store(State::Terminated, Ordering::SeqCst);
         self.shared.start_condition.notify_all();
         self.shared.wake_condition.notify_all();
 
         for thread in self.threads.drain(..) {
-            thread.join().unwrap();
+            _ = thread.join();
         }
 
         crate::print_global_metrics();
@@ -395,16 +389,14 @@ impl LocalScheduler {
         }
     }
 
-    fn run(mut self) -> Self {
+    fn run(mut self, _index: usize) -> Self {
         (self, _) = self.enter(|local| {
             let _suspend_guard = CallOnDrop(|| {
-                // make sure we don't hold on to any dead state.
-                local.publish_reserved_tasks();
-
                 // When the worker exits, mark it as suspended so that the executor can terminate
                 // gracefully without waiting endlessly for this thread to complete:
-                if let Ok(mut suspended) = local.shared.suspended_workers.try_lock() {
+                if let Ok(mut suspended) = local.shared.suspended_workers.lock() {
                     *suspended += 1;
+                    local.shared.suspended_condition.notify_one();
                 }
             });
 
@@ -456,6 +448,10 @@ impl LocalScheduler {
                     }
                 }
 
+                if local.shared.state.load(Relaxed) == State::Panicked {
+                    panic!("worker thread panicked");
+                }
+
                 if let Some(task) = local.try_next_task() {
                     stalled_count = 0;
                     local.poll_task(task);
@@ -495,9 +491,31 @@ impl LocalScheduler {
                 .replace(self);
 
             let output = {
+                let _guard = CallOnDrop(|| {
+                    let mut local_ref = cell.borrow_mut();
+
+                    if let Some(local) = local_ref.as_mut() {
+                        // make sure we don't hold on to any dead state.
+                        local.publish_reserved_tasks();
+
+                        if std::thread::panicking() {
+                            _ = local.shared.state.compare_exchange(
+                                State::Running,
+                                State::Panicked,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
+
+                            // make sure we don't leak the scheduler.
+                            local_ref.take();
+                        }
+                    }
+                });
+
                 let local_ref = cell.borrow();
                 let local = local_ref.as_ref().unwrap();
                 let _tokio_guard = local.shared.tokio_handle.enter();
+
                 f(local)
             };
 
@@ -601,6 +619,7 @@ impl LocalScheduler {
                         return Some(task);
                     }
                 }
+                State::Panicked => return None,
             };
         }
     }

@@ -17,7 +17,9 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::Durability;
+use haste::util::CallOnDrop;
 use index_map::IndexMap;
+use naming::DeclName;
 use notify::Watcher;
 use path::NormalPath;
 use util::future::IteratorExt;
@@ -181,6 +183,8 @@ fn parse_arc_path(text: &str) -> std::io::Result<Arc<Path>> {
 }
 
 fn main() {
+    let _guard = CallOnDrop(|| eprintln!("done"));
+
     tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -199,8 +203,6 @@ fn main() {
     } else {
         run(&mut db, arguments);
     }
-
-    eprintln!("done");
 }
 
 fn watch_loop(db: &mut Database, arguments: Arguments) {
@@ -384,7 +386,7 @@ struct Package {
     // For each file, the list of packages it imports.
     import_names: Vec<Vec<Text>>,
 
-    signatures: IndexMap<Text, typing::Type>,
+    signatures: IndexMap<DeclName, typing::Type>,
 }
 
 #[haste::query]

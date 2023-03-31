@@ -150,6 +150,17 @@ impl<K, V> IndexMap<K, V> {
     pub fn shrink_to_fit(&mut self) {
         self.entries.shrink_to_fit();
     }
+
+    pub fn map<U>(self, mut f: impl FnMut(V) -> U) -> IndexMap<K, U> {
+        IndexMap {
+            lookup: self.lookup,
+            entries: self
+                .entries
+                .into_iter()
+                .map(|(key, value)| (key, f(value)))
+                .collect(),
+        }
+    }
 }
 
 impl<K, V> IntoIterator for IndexMap<K, V> {

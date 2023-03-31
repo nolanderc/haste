@@ -2,12 +2,15 @@ use futures::{future::BoxFuture, FutureExt};
 use smallvec::smallvec;
 
 use crate::{
+    common::Text,
     diagnostic::bug,
     error,
     index_map::IndexMap,
     naming::{self, DeclId, DeclPath},
     span::Span,
-    syntax::{self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, TypeId},
+    syntax::{
+        self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, SpanId, TypeId,
+    },
     typing::{Field, TypeClass},
     HashMap, Result,
 };
@@ -193,8 +196,22 @@ impl<'db> TypingContext<'db> {
             Node::Interface(elements) => {
                 let mut methods = Vec::with_capacity(elements.len());
 
-                let mut names = HashMap::default();
+                let mut names = HashMap::<Text, SpanId>::default();
                 names.reserve(elements.len());
+
+                let mut register_method = |this: &Self, name, span: SpanId, signature| {
+                    if let Some(previous) = names.insert(name, span) {
+                        let old_span = this.ast.span(Some(this.path.index), previous);
+                        let new_span = this.ast.span(Some(this.path.index), span);
+                        return Err(error!("method names must be unique")
+                            .label(old_span, format!("{name} first declared here"))
+                            .label(new_span, "then redeclared here"));
+                    }
+
+                    methods.push(InterfaceMethod { name, signature });
+
+                    Ok(())
+                };
 
                 for &node in self.nodes.indirect(elements) {
                     let kind = self.nodes.kind(node);
@@ -204,21 +221,27 @@ impl<'db> TypingContext<'db> {
                                 return Err(error!("method names may not be blank")
                                     .label(self.ast.span(Some(self.path.index), ident.span), "invalid method name"))
                             };
-
-                            if let Some(previous) = names.insert(name, ident.span) {
-                                let old_span = self.ast.span(Some(self.path.index), previous);
-                                let new_span = self.ast.span(Some(self.path.index), ident.span);
-                                return Err(error!("method names must be unique")
-                                    .label(old_span, format!("{name} first declared here"))
-                                    .label(new_span, "then redeclared here"));
-                            }
-
                             let signature = self.resolve_signature(signature).await?;
-                            methods.push(InterfaceMethod { name, signature });
+                            register_method(self, name, ident.span, signature)?;
                         }
+
+                        Node::Name(_) | Node::Selector(_, _) => {
+                            let typ = self.resolve_type(syntax::TypeId::new(node)).await?;
+                            let core_type = super::underlying_type(self.db, typ).await?;
+                            let TypeKind::Interface(embedded) = core_type.lookup(self.db) else {
+                                return Err(error!("expected an embedded interface")
+                                    .label(self.node_span(node), format!("found `{}`", typ)))
+                            };
+
+                            let span = self.nodes.span(node);
+                            for method in embedded.methods.iter() {
+                                register_method(self, method.name, span, method.signature.clone())?;
+                            }
+                        }
+
                         _ => {
-                            return Err(bug!("not a method")
-                                .label(self.node_span(node), "expected a method"))
+                            return Err(bug!("only methods and embedded interfaces allowed")
+                                .label(self.node_span(node), ""))
                         }
                     }
                 }
@@ -229,7 +252,8 @@ impl<'db> TypingContext<'db> {
                 Ok(TypeKind::Interface(InterfaceType { methods }).insert(self.db))
             }
 
-            kind => unreachable!("not a type: {:?}", kind),
+            _ => Err(bug!("only types allowed in type context")
+                .label(self.node_span(typ), "expected a type")),
         }
     }
 
@@ -372,7 +396,7 @@ impl<'db> TypingContext<'db> {
                 Some(typ) => Ok(typ),
                 None => {
                     let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                    Err(bug!("unresolved reference `{name}`").label(self.node_span(expr), ""))
+                    Err(error!("unresolved reference `{name}`").label(self.node_span(expr), ""))
                 }
             },
             Node::Selector(base, ident) => {
@@ -393,7 +417,13 @@ impl<'db> TypingContext<'db> {
                 if let Some(selection) = selection {
                     match selection {
                         super::Selection::Element(typ) => Ok(Value(typ)),
-                        super::Selection::Method(_) => todo!("method selection"),
+                        super::Selection::Method(typ) => {
+                            // the result is the method signature, with the first parameter
+                            // removed.
+                            let TypeKind::Function(func) = typ.lookup(self.db) else { unreachable!() };
+                            let applied_method = func.without_receiver();
+                            Ok(Value(TypeKind::Function(applied_method).insert(self.db)))
+                        }
                     }
                 } else {
                     Err(
@@ -451,7 +481,8 @@ impl<'db> TypingContext<'db> {
                 let base_type = self.infer_expr(base).await?;
                 let target_type = self.resolve_type(typ).await?;
 
-                match base_type.lookup(self.db) {
+                let core_type = super::underlying_type(self.db, base_type).await?;
+                match core_type.lookup(self.db) {
                     TypeKind::Interface(_) => {
                         tracing::warn!(
                             "ensure that `{target_type}` implements the interface `{base_type}`"
@@ -593,7 +624,7 @@ impl<'db> TypingContext<'db> {
                             check_integer(self, end, typ)?;
                         }
 
-                        Ok(Value(inner))
+                        Ok(Value(TypeKind::Slice(inner).insert(self.db)))
                     }
                     _ => Err(error!("cannot slice into value of type `{target_type}`")
                         .label(self.node_span(expr), "")
@@ -786,20 +817,22 @@ impl<'db> TypingContext<'db> {
                     let lhs_class = lhs_kind.underlying_class(self.db).await?;
                     let rhs_class = rhs_kind.underlying_class(self.db).await?;
 
-                    let classes = match op {
-                        BinOp::Add => TypeClass::NUMERIC | TypeClass::STRING,
-                        BinOp::Sub | BinOp::Mul | BinOp::Div => TypeClass::NUMERIC,
+                    let overlap = lhs_class.intersection(rhs_class);
+                    let both_numeric = lhs_class.intersects(TypeClass::NUMERIC)
+                        && rhs_class.intersects(TypeClass::NUMERIC);
+
+                    let valid_combination = match op {
+                        BinOp::Add => both_numeric || overlap.intersects(TypeClass::STRING),
+                        BinOp::Sub | BinOp::Mul | BinOp::Div => both_numeric,
                         BinOp::Rem
                         | BinOp::BitOr
                         | BinOp::BitXor
                         | BinOp::BitAnd
-                        | BinOp::BitNand => TypeClass::INTEGER,
+                        | BinOp::BitNand => overlap.intersects(TypeClass::INTEGER),
                         _ => unreachable!(),
                     };
 
-                    let overlap = lhs_class.intersection(rhs_class);
-
-                    if overlap.intersects(classes) {
+                    if valid_combination {
                         if lhs == rhs || lhs_class.is_untyped() || rhs_class.is_untyped() {
                             lhs = if lhs_class.is_untyped() && rhs_class.is_untyped() {
                                 let order = [
@@ -833,7 +866,7 @@ impl<'db> TypingContext<'db> {
                     return Err(error!("incompatible types for `{op}`")
                         .label(
                             self.node_span(pair[0]),
-                            "both operands must be of the same type",
+                            "both operands must be of the same type ({classes:?})",
                         )
                         .label(
                             lhs_span(self, index),
@@ -846,8 +879,8 @@ impl<'db> TypingContext<'db> {
                 }
 
                 BinOp::ShiftLeft | BinOp::ShiftRight => {
-                    let lhs_class = lhs.lookup(self.db).class();
-                    let rhs_class = rhs.lookup(self.db).class();
+                    let lhs_class = lhs.lookup(self.db).underlying_class(self.db).await?;
+                    let rhs_class = rhs.lookup(self.db).underlying_class(self.db).await?;
 
                     if lhs_class.is_integer() && rhs_class.is_integer() {
                         continue;
@@ -1093,21 +1126,22 @@ impl<'db> TypingContext<'db> {
     async fn evaluate_integer(&mut self, expr: ExprId) -> Result<i64> {
         let typ = self.infer_expr(expr).await?;
         let kind = typ.lookup(self.db);
-        let class = kind.class();
+        let class = kind.underlying_class(self.db).await?;
 
         if !class.contains(TypeClass::INTEGER) {
             return Err(error!("expected a constant integer expression")
                 .label(self.node_span(expr), format!("this has type `{typ}`")));
         }
 
-        if !class.contains(TypeClass::UNTYPED) {
-            return Err(error!("expected a constant integer expression")
-                .label(self.node_span(expr), "must be a constant"));
-        }
-
         match self.nodes.kind(expr) {
             Node::IntegerSmall(value) => Ok(value.try_into().expect("handle large integers")),
-            _ => Ok(self.eval_context().eval(expr).await?.integer()),
+            _ => Ok(self
+                .eval_context()
+                .eval(expr)
+                .await?
+                .integer()
+                .try_into()
+                .expect("handle large integers")),
         }
     }
 
@@ -1207,7 +1241,9 @@ impl<'db> TypingContext<'db> {
                             return Err(error!("`make` expects a type as its argument")
                                 .label(self.node_span(call_expr), ""));
                         }
+
                         let typ = self.resolve_type(TypeId::new(arg_exprs[0].node)).await?;
+                        let core_type = super::underlying_type(self.db, typ).await?;
 
                         async fn check_make_parameter(
                             this: &mut TypingContext<'_>,
@@ -1224,7 +1260,7 @@ impl<'db> TypingContext<'db> {
                             Ok(())
                         }
 
-                        match typ.lookup(self.db) {
+                        match core_type.lookup(self.db) {
                             TypeKind::Slice(_) => {
                                 if arg_exprs.len() > 3 {
                                     return Err(error!("`make` accepts at most 3 arguments (type, length, capacity)")
@@ -1337,7 +1373,7 @@ impl<'db> TypingContext<'db> {
                 self.node_span(target),
                 format!(
                     "this function expected {} arguments{}",
-                    func.required_inputs().len(),
+                    func.required_inputs(),
                     if func.variadic { " (or more)" } else { "" }
                 ),
             )
@@ -1383,7 +1419,7 @@ impl<'db> TypingContext<'db> {
         if !self.can_convert(target_type, source_type).await? {
             return Err(error!("invalid conversion").label(
                 self.node_span(entire_expr),
-                format!("trying to cast `{target_type}` from `{source_type}`"),
+                format!("trying to convert `{source_type}` into `{target_type}`"),
             ));
         }
 
@@ -1426,18 +1462,28 @@ impl<'db> TypingContext<'db> {
 
             (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => true,
 
-            (TypeKind::Interface(interface), _) => {
-                self.is_interface_satisfied(interface, source).await?
-            }
-
             _ => {
                 let target_core = super::underlying_type(self.db, target).await?;
 
                 let target_core_kind = target_core.lookup(self.db);
 
                 if let TypeKind::Interface(interface) = target_core_kind {
-                    if self.is_interface_satisfied(interface, source).await? {
+                    if self
+                        .is_interface_satisfied(target, interface, source)
+                        .await?
+                    {
                         return Ok(true);
+                    }
+                }
+
+                if let TypeKind::Pointer(inner) = target_core_kind {
+                    if let TypeKind::Interface(interface) = inner.lookup(self.db) {
+                        if self
+                            .is_interface_satisfied(target, interface, source)
+                            .await?
+                        {
+                            return Ok(true);
+                        }
                     }
                 }
 
@@ -1461,6 +1507,7 @@ impl<'db> TypingContext<'db> {
 
     async fn is_interface_satisfied(
         &self,
+        target: Type,
         interface: &InterfaceType,
         source: Type,
     ) -> Result<bool> {
@@ -1470,7 +1517,7 @@ impl<'db> TypingContext<'db> {
         }
 
         Err(bug!(
-            "TODO: determine if `{source}` implements the interface `{interface}`"
+            "TODO: determine if `{source}` implements `{target} {interface}`"
         ))
     }
 
@@ -1536,6 +1583,8 @@ impl<'db> TypingContext<'db> {
             return Ok(true);
         }
 
+        let target = super::underlying_type(self.db, target).await?;
+
         let target_kind = target.lookup(self.db);
         let source_kind = source.lookup(self.db);
 
@@ -1544,11 +1593,8 @@ impl<'db> TypingContext<'db> {
 
         let common_class = target_class.intersection(source_class);
 
-        if common_class.intersects(TypeClass::INTEGER | TypeClass::FLOAT) {
-            return Ok(true);
-        }
-
-        if common_class.intersects(TypeClass::COMPLEX) {
+        if common_class.intersects(TypeClass::NUMERIC) {
+            // target and source are the same kind of numeric type (eg. two integers)
             return Ok(true);
         }
 
@@ -1571,10 +1617,17 @@ impl<'db> TypingContext<'db> {
                             _ => {}
                         }
                     }
-
                     Ok(false)
                 }
             },
+            TypeKind::Pointer(_) => {
+                if let TypeKind::Pointer(inner) = target.lookup(self.db) {
+                    if self.is_arbitrary_type(inner.lookup(self.db)) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             _ => Ok(false),
         }
     }

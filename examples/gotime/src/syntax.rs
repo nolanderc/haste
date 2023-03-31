@@ -226,6 +226,12 @@ impl Signature {
     pub fn is_variadic(&self) -> bool {
         self.inputs < 0
     }
+
+    pub fn receiver(&self, nodes: &NodeView) -> Parameter {
+        assert!(self.inputs.abs() != 0);
+        let node = nodes.indirect(self.inputs())[0];
+        nodes.parameter(node)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

@@ -84,7 +84,17 @@ impl<'a> EvalContext<'a> {
                     syntax::UnaryOperator::Plus => Ok(value),
                     syntax::UnaryOperator::Minus => Ok(ConstValue::Integer(-value.integer())),
                     syntax::UnaryOperator::Not => Ok(ConstValue::Bool(!value.bool())),
-                    syntax::UnaryOperator::Xor => Ok(ConstValue::Integer(!value.integer())),
+                    syntax::UnaryOperator::Xor => {
+                        let typ = self.types.nodes[&expr.node].value();
+                        let kind = typ.lookup(self.db);
+                        if kind.is_signed() {
+                            Ok(ConstValue::Integer((-1) ^ value.integer()))
+                        } else {
+                            let bits = kind.bits().unwrap();
+                            let mask = (1i128 << bits) - 1;
+                            Ok(ConstValue::Integer(mask ^ value.integer()))
+                        }
+                    }
                     syntax::UnaryOperator::Deref
                     | syntax::UnaryOperator::Ref
                     | syntax::UnaryOperator::Recv => Err(error!("cannot evaluate expression")
@@ -153,26 +163,20 @@ impl<'a> EvalContext<'a> {
                         BinOp::ShiftLeft => {
                             let lhs = lhs.integer();
                             let rhs = rhs.integer();
-                            if rhs < 0 {
-                                return Err(error!("shift by negative amount")
+                            if !(0..127).contains(&rhs) {
+                                return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this left shift")
-                                    .label(
-                                        self.node_span(pair[1]),
-                                        format!("this is negative ({rhs})"),
-                                    ));
+                                    .label(self.node_span(pair[1]), format!("this was {rhs}")));
                             }
                             ConstValue::Integer(lhs << rhs)
                         }
                         BinOp::ShiftRight => {
                             let lhs = lhs.integer();
                             let rhs = rhs.integer();
-                            if rhs < 0 {
-                                return Err(error!("shift by negative amount")
+                            if !(0..127).contains(&rhs) {
+                                return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this right shift")
-                                    .label(
-                                        self.node_span(pair[1]),
-                                        format!("this is negative ({rhs})"),
-                                    ));
+                                    .label(self.node_span(pair[1]), format!("this was {rhs}")));
                             }
                             ConstValue::Integer(lhs >> rhs)
                         }
@@ -188,7 +192,8 @@ impl<'a> EvalContext<'a> {
 
             Node::Call(target, args, None) => {
                 enum ConstFunc {
-                    SizeOf,
+                    IntCast,
+                    Sizeof,
                     Len,
                     Cap,
                     Real,
@@ -205,11 +210,22 @@ impl<'a> EvalContext<'a> {
                             naming::Builtin::Real => Some(ConstFunc::Real),
                             naming::Builtin::Len => Some(ConstFunc::Len),
                             naming::Builtin::Cap => Some(ConstFunc::Cap),
+                            naming::Builtin::Int
+                            | naming::Builtin::Int8
+                            | naming::Builtin::Int16
+                            | naming::Builtin::Int32
+                            | naming::Builtin::Int64
+                            | naming::Builtin::Uint
+                            | naming::Builtin::Uint8
+                            | naming::Builtin::Uint16
+                            | naming::Builtin::Uint32
+                            | naming::Builtin::Uint64
+                            | naming::Builtin::Uintptr => Some(ConstFunc::IntCast),
                             _ => None,
                         },
                         Some(Symbol::Global(GlobalSymbol::Decl(decl))) => {
-                            if super::is_unsafe_decl(self.db, *decl, "SizeOf") {
-                                Some(ConstFunc::SizeOf)
+                            if super::is_unsafe_decl(self.db, *decl, "Sizeof") {
+                                Some(ConstFunc::Sizeof)
                             } else {
                                 None
                             }
@@ -221,14 +237,24 @@ impl<'a> EvalContext<'a> {
 
                 let Some(func) = func else {
                     return Err(error!("function cannot be evaluated at compile-time")
-                        .label(self.node_span(expr), format!("{:?}", self.references)))
+                        .label(self.node_span(expr), ""))
                 };
 
                 let exprs = self.nodes.indirect(args);
 
                 let value = match func {
+                    ConstFunc::IntCast => match self.eval_boxed(exprs[0]).await? {
+                        ConstValue::Integer(value) => ConstValue::Integer(value),
+                        value => {
+                            return Err(error!("cannot perform cast").label(
+                                self.node_span(exprs[0]),
+                                format!("cannot cast to integer: `{value}`"),
+                            ))
+                        }
+                    },
+
                     // TODO: actually compute the size of types
-                    ConstFunc::SizeOf => ConstValue::Integer(1),
+                    ConstFunc::Sizeof => ConstValue::Integer(8),
 
                     ConstFunc::Len => {
                         let inferred = self.types.nodes.get(&exprs[0].node).ok_or_else(|| {

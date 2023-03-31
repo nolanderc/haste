@@ -165,6 +165,13 @@ impl<K: KeyOps, T> KeySlice<K, T> {
     pub fn get_mut(&mut self, id: K) -> Option<&mut T> {
         self.data.get_mut(id.index())
     }
+
+    pub fn iter_indexed(&self) -> impl Iterator<Item = (K, &T)> {
+        self.data
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (K::from_index(index), item))
+    }
 }
 
 impl<K: KeyOps, T> std::ops::Index<K> for KeySlice<K, T> {

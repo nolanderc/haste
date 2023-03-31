@@ -1,7 +1,10 @@
 mod context;
 
+use std::sync::Arc;
+
 use crate::{
     common::Text,
+    diagnostic::bug,
     error,
     import::{self, FileSet},
     index_map::IndexMap,
@@ -20,6 +23,8 @@ pub struct Storage(
     package_scope,
     exported_decls,
     package_name,
+    package_methods,
+    method_set,
     decl_symbols,
 );
 
@@ -28,8 +33,35 @@ pub struct Storage(
 pub struct DeclId {
     /// The package where the decl is found.
     pub package: PackageId,
-    /// The name of the decl.
-    pub name: Text,
+    /// Uniquely identifies the decl within the package.
+    pub name: DeclName,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeclName {
+    /// If this is a method, the name of the receiver type.
+    pub receiver: Option<Text>,
+    /// The actual name of the decl.
+    pub base: Text,
+}
+
+impl DeclName {
+    fn plain(name: Text) -> Self {
+        Self {
+            receiver: None,
+            base: name,
+        }
+    }
+}
+
+impl std::fmt::Display for DeclName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(receiver) = self.receiver {
+            write!(f, "{}.{}", receiver, self.base)
+        } else {
+            write!(f, "{}", self.base)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,8 +78,12 @@ impl PackageId {
 }
 
 impl DeclId {
-    pub fn new(package: PackageId, name: Text) -> Self {
+    pub fn new(package: PackageId, name: DeclName) -> Self {
         Self { package, name }
+    }
+
+    pub fn new_plain(package: PackageId, name: Text) -> Self {
+        Self::new(package, DeclName::plain(name))
     }
 
     async fn span(self, db: &dyn crate::Db) -> Result<Option<Span>> {
@@ -66,7 +102,10 @@ impl DeclId {
             Some(path) => Ok(path),
             None => {
                 let package = package_name(db, self.package.files).await?;
-                Err(error!("`{}` is not a member of `{}`", self.name, package))
+                Err(error!(
+                    "`{}` is not a member of `{}`",
+                    self.name.base, package
+                ))
             }
         }
     }
@@ -222,17 +261,17 @@ impl FileMember {
 pub async fn file_scope(
     db: &dyn crate::Db,
     path: NormalPath,
-) -> Result<IndexMap<Text, FileMember>> {
+) -> Result<IndexMap<DeclName, FileMember>> {
     let ast = syntax::parse_file(db, path).await.as_ref()?;
     let resolved_imports = import::resolve_imports(db, ast).await?;
 
     let mut scope = IndexMap::default();
-    let mut register = |name: Text, member: FileMember| {
+    let mut register = |name: DeclName, member: FileMember| {
         if let Some(previous) = scope.insert(name, member) {
             return Err(async move {
-                error!("the name `{name}` is defined twice")
+                error!("the declaration `{name}` is defined twice")
                     .label(previous.span(db, ast).await, "first declared here")
-                    .label(member.span(db, ast).await, "then declared here")
+                    .label(member.span(db, ast).await, "then redeclared here")
             });
         }
         Ok(())
@@ -246,15 +285,19 @@ pub async fn file_scope(
         };
 
         let name = match import.name {
-            syntax::PackageName::Inherit => package_name,
+            syntax::PackageName::Inherit => DeclName::plain(package_name),
             syntax::PackageName::Name(ident) => {
                 let Some(name) = ident.text else { continue };
-                name
+                DeclName::plain(name)
             }
             syntax::PackageName::Implicit => {
                 let exported = exported_decls(db, files).await.as_ref()?;
 
                 for &name in exported.iter() {
+                    if name.receiver.is_some() {
+                        continue;
+                    }
+
                     let decl = DeclId { package, name };
                     if let Err(error) = register(name, FileMember::Decl(decl)) {
                         return Err(error.await);
@@ -275,11 +318,11 @@ pub async fn file_scope(
 
 /// Get all names exported by a package.
 #[haste::query]
-pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<Text>> {
+pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<DeclName>> {
     let scope = package_scope(db, files).await.as_ref()?;
     let mut exports = Vec::with_capacity(scope.len());
     for &name in scope.keys() {
-        if name.get(db).starts_with(char::is_uppercase) {
+        if name.base.get(db).starts_with(char::is_uppercase) {
             exports.push(name);
         }
     }
@@ -289,7 +332,10 @@ pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<Te
 
 /// Get all names defined within a single package.
 #[haste::query]
-pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMap<Text, DeclPath>> {
+pub async fn package_scope(
+    db: &dyn crate::Db,
+    files: FileSet,
+) -> Result<IndexMap<DeclName, DeclPath>> {
     let asts = files.lookup(db).parse(db).await?;
 
     let mut scope = IndexMap::default();
@@ -298,7 +344,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
     let init_name = Text::new(db, "init");
 
     for ast in asts {
-        let mut register = |name: Text, index, sub| {
+        let mut register = |name: DeclName, index, sub| {
             let source = ast.source;
             let decl = DeclPath { source, index, sub };
             if let Some(previous) = scope.insert(name, decl) {
@@ -332,7 +378,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
                             Node::TypeDef(spec) | Node::TypeAlias(spec) => {
                                 let Some(name) = spec.name.text else { continue };
                                 let sub = SubIndex { row, col: 0 };
-                                register(name, index, sub);
+                                register(DeclName::plain(name), index, sub);
                             }
                             Node::VarDecl(names, _, exprs) => {
                                 if let Some(exprs) = exprs {
@@ -359,7 +405,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
                                     let col = col as u16;
                                     let sub = SubIndex { row, col };
                                     let Node::Name(Some(name)) = decl.nodes.kind(name) else { continue };
-                                    register(name, index, sub);
+                                    register(DeclName::plain(name), index, sub);
                                 }
                             }
                             Node::ConstDecl(names, _, _) => {
@@ -367,7 +413,7 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
                                     let col = col as u16;
                                     let sub = SubIndex { row, col };
                                     let Node::Name(Some(name)) = decl.nodes.kind(name) else { continue };
-                                    register(name, index, sub);
+                                    register(DeclName::plain(name), index, sub);
                                 }
                             }
                             _ => unreachable!(),
@@ -382,10 +428,37 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
                         }
 
                         let sub = SubIndex { row: 0, col: 0 };
-                        register(name, index, sub);
+                        register(DeclName::plain(name), index, sub);
                     }
                 }
-                DeclKind::Method(_) => continue,
+                DeclKind::Method(func) => {
+                    let receiver = func.signature.receiver(&decl.nodes);
+
+                    let receiver_name = match decl.nodes.kind(receiver.typ) {
+                        Node::Name(name) => name,
+                        Node::Pointer(inner) => match decl.nodes.kind(inner) {
+                            Node::Name(name) => name,
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                    let Some(receiver) = receiver_name else {
+                        return Err(bug!("not a valid receiver type").label(
+                            ast.node_span(index, receiver.typ),
+                            "expected a declared type or pointer",
+                        ));
+                    };
+
+                    if let Some(name) = func.name.text {
+                        let decl_name = DeclName {
+                            receiver: Some(receiver),
+                            base: name,
+                        };
+                        let sub = SubIndex { row: 0, col: 0 };
+                        register(decl_name, index, sub);
+                    }
+                }
             }
         }
     }
@@ -416,6 +489,41 @@ pub async fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMa
         combined.push(error);
     }
     Err(Diagnostic::combine(combined))
+}
+
+pub type MethodSet = crate::HashSet<DeclId>;
+
+/// For each declaration in a package, its set of methods.
+#[haste::query]
+pub async fn package_methods(
+    db: &dyn crate::Db,
+    package: PackageId,
+) -> Result<crate::HashMap<Text, Arc<MethodSet>>> {
+    let package_scope = package_scope(db, package.files).await.as_ref()?;
+
+    let mut methods = crate::HashMap::default();
+
+    for &name in package_scope.keys() {
+        if let Some(receiver) = name.receiver {
+            let set = methods
+                .entry(receiver)
+                .or_insert_with(|| Arc::new(MethodSet::default()));
+            Arc::make_mut(set).insert(DeclId::new(package, name));
+        }
+    }
+
+    Ok(methods)
+}
+
+/// Get the set of methods defined for a type.
+#[haste::query]
+#[clone]
+pub async fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSet>> {
+    let methods = package_methods(db, decl.package).await.as_ref()?;
+    match methods.get(&decl.name.base) {
+        Some(set) => Ok(set.clone()),
+        None => Ok(Default::default()),
+    }
 }
 
 #[haste::query]

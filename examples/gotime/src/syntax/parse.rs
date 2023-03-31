@@ -15,8 +15,6 @@ use crate::{
 use super::*;
 
 pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
-    let _guard = haste::enter_span("parse");
-
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -734,15 +732,20 @@ impl<'a> Parser<'a> {
     }
 
     fn const_declaration(&mut self) -> Result<NodeId> {
-        let mut previous = None;
+        let mut prev_type = None;
+        let mut prev_value = None;
         self.multi_declaration(
             Token::Const,
-            |this| this.const_spec(&mut previous),
+            |this| this.const_spec(&mut prev_type, &mut prev_value),
             Node::ConstList,
         )
     }
 
-    fn const_spec(&mut self, prev: &mut Option<ExprRange>) -> Result<NodeId> {
+    fn const_spec(
+        &mut self,
+        prev_type: &mut Option<TypeId>,
+        prev_value: &mut Option<ExprRange>,
+    ) -> Result<NodeId> {
         let names = self.multi(|this| {
             loop {
                 let name = this.identifier()?;
@@ -755,7 +758,7 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
-        let typ = self.try_type()?;
+        let typ = self.try_type()?.or(*prev_type);
 
         let values = if self.eat(Token::Assign) {
             ExprRange::new(self.multi(|this| loop {
@@ -765,7 +768,7 @@ impl<'a> Parser<'a> {
                     break Ok(());
                 }
             })?)
-        } else if let Some(prev) = prev {
+        } else if let Some(prev) = prev_value {
             *prev
         } else {
             return Err(self.emit_expected("a constant initializer: `= <expr>`"));
@@ -783,7 +786,7 @@ impl<'a> Parser<'a> {
                         format!("found {} expressions", values.nodes.length),
                     ),
             );
-        } else if let Some(prev) = *prev {
+        } else if let Some(prev) = *prev_value {
             if prev.nodes.length != values.nodes.length {
                 self.emit(
                     Diagnostic::error(
@@ -801,9 +804,10 @@ impl<'a> Parser<'a> {
             }
         }
 
-        *prev = Some(values);
+        *prev_type = typ;
+        *prev_value = Some(values);
         let span = match typ {
-            _ if *prev != Some(values) => self.emit_join(names, values),
+            _ if *prev_value != Some(values) => self.emit_join(names, values),
             Some(typ) => self.emit_join(names, typ),
             None => self.emit_span(names),
         };

@@ -19,7 +19,7 @@ pub mod util;
 
 use std::{
     borrow::Cow, cell::RefCell, collections::HashMap, future::Future, marker::PhantomData,
-    sync::Mutex, time::Duration,
+    sync::{Mutex, atomic::AtomicBool}, time::Duration,
 };
 
 pub use durability::Durability;
@@ -555,9 +555,25 @@ thread_local! {
 
 static GLOBAL_METRICS: Mutex<Metrics> = Mutex::new(Metrics::new());
 
+static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_metrics(enable: bool) {
+    METRICS_ENABLED.store(enable, std::sync::atomic::Ordering::Relaxed);
+}
+
+macro_rules! metrics_enabled {
+    () => {
+        if cfg!(feature = "metrics") {
+            METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            false
+        }
+    }
+}
+
 #[inline]
 pub fn enter_span(name: impl Into<SpanName>) -> SpanGuard {
-    if cfg!(feature = "metrics") {
+    if metrics_enabled!() {
         METRICS.with(|metrics| {
             let mut metrics = metrics.borrow_mut();
             metrics.stack.push((name.into(), std::time::Instant::now()));
@@ -575,7 +591,7 @@ pub struct SpanGuard {
 impl Drop for SpanGuard {
     #[inline]
     fn drop(&mut self) {
-        if cfg!(feature = "metrics") {
+        if metrics_enabled!() {
             METRICS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
                 let (name, start) = metrics.stack.pop().expect("unbalanced number of spans");
@@ -590,7 +606,7 @@ impl Drop for SpanGuard {
 }
 
 fn publish_metrics() {
-    if cfg!(feature = "metrics") {
+    if metrics_enabled!() {
         METRICS.with(|metrics| {
             let mut metrics = metrics.borrow_mut();
             let mut global = GLOBAL_METRICS.lock().unwrap();
@@ -605,7 +621,7 @@ fn publish_metrics() {
 }
 
 fn print_global_metrics() {
-    if cfg!(feature = "metrics") {
+    if metrics_enabled!() {
         let mut global = GLOBAL_METRICS.lock().unwrap();
         print_metrics_impl(&global).unwrap();
         global.spans.clear();

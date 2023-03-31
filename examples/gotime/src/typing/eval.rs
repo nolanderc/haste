@@ -5,7 +5,7 @@ use crate::{
     error,
     index_map::IndexMap,
     naming::{self, DeclId, DeclPath, GlobalSymbol, Symbol},
-    syntax::{self, ExprId, Node, NodeId, NodeRange},
+    syntax::{self, ExprId, Node, NodeId},
     typing::{ConstantKind, TypeKind},
     Result,
 };
@@ -329,9 +329,5 @@ impl<'a> EvalContext<'a> {
 
     fn node_span(&self, node: impl Into<NodeId>) -> crate::span::Span {
         self.ast.node_span(self.path.index, node)
-    }
-
-    fn range_span(&self, range: impl Into<NodeRange>) -> Option<crate::span::Span> {
-        self.ast.range_span(self.path.index, range)
     }
 }

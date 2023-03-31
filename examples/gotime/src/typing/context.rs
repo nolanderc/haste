@@ -482,16 +482,15 @@ impl<'db> TypingContext<'db> {
                 let target_type = self.resolve_type(typ).await?;
 
                 let core_type = super::underlying_type(self.db, base_type).await?;
-                match core_type.lookup(self.db) {
-                    TypeKind::Interface(_) => {
-                        tracing::warn!(
-                            "ensure that `{target_type}` implements the interface `{base_type}`"
-                        );
-                        Ok(Value(target_type))
-                    }
-                    _ => Err(error!("argument in type assertion must be an `interface`")
-                        .label(self.node_span(base), "must be an interface")),
-                }
+                let Some(interface) = core_type.lookup(self.db).interface(self.db) else {
+                    return Err(error!("argument in type assertion must be an `interface`")
+                        .label(self.node_span(base), "must be an interface"))
+                };
+
+                self.check_interface_satisfied(base_type, interface, target_type)
+                    .await?;
+
+                Ok(Value(target_type))
             }
 
             Node::Unary(op, arg) => match op {
@@ -1251,7 +1250,12 @@ impl<'db> TypingContext<'db> {
                             name: &str,
                         ) -> Result<()> {
                             let typ = this.infer_expr(expr).await?;
-                            if !typ.lookup(this.db).is_integer() {
+                            if !typ
+                                .lookup(this.db)
+                                .underlying_class(this.db)
+                                .await?
+                                .is_integer()
+                            {
                                 return Err(error!("{name} must be an integer").label(
                                     this.node_span(expr),
                                     format!("this is of type `{typ}`"),
@@ -1419,7 +1423,7 @@ impl<'db> TypingContext<'db> {
         if !self.can_convert(target_type, source_type).await? {
             return Err(error!("invalid conversion").label(
                 self.node_span(entire_expr),
-                format!("trying to convert `{source_type}` into `{target_type}`"),
+                format!("cannot convert `{source_type}` into `{target_type}`"),
             ));
         }
 
@@ -1467,23 +1471,17 @@ impl<'db> TypingContext<'db> {
 
                 let target_core_kind = target_core.lookup(self.db);
 
-                if let TypeKind::Interface(interface) = target_core_kind {
-                    if self
-                        .is_interface_satisfied(target, interface, source)
-                        .await?
-                    {
-                        return Ok(true);
-                    }
+                if let Some(interface) = target_core_kind.interface(self.db) {
+                    self.check_interface_satisfied(target, interface, source)
+                        .await?;
+                    return Ok(true);
                 }
 
                 if let TypeKind::Pointer(inner) = target_core_kind {
-                    if let TypeKind::Interface(interface) = inner.lookup(self.db) {
-                        if self
-                            .is_interface_satisfied(target, interface, source)
-                            .await?
-                        {
-                            return Ok(true);
-                        }
+                    if let Some(interface) = inner.lookup(self.db).interface(self.db) {
+                        self.check_interface_satisfied(target, interface, source)
+                            .await?;
+                        return Ok(true);
                     }
                 }
 
@@ -1505,20 +1503,24 @@ impl<'db> TypingContext<'db> {
         Ok(assignable)
     }
 
-    async fn is_interface_satisfied(
+    async fn check_interface_satisfied(
         &self,
         target: Type,
-        interface: &InterfaceType,
+        interface: InterfaceType,
         source: Type,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if interface.methods.is_empty() {
             // all types trivially implement the empty interface
-            return Ok(true);
+            return Ok(());
         }
 
-        Err(bug!(
-            "TODO: determine if `{source}` implements `{target} {interface}`"
-        ))
+        if !super::satisfies_interface(self.db, source, interface).await? {
+            return Err(error!(
+                "the type `{source}` does not implement the interface `{target}`"
+            ));
+        }
+
+        Ok(())
     }
 
     fn is_arbitrary_type(&self, kind: &TypeKind) -> bool {

@@ -491,15 +491,15 @@ pub async fn package_scope(
     Err(Diagnostic::combine(combined))
 }
 
-pub type MethodSet = crate::HashSet<DeclId>;
+pub type MethodSet = crate::HashSet<Text>;
 
 /// For each declaration in a package, its set of methods.
 #[haste::query]
 pub async fn package_methods(
     db: &dyn crate::Db,
-    package: PackageId,
+    package: FileSet,
 ) -> Result<crate::HashMap<Text, Arc<MethodSet>>> {
-    let package_scope = package_scope(db, package.files).await.as_ref()?;
+    let package_scope = package_scope(db, package).await.as_ref()?;
 
     let mut methods = crate::HashMap::default();
 
@@ -508,7 +508,7 @@ pub async fn package_methods(
             let set = methods
                 .entry(receiver)
                 .or_insert_with(|| Arc::new(MethodSet::default()));
-            Arc::make_mut(set).insert(DeclId::new(package, name));
+            Arc::make_mut(set).insert(name.base);
         }
     }
 
@@ -519,7 +519,7 @@ pub async fn package_methods(
 #[haste::query]
 #[clone]
 pub async fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSet>> {
-    let methods = package_methods(db, decl.package).await.as_ref()?;
+    let methods = package_methods(db, decl.package.files).await.as_ref()?;
     match methods.get(&decl.name.base) {
         Some(set) => Ok(set.clone()),
         None => Ok(Default::default()),

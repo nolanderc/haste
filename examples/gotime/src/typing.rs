@@ -4,7 +4,7 @@ mod eval;
 use std::sync::Arc;
 
 use bstr::BStr;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     common::Text,
@@ -26,6 +26,7 @@ pub struct Storage(
     const_value,
     selector_candidates,
     resolve_selector,
+    method_signature,
 );
 
 #[haste::intern(Type)]
@@ -292,6 +293,26 @@ impl TypeKind {
             TypeKind::Float64 => Some(64),
             TypeKind::Complex64 => Some(64),
             TypeKind::Complex128 => Some(128),
+            _ => None,
+        }
+    }
+
+    pub fn interface(&self, db: &dyn crate::Db) -> Option<InterfaceType> {
+        match self {
+            TypeKind::Error => {
+                let interface = InterfaceType {
+                    methods: Box::from([InterfaceMethod {
+                        name: Text::new(db, "Error"),
+                        signature: FunctionType {
+                            types: smallvec![TypeKind::String.insert(db)],
+                            inputs: 0,
+                            variadic: false,
+                        },
+                    }]),
+                };
+                Some(interface)
+            }
+            TypeKind::Interface(interface) => Some(interface.clone()),
             _ => None,
         }
     }
@@ -858,8 +879,10 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
 }
 
 async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
-    let &TypeKind::Declared(decl) = typ.lookup(db) else { return Ok(typ) };
-    underlying_type_for_decl(db, decl).await
+    match typ.lookup(db) {
+        &TypeKind::Declared(decl) => underlying_type_for_decl(db, decl).await,
+        _ => Ok(typ),
+    }
 }
 
 #[haste::query]
@@ -982,7 +1005,11 @@ struct SelectionCandidate {
 
 #[haste::query]
 #[clone]
-async fn resolve_selector(db: &dyn crate::Db, mut typ: Type, name: Text) -> Result<Option<Selection>> {
+async fn resolve_selector(
+    db: &dyn crate::Db,
+    mut typ: Type,
+    name: Text,
+) -> Result<Option<Selection>> {
     if let TypeKind::Pointer(inner) = typ.lookup(db) {
         typ = *inner;
     }
@@ -1026,11 +1053,20 @@ async fn selector_candidates(
         let methods = naming::method_set(db, decl).await?;
 
         for &method in methods.iter() {
-            let method_type = match decl_signature(db, method).await? {
+            let method_decl = DeclId {
+                package: decl.package,
+                name: naming::DeclName {
+                    receiver: Some(decl.name.base),
+                    base: method,
+                },
+            };
+
+            let method_type = match decl_signature(db, method_decl).await? {
                 Signature::Value(typ) => typ,
                 _ => unreachable!("methods must be values"),
             };
-            add_candidate(method.name.base, 0, Selection::Method(method_type));
+
+            add_candidate(method, 0, Selection::Method(method_type));
         }
 
         typ = underlying_type_for_decl(db, decl).await?;
@@ -1058,4 +1094,66 @@ async fn selector_candidates(
     }
 
     Ok(candidates)
+}
+
+async fn satisfies_interface(
+    db: &dyn crate::Db,
+    typ: Type,
+    interface: InterfaceType,
+) -> Result<bool> {
+    if interface.methods.is_empty() {
+        return Ok(true);
+    }
+
+    let decl = match typ.lookup(db) {
+        &TypeKind::Declared(decl) => Some(decl),
+        TypeKind::Pointer(inner) => match inner.lookup(db) {
+            &TypeKind::Declared(decl) => Some(decl),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(decl) = decl else { return Ok(false) };
+
+    for method in interface.methods.iter() {
+        let Some(found) = method_signature(db, decl, method.name).await.as_ref()? else {
+            // missing method
+            return Ok(false);
+        };
+
+        if found != &method.signature {
+            // wrong signature
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+#[haste::query]
+async fn method_signature(
+    db: &dyn crate::Db,
+    decl: DeclId,
+    name: Text,
+) -> Result<Option<FunctionType>> {
+    let methods = naming::method_set(db, decl).await?;
+    if !methods.contains(&name) {
+        return Ok(None);
+    }
+
+    let method_decl = DeclId::new(
+        decl.package,
+        naming::DeclName {
+            receiver: Some(decl.name.base),
+            base: name,
+        },
+    );
+
+    let method_type = match decl_signature(db, method_decl).await? {
+        Signature::Value(typ) => typ,
+        _ => unreachable!("methods must be values"),
+    };
+
+    let TypeKind::Function(func) = method_type.lookup(db) else { unreachable!() };
+    Ok(Some(func.without_receiver()))
 }

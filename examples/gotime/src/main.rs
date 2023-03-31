@@ -16,8 +16,8 @@ use std::sync::Arc;
 use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use haste::Durability;
 use haste::util::CallOnDrop;
+use haste::Durability;
 use index_map::IndexMap;
 use naming::DeclName;
 use notify::Watcher;
@@ -167,6 +167,10 @@ struct Arguments {
     #[clap(short, long)]
     watch: bool,
 
+    /// Record and display performance metrics.
+    #[clap(long)]
+    metrics: bool,
+
     #[clap(flatten)]
     config: CompileConfig,
 }
@@ -195,6 +199,7 @@ fn main() {
         .init();
 
     let arguments = <Arguments as clap::Parser>::parse();
+    haste::enable_metrics(arguments.metrics);
 
     let mut db = Database::new();
 

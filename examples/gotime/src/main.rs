@@ -416,7 +416,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
 
     let mut futures = Vec::new();
     for &name in package_scope.keys() {
-        let decl = naming::DeclId::new(package, name);
+        let decl = naming::DeclId::new(db, package, name);
         let signature = typing::signature(db, naming::GlobalSymbol::Decl(decl));
         futures.push(async move {
             let signature = match signature.await? {
@@ -431,7 +431,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
 
     let decls = package_scope
         .keys()
-        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(package, name)))
+        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(db, package, name)))
         .try_join_all()
         .await?;
 

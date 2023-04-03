@@ -158,8 +158,6 @@ define_tokens! {
 }
 
 pub fn tokenize(text: &BStr) -> Vec<SpannedToken> {
-    let _guard = haste::enter_span("tokenize");
-
     assert!(text.len() < u32::MAX as usize);
 
     let mut tokens = Vec::with_capacity(text.len() / 4);

@@ -8,6 +8,7 @@ pub struct Arguments {
     pub clone: bool,
     pub cycle: Option<syn::Path>,
     pub input: bool,
+    pub lookup: syn::Path,
 }
 
 impl Default for Arguments {
@@ -18,6 +19,7 @@ impl Default for Arguments {
             clone: false,
             cycle: None,
             input: false,
+            lookup: syn::parse_quote!(haste::query_cache::HashStrategy),
         }
     }
 }
@@ -30,6 +32,7 @@ pub struct ArgumentOptions {
     pub clone: bool,
     pub cycle: bool,
     pub input: bool,
+    pub lookup: bool,
 }
 
 pub fn extract_attrs(attrs: &mut Vec<syn::Attribute>, options: ArgumentOptions) -> Arguments {
@@ -50,6 +53,9 @@ pub fn extract_attrs(attrs: &mut Vec<syn::Attribute>, options: ArgumentOptions) 
     }
     if options.input {
         parser.expect_flag("input", |enabled| args.input = enabled);
+    }
+    if options.lookup {
+        parser.expect_path("lookup", |path| args.lookup = path);
     }
 
     parser.parse(attrs);

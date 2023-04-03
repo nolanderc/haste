@@ -7,7 +7,9 @@ use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
 use crate::{error, Diagnostic, HashMap, Result};
 
-use super::{Builtin, DeclId, DeclPath, FileMember, GlobalSymbol, Local, PackageId, Symbol, DeclName};
+use super::{
+    Builtin, DeclId, DeclName, DeclPath, FileMember, GlobalSymbol, Local, PackageId, Symbol,
+};
 
 pub struct NamingContext<'db> {
     db: &'db dyn crate::Db,
@@ -176,7 +178,7 @@ impl<'db> NamingContext<'db> {
                         return;
                     }
 
-                    let decl = DeclId::new_plain(*package, name);
+                    let decl = DeclId::new_plain(self.db, *package, name);
                     let symbol = Symbol::Global(GlobalSymbol::Decl(decl));
                     self.resolved.insert(node, symbol);
                 }
@@ -517,10 +519,11 @@ impl<'db> NamingContext<'db> {
         }
 
         if self.package_scope.contains_key(&decl_name) {
-            return Some(Symbol::Global(GlobalSymbol::Decl(DeclId {
-                package: self.package,
-                name: decl_name,
-            })));
+            return Some(Symbol::Global(GlobalSymbol::Decl(DeclId::new(
+                self.db,
+                self.package,
+                decl_name,
+            ))));
         }
 
         if let Some(builtin) = Builtin::lookup(name.get(self.db)) {

@@ -33,6 +33,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             clone: true,
             cycle: true,
             input: true,
+            lookup: true,
             ..Default::default()
         },
     );
@@ -78,6 +79,8 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
 
     let is_input = args.input;
 
+    let lookup = args.lookup;
+
     tokens.extend(quote! {
         #[allow(non_camel_case_types)]
         #vis enum #ident {}
@@ -87,7 +90,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
         }
 
         impl haste::Ingredient for #ident {
-            type Container = haste::query_cache::HashQueryCache<Self>;
+            type Container = haste::query_cache::QueryCacheImpl<Self, #lookup>;
             type Storage = #storage_path;
         }
 

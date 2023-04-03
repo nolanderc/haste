@@ -25,7 +25,7 @@ use self::{injector::Injector, task::Task};
 
 pub use self::task::RawTask;
 
-const MAX_LOCAL_TASKS: usize = 256;
+const MAX_LOCAL_TASKS: usize = 1024;
 
 const WORKERS_ENV: &str = "HASTE_WORKERS";
 
@@ -564,6 +564,8 @@ impl LocalScheduler {
 
     fn try_next_steal(&self) -> Option<Task> {
         use st3::StealError;
+
+        let _guard = crate::enter_span(|| "steal worker");
 
         let workers = &self.shared.workers;
 

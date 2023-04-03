@@ -68,7 +68,7 @@ impl Task {
     }
 
     pub fn poll(self) {
-        let _guard = crate::enter_span("poll task");
+        let _guard = crate::enter_span(|| "poll task");
 
         let header = self.header();
 

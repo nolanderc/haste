@@ -395,6 +395,8 @@ impl Runtime {
             return;
         }
 
+        let _guard = crate::enter_span(|| "would_block_on");
+
         tracing::trace!(
             child = %crate::util::fmt::ingredient(db, child),
             ?parent,

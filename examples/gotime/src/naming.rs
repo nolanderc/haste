@@ -19,6 +19,7 @@ use self::context::NamingContext;
 
 #[haste::storage]
 pub struct Storage(
+    DeclId,
     file_scope,
     package_scope,
     exported_decls,
@@ -29,11 +30,14 @@ pub struct Storage(
 );
 
 /// Uniquely identifies a declaration somewhere in the program.
+#[haste::intern(DeclId)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DeclId {
+pub struct DeclData {
     /// The package where the decl is found.
+    #[clone]
     pub package: PackageId,
     /// Uniquely identifies the decl within the package.
+    #[clone]
     pub name: DeclName,
 }
 
@@ -77,13 +81,27 @@ impl PackageId {
     }
 }
 
-impl DeclId {
+impl DeclData {
     pub fn new(package: PackageId, name: DeclName) -> Self {
         Self { package, name }
     }
 
     pub fn new_plain(package: PackageId, name: Text) -> Self {
         Self::new(package, DeclName::plain(name))
+    }
+
+    pub fn insert(self, db: &dyn crate::Db) -> DeclId {
+        DeclId::insert(db, self)
+    }
+}
+
+impl DeclId {
+    pub fn new(db: &dyn crate::Db, package: PackageId, name: DeclName) -> Self {
+        DeclData::new(package, name).insert(db)
+    }
+
+    pub fn new_plain(db: &dyn crate::Db, package: PackageId, name: Text) -> Self {
+        Self::new(db, package, DeclName::plain(name))
     }
 
     async fn span(self, db: &dyn crate::Db) -> Result<Option<Span>> {
@@ -93,25 +111,26 @@ impl DeclId {
     }
 
     async fn try_get_path(self, db: &dyn crate::Db) -> Result<Option<DeclPath>> {
-        let scope = package_scope(db, self.package.files).await.as_ref()?;
-        Ok(scope.get(&self.name).copied())
+        let data = self.lookup(db);
+        let scope = package_scope(db, data.package.files).await.as_ref()?;
+        Ok(scope.get(&data.name).copied())
     }
 
     pub async fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
         match self.try_get_path(db).await? {
             Some(path) => Ok(path),
             None => {
-                let package = package_name(db, self.package.files).await?;
+                let package = package_name(db, self.package(db).files).await?;
                 Err(error!(
                     "`{}` is not a member of `{}`",
-                    self.name.base, package
+                    self.name(db).base, package
                 ))
             }
         }
     }
 }
 
-impl std::fmt::Display for DeclId {
+impl std::fmt::Display for DeclData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.package.name, self.name)
     }
@@ -298,7 +317,7 @@ pub async fn file_scope(
                         continue;
                     }
 
-                    let decl = DeclId { package, name };
+                    let decl = DeclData { package, name }.insert(db);
                     if let Err(error) = register(name, FileMember::Decl(decl)) {
                         return Err(error.await);
                     }
@@ -518,9 +537,10 @@ pub async fn package_methods(
 /// Get the set of methods defined for a type.
 #[haste::query]
 #[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
 pub async fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSet>> {
-    let methods = package_methods(db, decl.package.files).await.as_ref()?;
-    match methods.get(&decl.name.base) {
+    let methods = package_methods(db, decl.package(db).files).await.as_ref()?;
+    match methods.get(&decl.name(db).base) {
         Some(set) => Ok(set.clone()),
         None => Ok(Default::default()),
     }
@@ -661,12 +681,13 @@ pub struct Local {
 
 /// For each node in the given decl, the symbol it references.
 #[haste::query]
+#[lookup(haste::query_cache::TrackedStrategy)]
 pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<NodeId, Symbol>> {
     let path = id.path(db).await?;
     let ast = syntax::parse_file(db, path.source).await.as_ref()?;
     let decl = &ast.declarations[path.index];
 
-    let mut context = NamingContext::new(db, ast, path.index, id.package).await?;
+    let mut context = NamingContext::new(db, ast, path.index, id.package(db)).await?;
 
     match path.sub.lookup_in(decl) {
         SingleDecl::TypeDef(spec) | SingleDecl::TypeAlias(spec) => {

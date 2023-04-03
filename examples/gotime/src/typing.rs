@@ -658,6 +658,7 @@ pub async fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Resu
 
 #[haste::query]
 #[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
 async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
@@ -791,6 +792,7 @@ pub struct TypingInfo {
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
 /// expressions).
 #[haste::query]
+#[lookup(haste::query_cache::TrackedStrategy)]
 pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingInfo> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
@@ -890,6 +892,7 @@ async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
 
 #[haste::query]
 #[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
 async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
@@ -949,6 +952,7 @@ impl ConstValue {
 
 #[haste::query]
 #[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
 async fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
     let mut ctx = EvalContext::new(db, decl).await?;
     let path = ctx.path;
@@ -977,11 +981,11 @@ fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &str) -> bool {
     use crate::import::FileSetData;
     use std::ffi::OsStr;
 
-    if decl.name.base.get(db) != name || decl.package.name.get(db) != "unsafe" {
+    if decl.name(db).base.get(db) != name || decl.package(db).name.get(db) != "unsafe" {
         return false;
     }
 
-    let FileSetData::Directory(dir) = decl.package.files.lookup(db) else {return false};
+    let FileSetData::Directory(dir) = decl.package(db).files.lookup(db) else {return false};
 
     let Some(suffix) = dir.lookup(db).as_goroot() else { return false };
 
@@ -1055,14 +1059,17 @@ async fn selector_candidates(
     if let &TypeKind::Declared(decl) = typ.lookup(db) {
         let methods = naming::method_set(db, decl).await?;
 
+        let decl_data = decl.lookup(db);
+
         for &method in methods.iter() {
-            let method_decl = DeclId {
-                package: decl.package,
-                name: naming::DeclName {
-                    receiver: Some(decl.name.base),
+            let method_decl = DeclId::new(
+                db,
+                decl_data.package,
+                naming::DeclName {
+                    receiver: Some(decl_data.name.base),
                     base: method,
                 },
-            };
+            );
 
             let method_type = match decl_signature(db, method_decl).await? {
                 Signature::Value(typ) => typ,
@@ -1154,10 +1161,13 @@ async fn method_signature(
         return Ok(None);
     }
 
+    let decl_data = decl.lookup(db);
+
     let method_decl = DeclId::new(
-        decl.package,
+        db,
+        decl_data.package,
         naming::DeclName {
-            receiver: Some(decl.name.base),
+            receiver: Some(decl_data.name.base),
             base: name,
         },
     );

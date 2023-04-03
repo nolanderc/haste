@@ -253,7 +253,7 @@ impl<I, O> QueryCell<I, O> {
 
         // wake any tasks waiting on this result
         if let Some(blocked) = blocked {
-            for waker in blocked.wakers {
+            for waker in blocked.wakers.into_iter().rev() {
                 waker.wake();
             }
         }

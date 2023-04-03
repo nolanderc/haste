@@ -18,8 +18,13 @@ mod storage;
 pub mod util;
 
 use std::{
-    borrow::Cow, cell::RefCell, collections::HashMap, future::Future, marker::PhantomData,
-    sync::{Mutex, atomic::AtomicBool}, time::Duration,
+    borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    sync::{atomic::AtomicBool, Mutex},
+    time::Duration,
 };
 
 pub use durability::Durability;
@@ -274,8 +279,6 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
-        let _guard = crate::enter_span(format!("spawn {}", std::any::type_name::<Q>()));
-
         let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
 
@@ -400,7 +403,7 @@ pub trait DatabaseExt: Database {
         <T::Container as ElementContainer>::Value: Sized,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(format!("insert {}", std::any::type_name::<T>()));
+        let _guard = crate::enter_span(|| format!("insert {}", std::any::type_name::<T>()));
 
         let (storage, _runtime) = self.storage();
         let container = storage.container();
@@ -415,7 +418,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainerRef + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(format!("insert_ref {}", std::any::type_name::<T>()));
+        let _guard = crate::enter_span(|| format!("insert_ref {}", std::any::type_name::<T>()));
 
         let (storage, _runtime) = self.storage();
         let container = storage.container();
@@ -430,7 +433,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainer + Container<Self> + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(format!("lookup {}", std::any::type_name::<T>()));
+        let _guard = crate::enter_span(|| format!("lookup {}", std::any::type_name::<T>()));
 
         let (storage, runtime) = self.storage();
         let container = storage.container();
@@ -570,15 +573,20 @@ macro_rules! metrics_enabled {
         } else {
             false
         }
-    }
+    };
 }
 
 #[inline]
-pub fn enter_span(name: impl Into<SpanName>) -> SpanGuard {
+pub fn enter_span<T>(name: impl FnOnce() -> T) -> SpanGuard
+where
+    T: Into<SpanName>,
+{
     if metrics_enabled!() {
         METRICS.with(|metrics| {
             let mut metrics = metrics.borrow_mut();
-            metrics.stack.push((name.into(), std::time::Instant::now()));
+            metrics
+                .stack
+                .push((name().into(), std::time::Instant::now()));
         })
     }
 

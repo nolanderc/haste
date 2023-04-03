@@ -16,3 +16,9 @@ func main() {
     fmt.Printf("hello")
 }
 
+var bar = func() {
+    x := make(map[string]string)
+    x = nil
+    if x != nil {}
+}
+

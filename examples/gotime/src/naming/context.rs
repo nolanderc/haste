@@ -281,8 +281,8 @@ impl<'db> NamingContext<'db> {
                 if let Some(exprs) = exprs {
                     self.resolve_range(exprs);
                 }
-                for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(name) = self.nodes.kind(node) else {
+                for (i, &name_node) in self.nodes.indirect(names).iter().enumerate() {
+                    let Node::Name(name) = self.nodes.kind(name_node) else {
                         self.emit(error!("variable declaration must bind to an identifier")
                             .label(self.node_span(node), "expected an identifier"));
                         continue;

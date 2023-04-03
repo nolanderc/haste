@@ -274,6 +274,8 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
+        let _guard = crate::enter_span(format!("spawn {}", std::any::type_name::<Q>()));
+
         let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
 

@@ -492,7 +492,7 @@ fn write_node(
             Node::ImaginarySmall(value) => write!(out, "{}i", value.get()),
 
             Node::Assign(targets, values) => {
-                write_node_list(out, nodes, targets)?;
+                write_node_list(out, nodes, targets.nodes)?;
                 write!(out, " = ")?;
                 write_node_list(out, nodes, values.nodes)?;
                 Ok(())

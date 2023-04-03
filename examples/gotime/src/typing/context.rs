@@ -9,7 +9,8 @@ use crate::{
     naming::{self, DeclId, DeclPath},
     span::Span,
     syntax::{
-        self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, SpanId, TypeId,
+        self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, SpanId, StmtId,
+        TypeId,
     },
     typing::{Field, TypeClass},
     HashMap, Result,
@@ -30,6 +31,18 @@ pub(super) struct TypingContext<'db> {
     pub path: DeclPath,
 
     pub types: super::TypingInfo,
+
+    pub func: Option<FunctionData>,
+}
+
+pub struct FunctionData {
+    output: FunctionOutputs,
+    named_output: bool,
+}
+
+struct FunctionOutputs {
+    nodes: NodeRange,
+    types: TypeList,
 }
 
 impl<'db> TypingContext<'db> {
@@ -50,6 +63,7 @@ impl<'db> TypingContext<'db> {
                 nodes: IndexMap::with_capacity(nodes.len()),
                 locals: IndexMap::new(),
             },
+            func: None,
         })
     }
 
@@ -234,7 +248,8 @@ impl<'db> TypingContext<'db> {
                             };
 
                             let span = self.nodes.span(node);
-                            for method in embedded.methods.iter() {
+                            let mut buffer = None;
+                            for method in embedded.methods(self.db, &mut buffer) {
                                 register_method(self, method.name, span, method.signature.clone())?;
                             }
                         }
@@ -249,7 +264,7 @@ impl<'db> TypingContext<'db> {
                 methods.sort_by_key(|method| method.name.get(self.db));
 
                 let methods = methods.into_boxed_slice();
-                Ok(TypeKind::Interface(InterfaceType { methods }).insert(self.db))
+                Ok(TypeKind::Interface(InterfaceType::Methods(methods)).insert(self.db))
             }
 
             _ => Err(bug!("only types allowed in type context")
@@ -263,9 +278,12 @@ impl<'db> TypingContext<'db> {
     ) -> Result<FunctionType> {
         let mut types = TypeList::with_capacity(signature.inputs_and_outputs().len());
 
-        for node in self.nodes.indirect(signature.inputs_and_outputs()) {
-            let param = self.nodes.parameter(*node);
-            types.push(self.resolve_type(param.typ).await?);
+        for &node in self.nodes.indirect(signature.inputs_and_outputs()) {
+            let param = self.nodes.parameter(node);
+            let typ = self.resolve_type(param.typ).await?;
+            let local = naming::Local { node, index: 0 };
+            self.types.locals.insert(local, InferredType::Value(typ));
+            types.push(typ);
         }
 
         Ok(FunctionType {
@@ -280,20 +298,32 @@ impl<'db> TypingContext<'db> {
         signature: syntax::Signature,
         body: syntax::FunctionBody,
     ) -> Result<FunctionType> {
-        let mut types = TypeList::with_capacity(signature.inputs_and_outputs().len());
+        let typ = self.resolve_signature(signature).await?;
 
-        for node in self.nodes.indirect(signature.inputs_and_outputs()) {
-            let param = self.nodes.parameter(*node);
-            types.push(self.resolve_type(param.typ).await?);
+        let old_func = self.func.replace(FunctionData {
+            output: FunctionOutputs {
+                nodes: signature.outputs(),
+                types: typ.outputs().into(),
+            },
+            named_output: {
+                let mut named = false;
+                for &node in self.nodes.indirect(signature.outputs()) {
+                    named |= self.nodes.parameter(node).name.is_some();
+                }
+                named
+            },
+        });
+
+        for &stmt in self.nodes.indirect(body.block.statements) {
+            if let Err(error) = self.check_stmt(stmt).await {
+                self.func = old_func;
+                return Err(error);
+            }
         }
 
-        tracing::warn!("TODO: check function body");
+        self.func = old_func;
 
-        Ok(FunctionType {
-            types,
-            inputs: signature.inputs().len(),
-            variadic: signature.is_variadic(),
-        })
+        Ok(typ)
     }
 
     pub fn node_span(&self, node: impl Into<NodeId>) -> crate::span::Span {
@@ -345,14 +375,7 @@ impl<'db> TypingContext<'db> {
         }
 
         let inferred = self.infer_expr(expr).await?;
-
-        if !self.is_assignable(expected, inferred).await? {
-            let span = self.node_span(expr);
-            return Err(error!("type mismatch").label(
-                span,
-                format!("found `{inferred}`, but expected `{expected}`"),
-            ));
-        }
+        self.check_assignable(expected, inferred, expr).await?;
 
         Ok(())
     }
@@ -482,7 +505,7 @@ impl<'db> TypingContext<'db> {
                 let target_type = self.resolve_type(typ).await?;
 
                 let core_type = super::underlying_type(self.db, base_type).await?;
-                let Some(interface) = core_type.lookup(self.db).interface(self.db) else {
+                let TypeKind::Interface(interface) = core_type.lookup(self.db) else {
                     return Err(error!("argument in type assertion must be an `interface`")
                         .label(self.node_span(base), "must be an interface"))
                 };
@@ -1192,8 +1215,25 @@ impl<'db> TypingContext<'db> {
 
         match target_type.lookup(self.db) {
             TypeKind::Builtin(builtin) => {
-                let out = match builtin {
-                    super::BuiltinFunction::Close => todo!("builtin close"),
+                match builtin {
+                    super::BuiltinFunction::Close => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!("`close` expects a single argument (chan)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let typ = self.infer_expr(arg_exprs[0]).await?;
+                        let TypeKind::Channel(kind, _) = typ.lookup(self.db) else {
+                            return Err(error!("can only close channels")
+                                .label(self.node_span(arg_exprs[0]), "expected a channel"))
+                        };
+
+                        if !kind.is_send() {
+                            return Err(error!("can only close send channels")
+                                .label(self.node_span(arg_exprs[0]), ""));
+                        }
+
+                        Ok(smallvec![])
+                    }
                     super::BuiltinFunction::Copy => todo!("builtin copy"),
 
                     super::BuiltinFunction::Append => todo!("builtin append"),
@@ -1210,7 +1250,7 @@ impl<'db> TypingContext<'db> {
                         }
                         let typ = self.infer_expr(arg_exprs[0]).await?;
                         if let Some(cap_typ) = typ.lookup(self.db).capacity(self.db) {
-                            cap_typ
+                            Ok(smallvec![cap_typ])
                         } else {
                             return Err(error!(
                                 "cannot only get capacity of arrays, slices and channels"
@@ -1228,7 +1268,7 @@ impl<'db> TypingContext<'db> {
                         }
                         let typ = self.infer_expr(arg_exprs[0]).await?;
                         if let Some(len_typ) = typ.lookup(self.db).length(self.db) {
-                            len_typ
+                            Ok(smallvec![len_typ])
                         } else {
                             return Err(error!("cannot only get length of strings, arrays, slices, maps and channels")
                                 .label(self.node_span(arg_exprs[0]), format!("this has type `{typ}`")));
@@ -1308,7 +1348,7 @@ impl<'db> TypingContext<'db> {
                             }
                         }
 
-                        typ
+                        Ok(smallvec![typ])
                     }
                     super::BuiltinFunction::New => {
                         if arg_exprs.len() != 1 {
@@ -1316,16 +1356,14 @@ impl<'db> TypingContext<'db> {
                                 .label(self.node_span(call_expr), ""));
                         }
                         let typ = self.resolve_type(TypeId::new(arg_exprs[0].node)).await?;
-                        TypeKind::Pointer(typ).insert(self.db)
+                        Ok(smallvec![TypeKind::Pointer(typ).insert(self.db)])
                     }
 
                     _ => {
-                        return Err(bug!("TODO: call builtin {builtin:?}")
+                        Err(bug!("TODO: call builtin {builtin:?}")
                             .label(self.node_span(call_expr), ""))
                     }
-                };
-
-                Ok(smallvec![out])
+                }
             }
             TypeKind::Function(func) => {
                 if args.len() == 1 && func.inputs > 1 {
@@ -1433,13 +1471,15 @@ impl<'db> TypingContext<'db> {
     /// Determines if the two types are comparable.
     async fn is_comparable(&self, lhs: Type, rhs: Type) -> Result<bool> {
         if self.is_assignable(lhs, rhs).await? {
-            if lhs.lookup(self.db).is_comparable(self.db) {
+            if rhs.lookup(self.db).is_nil() && lhs.lookup(self.db).is_nillable() {
                 return Ok(true);
             }
+            return super::comparable(self.db, lhs).await;
         } else if self.is_assignable(rhs, lhs).await? {
-            if rhs.lookup(self.db).is_comparable(self.db) {
+            if lhs.lookup(self.db).is_nil() && rhs.lookup(self.db).is_nillable() {
                 return Ok(true);
             }
+            return super::comparable(self.db, rhs).await;
         }
 
         // not assignable
@@ -1465,20 +1505,28 @@ impl<'db> TypingContext<'db> {
             (target, TypeKind::Untyped(ConstantKind::Nil)) if target.is_nillable() => true,
 
             (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => true,
+            (
+                &TypeKind::Channel(target_dir, target_inner),
+                &TypeKind::Channel(source_dir, source_inner),
+            ) if target_inner == source_inner && target_dir.is_subset_of(source_dir) => true,
 
             _ => {
+                if self.is_arbitrary_type(target_kind) {
+                    return Ok(true);
+                }
+
                 let target_core = super::underlying_type(self.db, target).await?;
 
                 let target_core_kind = target_core.lookup(self.db);
 
-                if let Some(interface) = target_core_kind.interface(self.db) {
+                if let TypeKind::Interface(interface) = target_core_kind {
                     self.check_interface_satisfied(target, interface, source)
                         .await?;
                     return Ok(true);
                 }
 
                 if let TypeKind::Pointer(inner) = target_core_kind {
-                    if let Some(interface) = inner.lookup(self.db).interface(self.db) {
+                    if let TypeKind::Interface(interface) = inner.lookup(self.db) {
                         self.check_interface_satisfied(target, interface, source)
                             .await?;
                         return Ok(true);
@@ -1492,10 +1540,6 @@ impl<'db> TypingContext<'db> {
                     }
                 }
 
-                if self.is_arbitrary_type(target_kind) {
-                    return Ok(true);
-                }
-
                 false
             }
         };
@@ -1506,15 +1550,15 @@ impl<'db> TypingContext<'db> {
     async fn check_interface_satisfied(
         &self,
         target: Type,
-        interface: InterfaceType,
+        interface: &InterfaceType,
         source: Type,
     ) -> Result<()> {
-        if interface.methods.is_empty() {
+        if interface.is_empty() {
             // all types trivially implement the empty interface
             return Ok(());
         }
 
-        if !super::satisfies_interface(self.db, source, interface).await? {
+        if !super::satisfies_interface(self.db, source, interface.clone()).await? {
             return Err(error!(
                 "the type `{source}` does not implement the interface `{target}`"
             ));
@@ -1565,13 +1609,9 @@ impl<'db> TypingContext<'db> {
     /// Determines if the two types are ordered.
     async fn is_ordered(&self, lhs: Type, rhs: Type) -> Result<bool> {
         if self.is_assignable(lhs, rhs).await? {
-            if lhs.lookup(self.db).is_ordered() {
-                return Ok(true);
-            }
+            return super::ordered(self.db, lhs).await;
         } else if self.is_assignable(rhs, lhs).await? {
-            if rhs.lookup(self.db).is_ordered() {
-                return Ok(true);
-            }
+            return super::ordered(self.db, rhs).await;
         }
 
         // not assignable
@@ -1632,5 +1672,224 @@ impl<'db> TypingContext<'db> {
             }
             _ => Ok(false),
         }
+    }
+
+    fn check_stmt_boxed(&mut self, stmt: StmtId) -> BoxFuture<Result<()>> {
+        self.check_stmt(stmt).boxed()
+    }
+
+    async fn check_stmt(&mut self, mut stmt: StmtId) -> Result<()> {
+        loop {
+            break match self.nodes.kind(stmt) {
+                Node::ConstDecl(names, typ, exprs) => {
+                    self.check_var_decl(stmt, names, typ, Some(exprs)).await
+                }
+                Node::VarDecl(names, typ, exprs) => {
+                    self.check_var_decl(stmt, names, typ, exprs).await
+                }
+
+                Node::Assign(targets, values) => {
+                    let target_exprs = self.nodes.indirect(targets);
+                    let value_exprs = self.nodes.indirect(values);
+
+                    let mut target_types = TypeList::with_capacity(target_exprs.len());
+                    for target in target_exprs {
+                        target_types.push(self.infer_expr(*target).await?);
+                    }
+
+                    if value_exprs.len() == 1 {
+                        let value_types = self.infer_assignment(value_exprs[0]).await?;
+                        if targets.len() > value_types.len() {
+                            return Err(error!("invalid assignment")
+                                .label(
+                                    self.range_span(targets).unwrap(),
+                                    format!("found {} targets", targets.len()),
+                                )
+                                .label(
+                                    self.range_span(values).unwrap(),
+                                    format!("found {} values", value_types.len()),
+                                ));
+                        }
+
+                        for (target, (expected, value)) in target_exprs
+                            .iter()
+                            .zip(target_types.iter().zip(value_types))
+                        {
+                            self.check_assignable(*expected, value, *target).await?;
+                        }
+                    } else {
+                        if value_exprs.len() != target_exprs.len() {
+                            return Err(error!("invalid assignment")
+                                .label(
+                                    self.range_span(targets).unwrap(),
+                                    format!("found {} targets", targets.len()),
+                                )
+                                .label(
+                                    self.range_span(values).unwrap(),
+                                    format!("found {} values", values.len()),
+                                ));
+                        }
+
+                        for (value, expected) in value_exprs.iter().zip(target_types) {
+                            self.check_expr(*value, expected).await?;
+                        }
+                    }
+
+                    Ok(())
+                }
+
+                Node::Call(target, args, spread) => {
+                    self.infer_function_call(ExprId::new(stmt.node), target, args, spread)
+                        .await?;
+                    Ok(())
+                }
+
+                Node::If(init, cond, block, els) => {
+                    if let Some(init) = init {
+                        self.check_stmt_boxed(init).await?;
+                    }
+
+                    self.check_expr(cond, TypeKind::Bool.insert(self.db))
+                        .await?;
+                    self.check_block_boxed(block).await?;
+
+                    if let Some(els) = els {
+                        stmt = els;
+                        continue;
+                    }
+                    Ok(())
+                }
+
+                Node::Return(None) => self.check_return(stmt, &[]).await,
+                Node::Return(Some(expr)) => self.check_return(stmt, &[expr]).await,
+                Node::ReturnMulti(exprs) => {
+                    self.check_return(stmt, self.nodes.indirect(exprs)).await
+                }
+
+                kind => Err(bug!("not a statement: {:?}", kind)
+                    .label(self.node_span(stmt), "expected a statement")),
+            };
+        }
+    }
+
+    async fn check_var_decl(
+        &mut self,
+        stmt: StmtId,
+        names: NodeRange,
+        typ: Option<TypeId>,
+        exprs: Option<ExprRange>,
+    ) -> std::result::Result<(), crate::Diagnostic> {
+        let required_names;
+        let types = if let Some(typ) = typ {
+            let expected = self.resolve_type(typ).await?;
+            if let Some(exprs) = exprs {
+                for &expr in self.nodes.indirect(exprs) {
+                    self.check_expr(expr, expected).await?;
+                }
+            }
+            required_names = names.len();
+            smallvec![expected; names.len()]
+        } else {
+            let Some(exprs) = exprs else {
+                return Err(error!("expected either expression or type")
+                    .label(self.node_span(stmt), ""));
+            };
+            let exprs = self.nodes.indirect(exprs);
+            if let [single] = exprs {
+                required_names = 1;
+                self.infer_assignment(*single).await?
+            } else {
+                let mut types = TypeList::with_capacity(exprs.len());
+                for expr in exprs {
+                    types.push(self.infer_expr(*expr).await?);
+                }
+                required_names = exprs.len();
+                types
+            }
+        };
+
+        if names.len() < required_names {
+            return Err(error!("assignment mismatch")
+                .label(
+                    self.range_span(names).unwrap(),
+                    format!("found {} names", names.len()),
+                )
+                .label(
+                    self.range_span(exprs.unwrap()).unwrap(),
+                    format!("but expression has type {}", crate::util::fmt_tuple(&types)),
+                ));
+        }
+
+        for (index, typ) in (0..).zip(types) {
+            let local = naming::Local {
+                node: stmt.node,
+                index: index as u16,
+            };
+            self.types.locals.insert(local, InferredType::Value(typ));
+        }
+
+        Ok(())
+    }
+
+    async fn check_return(&mut self, stmt: StmtId, exprs: &[ExprId]) -> Result<()> {
+        let func = self
+            .func
+            .as_ref()
+            .expect("statements only allowed in functions");
+
+        if exprs.is_empty() && func.named_output {
+            return Ok(());
+        }
+
+        let output_types = func.output.types.clone();
+
+        if exprs.len() == 1 && output_types.len() > 1 {
+            let types = self.infer_assignment(exprs[0]).await?;
+
+            if types.len() < output_types.len() {
+                return Err(error!("too few values in return").label(
+                    self.node_span(stmt),
+                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
+                ));
+            }
+
+            if types[..output_types.len()] != output_types[..] {
+                return Err(error!("invalid return type").label(
+                    self.node_span(stmt),
+                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
+                ));
+            }
+        } else {
+            if exprs.len() < output_types.len() {
+                return Err(error!("too few values in return").label(
+                    self.node_span(stmt),
+                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
+                ));
+            }
+
+            if exprs.len() > output_types.len() {
+                return Err(error!("too many values in return").label(
+                    self.node_span(stmt),
+                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
+                ));
+            }
+
+            for (&expr, typ) in exprs.iter().zip(output_types) {
+                self.check_expr(expr, typ).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_block_boxed(&mut self, block: syntax::Block) -> BoxFuture<Result<()>> {
+        self.check_block(block).boxed()
+    }
+
+    async fn check_block(&mut self, block: syntax::Block) -> Result<()> {
+        for stmt in self.nodes.indirect(block.statements) {
+            self.check_stmt(*stmt).await?;
+        }
+        Ok(())
     }
 }

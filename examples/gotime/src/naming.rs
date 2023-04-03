@@ -654,9 +654,9 @@ define_builtin! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Local {
     /// The syntax node the local references.
-    node: NodeId,
+    pub node: NodeId,
     /// If the syntax node contains multiple names, it refers to the one with this index.
-    index: u16,
+    pub index: u16,
 }
 
 /// For each node in the given decl, the symbol it references.

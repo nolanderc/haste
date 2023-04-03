@@ -4,7 +4,7 @@ mod eval;
 use std::sync::Arc;
 
 use bstr::BStr;
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
 use crate::{
     common::Text,
@@ -27,6 +27,7 @@ pub struct Storage(
     selector_candidates,
     resolve_selector,
     method_signature,
+    comparable,
 );
 
 #[haste::intern(Type)]
@@ -58,7 +59,6 @@ pub enum TypeKind {
     Complex64,
     Complex128,
 
-    Error,
     String,
 
     Pointer(Type),
@@ -154,7 +154,6 @@ impl TypeKind {
             TypeKind::Float32 | TypeKind::Float64 => TypeClass::FLOAT | ordered | signed,
             TypeKind::Complex64 | TypeKind::Complex128 => TypeClass::COMPLEX | comparable | signed,
 
-            TypeKind::Error => nillable | comparable,
             TypeKind::String => TypeClass::STRING | nillable | ordered,
 
             TypeKind::Pointer(_) => nillable | comparable,
@@ -215,27 +214,12 @@ impl TypeKind {
         matches!(self, Self::Declared(_))
     }
 
-    pub fn is_nillable(&self) -> bool {
-        self.class().contains(TypeClass::NILLABLE)
+    pub fn is_nil(&self) -> bool {
+        matches!(self, TypeKind::Untyped(ConstantKind::Nil))
     }
 
-    pub fn is_comparable(&self, db: &dyn crate::Db) -> bool {
-        if self.class().contains(TypeClass::TRIVIALLY_COMPARABLE) {
-            return true;
-        }
-
-        match self {
-            Self::Array(_, inner) => inner.lookup(db).is_comparable(db),
-            Self::Struct(strukt) => {
-                for field in strukt.fields.iter() {
-                    if !field.typ.lookup(db).is_comparable(db) {
-                        return false;
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
+    pub fn is_nillable(&self) -> bool {
+        self.class().contains(TypeClass::NILLABLE)
     }
 
     pub fn is_ordered(&self) -> bool {
@@ -293,26 +277,6 @@ impl TypeKind {
             TypeKind::Float64 => Some(64),
             TypeKind::Complex64 => Some(64),
             TypeKind::Complex128 => Some(128),
-            _ => None,
-        }
-    }
-
-    pub fn interface(&self, db: &dyn crate::Db) -> Option<InterfaceType> {
-        match self {
-            TypeKind::Error => {
-                let interface = InterfaceType {
-                    methods: Box::from([InterfaceMethod {
-                        name: Text::new(db, "Error"),
-                        signature: FunctionType {
-                            types: smallvec![TypeKind::String.insert(db)],
-                            inputs: 0,
-                            variadic: false,
-                        },
-                    }]),
-                };
-                Some(interface)
-            }
-            TypeKind::Interface(interface) => Some(interface.clone()),
             _ => None,
         }
     }
@@ -434,8 +398,43 @@ impl StructType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct InterfaceType {
-    pub methods: Box<[InterfaceMethod]>,
+pub enum InterfaceType {
+    /// List of methods.
+    Methods(Box<[InterfaceMethod]>),
+    /// The error interface.
+    Error,
+}
+
+impl InterfaceType {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Methods(methods) if methods.is_empty())
+    }
+
+    fn error_method(db: &dyn crate::Db) -> InterfaceMethod {
+        InterfaceMethod {
+            name: Text::new(db, "Error"),
+            signature: FunctionType {
+                types: smallvec::smallvec![TypeKind::String.insert(db)],
+                inputs: 0,
+                variadic: false,
+            },
+        }
+    }
+
+    fn methods<'a>(
+        &'a self,
+        db: &dyn crate::Db,
+        buffer: &'a mut Option<InterfaceMethod>,
+    ) -> impl Iterator<Item = &'a InterfaceMethod> {
+        let methods: &[_] = match self {
+            InterfaceType::Methods(methods) => methods,
+            InterfaceType::Error => {
+                *buffer = Some(Self::error_method(db));
+                std::slice::from_ref(buffer.as_ref().unwrap())
+            }
+        };
+        methods.iter()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -486,7 +485,6 @@ impl std::fmt::Display for TypeKind {
                 None => write!(f, "nil"),
             },
             TypeKind::Builtin(builtin) => write!(f, "builtin[{:?}]", builtin),
-            TypeKind::Error => write!(f, "error"),
             TypeKind::Bool => write!(f, "bool"),
             TypeKind::Int => write!(f, "int"),
             TypeKind::Int8 => write!(f, "int8"),
@@ -600,22 +598,27 @@ impl std::fmt::Display for StructType {
 
 impl std::fmt::Display for InterfaceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "interface {{")?;
+        match self {
+            Self::Error => write!(f, "error"),
+            Self::Methods(methods) => {
+                write!(f, "interface {{")?;
 
-        for (i, method) in self.methods.iter().enumerate() {
-            if i == 0 {
-                write!(f, " ")?;
-            } else {
-                write!(f, "; ")?;
+                for (i, method) in methods.iter().enumerate() {
+                    if i == 0 {
+                        write!(f, " ")?;
+                    } else {
+                        write!(f, "; ")?;
+                    }
+
+                    method.signature.fmt_with_name(f, Some(method.name))?;
+                }
+
+                if methods.is_empty() {
+                    write!(f, "}}")
+                } else {
+                    write!(f, " }}")
+                }
             }
-
-            method.signature.fmt_with_name(f, Some(method.name))?;
-        }
-
-        if self.methods.is_empty() {
-            write!(f, "}}")
-        } else {
-            write!(f, " }}")
         }
     }
 }
@@ -736,7 +739,7 @@ fn builtin_signature(db: &dyn crate::Db, builtin: Builtin) -> Signature {
         Builtin::Byte => make_type(TypeKind::Uint8),
         Builtin::Complex64 => make_type(TypeKind::Complex64),
         Builtin::Complex128 => make_type(TypeKind::Complex128),
-        Builtin::Error => make_type(TypeKind::Error),
+        Builtin::Error => make_type(TypeKind::Interface(InterfaceType::Error)),
         Builtin::Float32 => make_type(TypeKind::Float32),
         Builtin::Float64 => make_type(TypeKind::Float64),
         Builtin::Int => make_type(TypeKind::Int),
@@ -1085,7 +1088,8 @@ async fn selector_candidates(
             }
         }
         TypeKind::Interface(interface) => {
-            for method in interface.methods.iter() {
+            let mut buffer = None;
+            for method in interface.methods(db, &mut buffer) {
                 let signature = TypeKind::Function(method.signature.clone()).insert(db);
                 add_candidate(method.name, 0, Selection::Element(signature));
             }
@@ -1101,7 +1105,7 @@ async fn satisfies_interface(
     typ: Type,
     interface: InterfaceType,
 ) -> Result<bool> {
-    if interface.methods.is_empty() {
+    if interface.is_empty() {
         return Ok(true);
     }
 
@@ -1115,7 +1119,16 @@ async fn satisfies_interface(
     };
     let Some(decl) = decl else { return Ok(false) };
 
-    for method in interface.methods.iter() {
+    let error_method;
+    let methods = match &interface {
+        InterfaceType::Methods(methods) => &methods[..],
+        InterfaceType::Error => {
+            error_method = [InterfaceType::error_method(db)];
+            &error_method
+        }
+    };
+
+    for method in methods.iter() {
         let Some(found) = method_signature(db, decl, method.name).await.as_ref()? else {
             // missing method
             return Ok(false);
@@ -1156,4 +1169,36 @@ async fn method_signature(
 
     let TypeKind::Function(func) = method_type.lookup(db) else { unreachable!() };
     Ok(Some(func.without_receiver()))
+}
+
+#[haste::query]
+#[clone]
+async fn comparable(db: &dyn crate::Db, typ: Type) -> Result<bool> {
+    let kind = typ.lookup(db);
+    if kind.class().contains(TypeClass::TRIVIALLY_COMPARABLE) {
+        return Ok(true);
+    }
+
+    match kind {
+        TypeKind::Array(_, inner) => comparable(db, *inner).await,
+        TypeKind::Struct(strukt) => {
+            for field in strukt.fields.iter() {
+                if !comparable(db, field.typ).await? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        TypeKind::Declared(decl) => {
+            let core = underlying_type_for_decl(db, *decl).await?;
+            comparable(db, core).await
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn ordered(db: &dyn crate::Db, typ: Type) -> Result<bool> {
+    let core = underlying_type(db, typ).await?;
+    let kind = core.lookup(db);
+    Ok(kind.class().contains(TypeClass::TRIVIALLY_ORDERED))
 }

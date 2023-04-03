@@ -650,7 +650,7 @@ pub enum Node {
     ReturnMulti(ExprRange),
 
     /// Bind the expressions to the values
-    Assign(NodeRange, ExprRange),
+    Assign(ExprRange, ExprRange),
 
     /// Apply a binary operator and store the result in the lhs: `lhs += rhs`
     AssignOp(ExprId, BinaryOperator, ExprId),
@@ -792,9 +792,18 @@ pub enum ChannelKind {
 
 impl ChannelKind {
     pub fn is_recv(self) -> bool {
+        matches!(self, ChannelKind::SendRecv | ChannelKind::Recv)
+    }
+
+    pub fn is_send(self) -> bool {
+        matches!(self, ChannelKind::SendRecv | ChannelKind::Send)
+    }
+
+    pub fn is_subset_of(self, source_dir: ChannelKind) -> bool {
         match self {
-            ChannelKind::SendRecv | ChannelKind::Recv => true,
-            ChannelKind::Send => false,
+            Self::SendRecv => matches!(source_dir, Self::SendRecv),
+            Self::Send => source_dir.is_send(),
+            Self::Recv => source_dir.is_recv(),
         }
     }
 }

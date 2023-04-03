@@ -1,27 +1,30 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering::Relaxed},
-    Mutex,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Mutex,
+    },
 };
 
 use super::task::Task;
 
 pub struct Injector {
     approx_len: AtomicUsize,
-    tasks: Mutex<Vec<Task>>,
+    tasks: Mutex<VecDeque<Task>>,
 }
 
 impl Injector {
     pub fn new() -> Self {
         Self {
             approx_len: AtomicUsize::new(0),
-            tasks: Mutex::new(Vec::with_capacity(1024)),
+            tasks: Mutex::new(VecDeque::with_capacity(1024)),
         }
     }
 
     /// Inject a new task, returning the number of tasks available
     pub fn push(&self, task: Task) {
         self.approx_len.fetch_add(1, Relaxed);
-        self.tasks.lock().unwrap().push(task);
+        self.tasks.lock().unwrap().push_back(task);
     }
 
     pub fn pop(&self) -> Option<Task> {
@@ -29,7 +32,7 @@ impl Injector {
             return None;
         }
 
-        let task = self.tasks.lock().unwrap().pop()?;
+        let task = self.tasks.lock().unwrap().pop_back()?;
         self.approx_len.fetch_sub(1, Relaxed);
         Some(task)
     }

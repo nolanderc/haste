@@ -1931,7 +1931,7 @@ impl<'a> Parser<'a> {
         let kind = if is_definition {
             Node::VarDecl(names, None, Some(values))
         } else {
-            Node::Assign(names, values)
+            Node::Assign(ExprRange::new(names), values)
         };
 
         let span = self.emit_join(names, values);

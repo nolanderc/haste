@@ -29,6 +29,13 @@ pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Resu
         data: Data::default(),
     };
 
+    // emperical measurements show that `#nodes ~ #tokens * 0.6` on average.
+    let expected_node_count = tokens.len();
+
+    parser.data.node.kinds.reserve(expected_node_count);
+    parser.data.node.spans.reserve(expected_node_count);
+    parser.data.node.indirect.reserve(expected_node_count);
+
     match parser.file() {
         Ok(file) => Ok(file),
         Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics)),

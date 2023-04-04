@@ -21,11 +21,9 @@ use crossbeam_utils::CachePadded;
 
 use crate::util::CallOnDrop;
 
-use self::{injector::Injector, task::Task};
+use self::task::Task;
 
 pub use self::task::RawTask;
-
-const MAX_LOCAL_TASKS: usize = 1024;
 
 const WORKERS_ENV: &str = "HASTE_WORKERS";
 
@@ -124,8 +122,9 @@ struct WorkerState {
     stealer: Stealer,
 }
 
-type LocalQueue = st3::lifo::Worker<Task>;
-type Stealer = st3::lifo::Stealer<Task>;
+type LocalQueue = crossbeam_deque::Worker<Task>;
+type Stealer = crossbeam_deque::Stealer<Task>;
+type Injector = crossbeam_deque::Injector<Task>;
 
 pub fn worker_threads() -> usize {
     if let Ok(var) = std::env::var(WORKERS_ENV) {
@@ -149,7 +148,7 @@ impl Executor {
         let worker_count = worker_threads();
 
         let workers = (0..worker_count + 1)
-            .map(|_| LocalQueue::new(MAX_LOCAL_TASKS))
+            .map(|_| LocalQueue::new_lifo())
             .collect::<Vec<_>>();
 
         let shared = Arc::new(Shared {
@@ -532,19 +531,7 @@ impl LocalScheduler {
     }
 
     fn drain(&self) {
-        loop {
-            self.reserved_next.take();
-
-            while let Ok(items) = self.queue.drain(|n| n) {
-                items.for_each(drop);
-            }
-
-            self.shared.injector.drain();
-
-            if self.try_next_local().is_none() && self.try_next_global().is_none() {
-                break;
-            }
-        }
+        while self.try_next_task().is_some() {}
     }
 
     /// Makes any tasks reserved possible to be stolen by other workers.
@@ -559,11 +546,23 @@ impl LocalScheduler {
     }
 
     fn try_next_global(&self) -> Option<Task> {
-        self.shared.injector.pop()
+        loop {
+            let steal = self
+                .shared
+                .injector
+                .steal_batch_with_limit_and_pop(&self.queue, 32);
+
+            if steal.is_retry() {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            break steal.success();
+        }
     }
 
     fn try_next_steal(&self) -> Option<Task> {
-        use st3::StealError;
+        use crossbeam_deque::Steal;
 
         let _guard = crate::enter_span(|| "steal worker");
 
@@ -578,10 +577,10 @@ impl LocalScheduler {
             let mut retry = false;
 
             for worker in order {
-                match worker.stealer.steal_and_pop(&self.queue, |n| n / 2) {
-                    Err(StealError::Empty) => continue,
-                    Err(StealError::Busy) => retry = true,
-                    Ok((task, _count)) => return Some(task),
+                match worker.stealer.steal_batch_and_pop(&self.queue) {
+                    Steal::Empty => continue,
+                    Steal::Retry => retry = true,
+                    Steal::Success(task) => return Some(task),
                 }
             }
 
@@ -675,11 +674,7 @@ impl LocalScheduler {
     }
 
     fn schedule_stealable(&self, task: Task) {
-        match self.queue.push(task) {
-            Ok(()) => self.shared.try_wake_suspended(),
-
-            // too many tasks in the local queue:
-            Err(task) => self.shared.schedule_global(task),
-        }
+        self.queue.push(task);
+        self.shared.try_wake_suspended();
     }
 }

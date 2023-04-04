@@ -87,6 +87,7 @@ impl Diagnostic {
     }
 
     /// Create a new error message
+    #[cold]
     pub fn error(text: impl ToString) -> Self {
         Self::new(Inner::Message(Message {
             severity: Severity::Error,
@@ -96,6 +97,7 @@ impl Diagnostic {
     }
 
     /// Create a new bug message
+    #[cold]
     pub fn bug(text: impl ToString) -> Self {
         Self::new(Inner::Message(Message {
             severity: Severity::Bug,
@@ -105,6 +107,7 @@ impl Diagnostic {
     }
 
     /// Combine multiple diagnostics into one
+    #[cold]
     pub fn combine<I>(diagnostics: I) -> Self
     where
         I: IntoIterator<Item = Diagnostic>,
@@ -118,6 +121,7 @@ impl Diagnostic {
         }
     }
 
+    #[cold]
     pub fn push(&mut self, other: Diagnostic) {
         if let Some(Inner::Combine(list)) = Arc::get_mut(&mut self.inner) {
             list.push(other);

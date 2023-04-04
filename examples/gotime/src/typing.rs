@@ -681,12 +681,25 @@ async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
         }
 
         naming::SingleDecl::ConstDecl(_, _, expr) => {
-            let typ = ctx.infer_expr(expr).await?;
+            let typ = match ctx.try_infer_expr_no_check(expr).await? {
+                Some(typ) => typ,
+                None => {
+                    let typing = type_check_body(db, decl).await.as_ref()?;
+                    typing.nodes[&expr.node].value()
+                }
+            };
             Ok(Signature::Value(typ))
         }
 
         naming::SingleDecl::VarDecl(_, _, Some(AssignmentExpr::Single(expr))) => {
-            let typ = ctx.infer_expr(expr).await?;
+            let typ = match ctx.try_infer_expr_no_check(expr).await? {
+                Some(typ) => typ,
+                None => {
+                    let typing = type_check_body(db, decl).await.as_ref()?;
+                    typing.nodes[&expr.node].value()
+                }
+            };
+
             match typ.value_type(db) {
                 Err(error) => Err(error.label(ctx.node_span(expr), "could not infer type")),
                 Ok(typ) => Ok(Signature::Value(typ)),

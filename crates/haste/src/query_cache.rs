@@ -545,9 +545,12 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
             this.inner.as_mut().recover(cycle, slot.input());
         }
 
-        let id = this.inner.query().resource;
+        let path = this.inner.query();
+        let id = path.resource;
 
-        let result = std::task::ready!(this.inner.as_mut().poll(cx));
+        let poll_inner = this.inner.as_mut().poll(cx);
+
+        let result = std::task::ready!(poll_inner);
         tracing::trace!("output ready");
 
         let mut new = this.storage.create_output(result);

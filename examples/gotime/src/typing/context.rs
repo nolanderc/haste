@@ -52,6 +52,12 @@ impl<'db> TypingContext<'db> {
         let references = naming::decl_symbols(db, decl).await.as_ref()?;
         let nodes = &ast.declarations[path.index].nodes;
 
+        for symbol in references.values() {
+            if let naming::Symbol::Global(naming::GlobalSymbol::Decl(decl)) = symbol {
+                super::decl_signature::prefetch(db, *decl);
+            }
+        }
+
         Ok(Self {
             db,
             ast,
@@ -60,7 +66,7 @@ impl<'db> TypingContext<'db> {
             decl,
             path,
             types: super::TypingInfo {
-                nodes: IndexMap::with_capacity(nodes.len()),
+                nodes: IndexMap::new(),
                 locals: IndexMap::new(),
             },
             func: None,
@@ -390,15 +396,60 @@ impl<'db> TypingContext<'db> {
         Ok(())
     }
 
-    pub fn infer_expr(&mut self, expr: ExprId) -> BoxFuture<Result<Type>> {
-        async move {
-            match self.infer_expr_impl(expr).await? {
-                InferredType::Value(typ) => Ok(typ),
-                InferredType::Type(typ) => Err(error!("expected a value, but found a type")
-                    .label(self.node_span(expr), format!("found the type `{typ}`"))),
+    /// Infers the type of an expression without necessarily verifying that the entire expression
+    /// is sound, which means we don't have to treverse the entire expression tree. This is most
+    /// useful for determining the type of variables, as large constants (eg lookup tables) can
+    /// take a while to type-check, which introduces bottlenecks into the compilation.
+    pub async fn try_infer_expr_no_check(&mut self, expr: ExprId) -> Result<Option<Type>> {
+        let typ = match self.nodes.kind(expr) {
+            Node::Composite(typ, composite) => {
+                self.infer_composite_init_no_check(typ, composite).await?
             }
+            Node::Function(signature, _) => {
+                let func = self.resolve_signature(signature).await?;
+                TypeKind::Function(func).insert(self.db)
+            }
+
+            Node::Name(name) => {
+                let inferred = self.infer_expr_name(expr, name).await?;
+                self.as_value(expr, inferred)?
+            }
+            Node::Selector(base, ident) => {
+                let inferred = self.infer_expr_selector(expr, ident, base).await?;
+                self.as_value(expr, inferred)?
+            }
+
+            Node::IntegerSmall(_) => {
+                TypeKind::Untyped(super::ConstantKind::Integer).insert(self.db)
+            }
+            Node::FloatSmall(_) => TypeKind::Untyped(super::ConstantKind::Float).insert(self.db),
+            Node::ImaginarySmall(_) => {
+                TypeKind::Untyped(super::ConstantKind::Complex).insert(self.db)
+            }
+            Node::Rune(_) => TypeKind::Untyped(super::ConstantKind::Rune).insert(self.db),
+            Node::String(_) => TypeKind::Untyped(super::ConstantKind::String).insert(self.db),
+
+            _ => return Ok(None),
+        };
+
+        Ok(Some(typ))
+    }
+
+    pub fn infer_expr(&mut self, expr: ExprId) -> BoxFuture<Result<Type>> {
+        self.infer_expr_value(expr).boxed()
+    }
+
+    pub async fn infer_expr_value(&mut self, expr: ExprId) -> Result<Type> {
+        let inferred = self.infer_expr_impl(expr).await?;
+        self.as_value(expr, inferred)
+    }
+
+    fn as_value(&mut self, expr: ExprId, inferred: InferredType) -> Result<Type> {
+        match inferred {
+            InferredType::Value(typ) => Ok(typ),
+            InferredType::Type(typ) => Err(error!("expected a value, but found a type")
+                .label(self.node_span(expr), format!("found the type `{typ}`"))),
         }
-        .boxed()
     }
 
     pub fn infer_expr_any(&mut self, expr: ExprId) -> BoxFuture<Result<InferredType>> {
@@ -415,46 +466,8 @@ impl<'db> TypingContext<'db> {
         use InferredType::Value;
 
         match self.nodes.kind(expr) {
-            Node::Name(name) => match self.lookup_node(expr.node).await? {
-                Some(typ) => Ok(typ),
-                None => {
-                    let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                    Err(error!("unresolved reference `{name}`").label(self.node_span(expr), ""))
-                }
-            },
-            Node::Selector(base, ident) => {
-                if let Some(typ) = self.lookup_node(expr.node).await? {
-                    // qualified identifier
-                    return Ok(typ);
-                }
-
-                let Some(name) = ident.text else {
-                    return Err(error!("selector name must not be blank")
-                        .label(self.ast.span(Some(self.path.index), ident.span), ""))
-                };
-
-                let base_type = self.infer_expr(ExprId::new(base)).await?;
-
-                let selection = super::resolve_selector(self.db, base_type, name).await?;
-
-                if let Some(selection) = selection {
-                    match selection {
-                        super::Selection::Element(typ) => Ok(Value(typ)),
-                        super::Selection::Method(typ) => {
-                            // the result is the method signature, with the first parameter
-                            // removed.
-                            let TypeKind::Function(func) = typ.lookup(self.db) else { unreachable!() };
-                            let applied_method = func.without_receiver();
-                            Ok(Value(TypeKind::Function(applied_method).insert(self.db)))
-                        }
-                    }
-                } else {
-                    Err(
-                        error!("no field or method `{name}` found for `{base_type}`")
-                            .label(self.node_span(expr), ""),
-                    )
-                }
-            }
+            Node::Name(name) => self.infer_expr_name(expr, name).await,
+            Node::Selector(base, ident) => self.infer_expr_selector(expr, ident, base).await,
 
             Node::IntegerSmall(_) => Ok(Value(
                 TypeKind::Untyped(super::ConstantKind::Integer).insert(self.db),
@@ -744,6 +757,57 @@ impl<'db> TypingContext<'db> {
         }
     }
 
+    async fn infer_expr_selector(
+        &mut self,
+        expr: ExprId,
+        ident: syntax::Identifier,
+        base: NodeId,
+    ) -> Result<InferredType> {
+        if let Some(typ) = self.lookup_node(expr.node).await? {
+            // qualified identifier
+            return Ok(typ);
+        }
+
+        let Some(name) = ident.text else {
+            return Err(error!("selector name must not be blank")
+                .label(self.ast.span(Some(self.path.index), ident.span), ""))
+        };
+
+        let base_type = self.infer_expr(ExprId::new(base)).await?;
+
+        let selection = super::resolve_selector(self.db, base_type, name).await?;
+
+        if let Some(selection) = selection {
+            match selection {
+                super::Selection::Element(typ) => Ok(InferredType::Value(typ)),
+                super::Selection::Method(typ) => {
+                    // the result is the method signature, with the first parameter
+                    // removed.
+                    let TypeKind::Function(func) = typ.lookup(self.db) else { unreachable!() };
+                    let applied_method = func.without_receiver();
+                    Ok(InferredType::Value(
+                        TypeKind::Function(applied_method).insert(self.db),
+                    ))
+                }
+            }
+        } else {
+            Err(
+                error!("no field or method `{name}` found for `{base_type}`")
+                    .label(self.node_span(expr), ""),
+            )
+        }
+    }
+
+    async fn infer_expr_name(&mut self, expr: ExprId, name: Option<Text>) -> Result<InferredType> {
+        match self.lookup_node(expr.node).await? {
+            Some(typ) => Ok(typ),
+            None => {
+                let name = name.map(|t| t.get(self.db)).unwrap_or("_");
+                Err(error!("unresolved reference `{name}`").label(self.node_span(expr), ""))
+            }
+        }
+    }
+
     async fn infer_binary_expr(&mut self, interleaved: ExprRange) -> Result<InferredType> {
         use syntax::BinaryOperator as BinOp;
 
@@ -924,19 +988,27 @@ impl<'db> TypingContext<'db> {
         Ok(InferredType::Value(lhs))
     }
 
+    async fn infer_composite_init_no_check(
+        &mut self,
+        typ: TypeId,
+        composite: syntax::CompositeRange,
+    ) -> Result<Type> {
+        match self.nodes.kind(typ) {
+            Node::Array(None, inner) => {
+                let inner = self.resolve_type(inner).await?;
+                Ok(TypeKind::Array(composite.len() as u64, inner).insert(self.db))
+            }
+            _ => self.resolve_type(typ).await,
+        }
+    }
+
     async fn infer_composite_init(
         &mut self,
         expr: ExprId,
         typ: TypeId,
         composite: syntax::CompositeRange,
     ) -> Result<Type> {
-        let expected = match self.nodes.kind(typ) {
-            Node::Array(None, inner) => {
-                let inner = self.resolve_type(inner).await?;
-                TypeKind::Array(composite.len() as u64, inner).insert(self.db)
-            }
-            _ => self.resolve_type(typ).await?,
-        };
+        let expected = self.infer_composite_init_no_check(typ, composite).await?;
 
         self.check_composite_literal(expr, expected, composite, |this| this.node_span(typ))
             .await?;
@@ -1841,16 +1913,22 @@ impl<'db> TypingContext<'db> {
             return Ok(());
         }
 
+        let output_nodes = func.output.nodes;
         let output_types = func.output.types.clone();
 
         if exprs.len() == 1 && output_types.len() > 1 {
             let types = self.infer_assignment(exprs[0]).await?;
 
             if types.len() < output_types.len() {
-                return Err(error!("too few values in return").label(
-                    self.node_span(stmt),
-                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
-                ));
+                return Err(error!("too few values in return")
+                    .label(
+                        self.node_span(exprs[0]),
+                        format!("found {}", crate::util::fmt_tuple(&output_types)),
+                    )
+                    .label(
+                        self.range_span(output_nodes).unwrap(),
+                        format!("expected {}", crate::util::fmt_tuple(&output_types)),
+                    ));
             }
 
             if types[..output_types.len()] != output_types[..] {

@@ -9,16 +9,16 @@ use crate::{
     naming::{self, DeclId, DeclPath},
     span::Span,
     syntax::{
-        self, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView, SpanId, StmtId,
-        TypeId,
+        self, BinaryOperator, ChannelKind, ExprId, ExprRange, Node, NodeId, NodeRange, NodeView,
+        SpanId, StmtId, TypeId,
     },
     typing::{Field, TypeClass},
     HashMap, Result,
 };
 
 use super::{
-    eval::EvalContext, ConstantKind, FunctionType, InferredType, InterfaceMethod, InterfaceType,
-    Signature, StructType, Type, TypeKind, TypeList,
+    eval::EvalContext, ConstValue, ConstantKind, FunctionType, InferredType, InterfaceMethod,
+    InterfaceType, Signature, StructType, Type, TypeKind, TypeList,
 };
 
 pub(super) struct TypingContext<'db> {
@@ -51,12 +51,6 @@ impl<'db> TypingContext<'db> {
         let ast = syntax::parse_file(db, path.source).await.as_ref()?;
         let references = naming::decl_symbols(db, decl).await.as_ref()?;
         let nodes = &ast.declarations[path.index].nodes;
-
-        for symbol in references.values() {
-            if let naming::Symbol::Global(naming::GlobalSymbol::Decl(decl)) = symbol {
-                super::decl_signature::prefetch(db, *decl);
-            }
-        }
 
         Ok(Self {
             db,
@@ -126,7 +120,7 @@ impl<'db> TypingContext<'db> {
                 Some(typ) => Ok(typ),
                 None => {
                     let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                    Err(error!("unresolved type `{name}`").label(self.node_span(typ), ""))
+                    Err(error!("missign typed declaration `{name}`").label(self.node_span(typ), ""))
                 }
             },
             Node::Selector(_, _) => {
@@ -282,13 +276,31 @@ impl<'db> TypingContext<'db> {
         &mut self,
         signature: syntax::Signature,
     ) -> Result<FunctionType> {
-        let mut types = TypeList::with_capacity(signature.inputs_and_outputs().len());
+        let parameters = signature.inputs_and_outputs();
 
-        for &node in self.nodes.indirect(signature.inputs_and_outputs()) {
+        let mut types = TypeList::with_capacity(parameters.len());
+
+        let variadic_index = if signature.is_variadic() {
+            Some(signature.inputs().len() - 1)
+        } else {
+            None
+        };
+
+        for (i, &node) in self.nodes.indirect(parameters).iter().enumerate() {
             let param = self.nodes.parameter(node);
             let typ = self.resolve_type(param.typ).await?;
             let local = naming::Local { node, index: 0 };
-            self.types.locals.insert(local, InferredType::Value(typ));
+
+            let local_type = if Some(i) == variadic_index {
+                TypeKind::Slice(typ).insert(self.db)
+            } else {
+                typ
+            };
+
+            self.types
+                .locals
+                .insert(local, InferredType::Value(local_type));
+
             types.push(typ);
         }
 
@@ -524,7 +536,8 @@ impl<'db> TypingContext<'db> {
                 };
 
                 self.check_interface_satisfied(base_type, interface, target_type)
-                    .await?;
+                    .await
+                    .map_err(|error| error.label(self.node_span(expr), "in this type assertion"))?;
 
                 Ok(Value(target_type))
             }
@@ -584,25 +597,7 @@ impl<'db> TypingContext<'db> {
                     let arg_type = self.infer_expr(arg).await?;
                     Ok(Value(TypeKind::Pointer(arg_type).insert(self.db)))
                 }
-                syntax::UnaryOperator::Recv => {
-                    let arg_type = self.infer_expr(arg).await?;
-                    match arg_type.lookup(self.db) {
-                        TypeKind::Channel(kind, inner) => {
-                            if !kind.is_recv() {
-                                return Err(error!(
-                                    "cannot receive values from a send-only channel"
-                                )
-                                .label(
-                                    self.node_span(arg),
-                                    format!("this has type `{arg_type}`"),
-                                ));
-                            }
-                            Ok(Value(*inner))
-                        }
-                        _ => Err(error!("expected a channel")
-                            .label(self.node_span(arg), format!("this has type `{arg_type}`"))),
-                    }
-                }
+                syntax::UnaryOperator::Recv => self.infer_recv_expr(arg).await.map(Value),
             },
             Node::Binary(interleaved) => self.infer_binary_expr(interleaved).await,
             Node::BinaryOp(_) => unreachable!("handled by `Node::Binary`"),
@@ -614,7 +609,8 @@ impl<'db> TypingContext<'db> {
 
             Node::Index(target, index) => {
                 let target_type = self.infer_expr(target).await?;
-                match target_type.lookup(self.db) {
+                let core_type = super::underlying_type(self.db, target_type).await?;
+                match core_type.lookup(self.db) {
                     &TypeKind::Array(_, inner) | &TypeKind::Slice(inner) => {
                         let index_type = self.infer_expr(index).await?;
                         if !index_type.lookup(self.db).is_integer() {
@@ -625,6 +621,16 @@ impl<'db> TypingContext<'db> {
                         }
                         Ok(Value(inner))
                     }
+                    TypeKind::String => {
+                        let index_type = self.infer_expr(index).await?;
+                        if !index_type.lookup(self.db).is_integer() {
+                            return Err(error!("expecetd an integer index").label(
+                                self.node_span(index),
+                                format!("this is of type `{index_type}`"),
+                            ));
+                        }
+                        Ok(Value(TypeKind::Uint8.insert(self.db)))
+                    }
                     &TypeKind::Map(key, value) => {
                         self.check_expr(index, key).await?;
                         Ok(Value(value))
@@ -634,21 +640,19 @@ impl<'db> TypingContext<'db> {
                 }
             }
             Node::SliceIndex(target, start, end) => {
-                let target_type = self.infer_expr(target).await?;
-                match target_type.lookup(self.db) {
-                    &TypeKind::Array(_, inner) | &TypeKind::Slice(inner) => {
-                        let check_integer = |this: &Self, index: ExprId, typ: Type| {
-                            if !typ.lookup(this.db).is_integer() {
-                                return Err(error!("expecetd an integer index")
-                                    .label(
-                                        this.node_span(index),
-                                        format!("this is of type `{typ}`"),
-                                    )
-                                    .label(this.node_span(expr), "in this slice operation"));
-                            }
-                            Ok(())
-                        };
+                let check_integer = |this: &Self, index: ExprId, typ: Type| {
+                    if !typ.lookup(this.db).is_integer() {
+                        return Err(error!("expecetd an integer index")
+                            .label(this.node_span(index), format!("this is of type `{typ}`"))
+                            .label(this.node_span(expr), "in this slice operation"));
+                    }
+                    Ok(())
+                };
 
+                let target_type = self.infer_expr(target).await?;
+                let core_type = super::underlying_type(self.db, target_type).await?;
+                match core_type.lookup(self.db) {
+                    &TypeKind::Array(_, inner) | &TypeKind::Slice(inner) => {
                         if let Some(start) = start {
                             let typ = self.infer_expr(start).await?;
                             check_integer(self, start, typ)?;
@@ -661,6 +665,19 @@ impl<'db> TypingContext<'db> {
 
                         Ok(Value(TypeKind::Slice(inner).insert(self.db)))
                     }
+                    TypeKind::String | TypeKind::Untyped(ConstantKind::String) => {
+                        if let Some(start) = start {
+                            let typ = self.infer_expr(start).await?;
+                            check_integer(self, start, typ)?;
+                        }
+
+                        if let Some(end) = end {
+                            let typ = self.infer_expr(end).await?;
+                            check_integer(self, end, typ)?;
+                        }
+
+                        Ok(Value(target_type))
+                    }
                     _ => Err(error!("cannot slice into value of type `{target_type}`")
                         .label(self.node_span(expr), "")
                         .label(self.node_span(target), "expected a slice or array")),
@@ -668,7 +685,8 @@ impl<'db> TypingContext<'db> {
             }
             Node::SliceCapacity(target, start, end, cap) => {
                 let target_type = self.infer_expr(target).await?;
-                match target_type.lookup(self.db) {
+                let core_type = super::underlying_type(self.db, target_type).await?;
+                match core_type.lookup(self.db) {
                     &TypeKind::Array(_, inner) | &TypeKind::Slice(inner) => {
                         let check_integer = |this: &Self, index: ExprId, typ: Type| {
                             if !typ.lookup(this.db).is_integer() {
@@ -757,6 +775,21 @@ impl<'db> TypingContext<'db> {
         }
     }
 
+    async fn infer_recv_expr(&mut self, expr: ExprId) -> Result<Type> {
+        let arg_type = self.infer_expr(expr).await?;
+        match arg_type.lookup(self.db) {
+            TypeKind::Channel(kind, inner) => {
+                if !kind.is_recv() {
+                    return Err(error!("cannot receive values from a send-only channel")
+                        .label(self.node_span(expr), format!("this has type `{arg_type}`")));
+                }
+                Ok(*inner)
+            }
+            _ => Err(error!("expected a channel")
+                .label(self.node_span(expr), format!("this has type `{arg_type}`"))),
+        }
+    }
+
     async fn infer_expr_selector(
         &mut self,
         expr: ExprId,
@@ -799,18 +832,22 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn infer_expr_name(&mut self, expr: ExprId, name: Option<Text>) -> Result<InferredType> {
+        if name.is_none() {
+            return Ok(InferredType::Value(
+                TypeKind::Interface(InterfaceType::Methods([].into())).insert(self.db),
+            ));
+        }
+
         match self.lookup_node(expr.node).await? {
             Some(typ) => Ok(typ),
             None => {
                 let name = name.map(|t| t.get(self.db)).unwrap_or("_");
-                Err(error!("unresolved reference `{name}`").label(self.node_span(expr), ""))
+                Err(error!("missing typed declaration `{name}`").label(self.node_span(expr), ""))
             }
         }
     }
 
     async fn infer_binary_expr(&mut self, interleaved: ExprRange) -> Result<InferredType> {
-        use syntax::BinaryOperator as BinOp;
-
         let interleaved = self.nodes.indirect(interleaved);
 
         let lhs_span = |this: &Self, index: usize| {
@@ -820,172 +857,187 @@ impl<'db> TypingContext<'db> {
 
         let mut lhs = self.infer_expr(interleaved[0]).await?;
         for (index, pair) in interleaved[1..].chunks_exact(2).enumerate() {
+            let op_node = pair[0];
+            let rhs_node = pair[1];
+
             let Node::BinaryOp(op) = self.nodes.kind(pair[0]) else { unreachable!() };
-            let mut rhs = self.infer_expr(pair[1]).await?;
+            let rhs = self.infer_expr(pair[1]).await?;
 
-            match op {
-                BinOp::LogicalOr | BinOp::LogicalAnd => {
-                    if lhs.lookup(self.db).is_bool() && rhs.lookup(self.db).is_bool() {
-                        lhs = Type::untyped_bool(self.db);
-                        continue;
-                    }
-                    return Err(error!("incompatible types for `{op}`")
-                        .label(
-                            self.node_span(pair[0]),
-                            "expected both operands to be of type `bool`",
-                        )
-                        .label(
-                            lhs_span(self, index),
-                            format!("this is found to be of type `{lhs}`"),
-                        )
-                        .label(
-                            self.node_span(pair[1]),
-                            format!("this is found to be of type `{rhs}`"),
-                        ));
-                }
-                BinOp::Equal | BinOp::NotEqual => {
-                    if self.is_comparable(lhs, rhs).await? {
-                        lhs = Type::untyped_bool(self.db);
-                        continue;
-                    }
-                    return Err(error!("the operands are not comparable")
-                        .label(self.node_span(pair[0]), "in this comparison")
-                        .label(
-                            lhs_span(self, index),
-                            format!("this is found to be of type `{lhs}`"),
-                        )
-                        .label(
-                            self.node_span(pair[1]),
-                            format!("this is found to be of type `{rhs}`"),
-                        ));
-                }
-                BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
-                    if self.is_ordered(lhs, rhs).await? {
-                        lhs = Type::untyped_bool(self.db);
-                        continue;
-                    }
-                    return Err(error!("the operands cannot be ordered")
-                        .label(self.node_span(pair[0]), "in this comparison")
-                        .label(
-                            lhs_span(self, index),
-                            format!("this is found to be of type `{lhs}`"),
-                        )
-                        .label(
-                            self.node_span(pair[1]),
-                            format!("this is found to be of type `{rhs}`"),
-                        ));
-                }
-
-                BinOp::Add
-                | BinOp::Sub
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Rem
-                | BinOp::BitAnd
-                | BinOp::BitNand => {
-                    let mut lhs_kind = lhs.lookup(self.db);
-                    let mut rhs_kind = rhs.lookup(self.db);
-
-                    if lhs_kind.is_untyped() {
-                        if !rhs_kind.is_untyped() && self.can_convert(rhs, lhs).await? {
-                            lhs_kind = rhs_kind;
-                            lhs = rhs;
-                        }
-                    } else {
-                        if rhs_kind.is_untyped() && self.can_convert(lhs, rhs).await? {
-                            rhs_kind = lhs_kind;
-                            rhs = lhs;
-                        }
-                    }
-
-                    let lhs_class = lhs_kind.underlying_class(self.db).await?;
-                    let rhs_class = rhs_kind.underlying_class(self.db).await?;
-
-                    let overlap = lhs_class.intersection(rhs_class);
-                    let both_numeric = lhs_class.intersects(TypeClass::NUMERIC)
-                        && rhs_class.intersects(TypeClass::NUMERIC);
-
-                    let valid_combination = match op {
-                        BinOp::Add => both_numeric || overlap.intersects(TypeClass::STRING),
-                        BinOp::Sub | BinOp::Mul | BinOp::Div => both_numeric,
-                        BinOp::Rem
-                        | BinOp::BitOr
-                        | BinOp::BitXor
-                        | BinOp::BitAnd
-                        | BinOp::BitNand => overlap.intersects(TypeClass::INTEGER),
-                        _ => unreachable!(),
-                    };
-
-                    if valid_combination {
-                        if lhs == rhs || lhs_class.is_untyped() || rhs_class.is_untyped() {
-                            lhs = if lhs_class.is_untyped() && rhs_class.is_untyped() {
-                                let order = [
-                                    TypeClass::COMPLEX,
-                                    TypeClass::FLOAT,
-                                    TypeClass::RUNE,
-                                    TypeClass::INTEGER,
-                                ];
-
-                                'order: {
-                                    for order in order {
-                                        if lhs_class.contains(order) {
-                                            break 'order lhs;
-                                        }
-                                        if rhs_class.contains(order) {
-                                            break 'order rhs;
-                                        }
-                                    }
-
-                                    lhs
-                                }
-                            } else if lhs_class.is_untyped() {
-                                rhs
-                            } else {
-                                lhs
-                            };
-                            continue;
-                        }
-                    }
-
-                    return Err(error!("incompatible types for `{op}`")
-                        .label(
-                            self.node_span(pair[0]),
-                            "both operands must be of the same type ({classes:?})",
-                        )
-                        .label(
-                            lhs_span(self, index),
-                            format!("this is found to be of type `{lhs}`"),
-                        )
-                        .label(
-                            self.node_span(pair[1]),
-                            format!("this is found to be of type `{rhs}`"),
-                        ));
-                }
-
-                BinOp::ShiftLeft | BinOp::ShiftRight => {
-                    let lhs_class = lhs.lookup(self.db).underlying_class(self.db).await?;
-                    let rhs_class = rhs.lookup(self.db).underlying_class(self.db).await?;
-
-                    if lhs_class.is_integer() && rhs_class.is_integer() {
-                        continue;
-                    }
-
-                    return Err(error!("incompatible types for `{op}`")
-                        .label(self.node_span(pair[0]), "both operands must be integers")
-                        .label(
-                            lhs_span(self, index),
-                            format!("this is found to be of type `{lhs}`"),
-                        )
-                        .label(
-                            self.node_span(pair[1]),
-                            format!("this is found to be of type `{rhs}`"),
-                        ));
-                }
-            }
+            lhs = self
+                .infer_binary_op(
+                    lhs,
+                    op,
+                    rhs,
+                    |this| lhs_span(this, index),
+                    |this| this.node_span(op_node),
+                    |this| this.node_span(rhs_node),
+                )
+                .await?;
         }
         Ok(InferredType::Value(lhs))
+    }
+
+    async fn infer_binary_op(
+        &mut self,
+        mut lhs: Type,
+        op: BinaryOperator,
+        mut rhs: Type,
+        lhs_span: impl Fn(&Self) -> Span,
+        op_span: impl Fn(&Self) -> Span,
+        rhs_span: impl Fn(&Self) -> Span,
+    ) -> Result<Type> {
+        use syntax::BinaryOperator as BinOp;
+
+        match op {
+            BinOp::LogicalOr | BinOp::LogicalAnd => {
+                if lhs.lookup(self.db).is_bool() && rhs.lookup(self.db).is_bool() {
+                    return Ok(Type::untyped_bool(self.db));
+                }
+                Err(error!("incompatible types for `{op}`")
+                    .label(op_span(self), "expected both operands to be of type `bool`")
+                    .label(
+                        lhs_span(self),
+                        format!("this is found to be of type `{lhs}`"),
+                    )
+                    .label(
+                        rhs_span(self),
+                        format!("this is found to be of type `{rhs}`"),
+                    ))
+            }
+            BinOp::Equal | BinOp::NotEqual => {
+                if self.is_comparable(lhs, rhs).await? {
+                    return Ok(Type::untyped_bool(self.db));
+                }
+                Err(error!("the operands are not comparable")
+                    .label(op_span(self), "in this comparison")
+                    .label(
+                        lhs_span(self),
+                        format!("this is found to be of type `{lhs}`"),
+                    )
+                    .label(
+                        rhs_span(self),
+                        format!("this is found to be of type `{rhs}`"),
+                    ))
+            }
+            BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
+                if self.is_ordered(lhs, rhs).await? {
+                    return Ok(Type::untyped_bool(self.db));
+                }
+                Err(error!("the operands cannot be ordered")
+                    .label(op_span(self), "in this comparison")
+                    .label(
+                        lhs_span(self),
+                        format!("this is found to be of type `{lhs}`"),
+                    )
+                    .label(
+                        rhs_span(self),
+                        format!("this is found to be of type `{rhs}`"),
+                    ))
+            }
+
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::BitAnd
+            | BinOp::BitNand => {
+                let mut lhs_kind = lhs.lookup(self.db);
+                let mut rhs_kind = rhs.lookup(self.db);
+
+                if lhs_kind.is_untyped() {
+                    if !rhs_kind.is_untyped() && self.can_convert(rhs, lhs).await? {
+                        lhs_kind = rhs_kind;
+                        lhs = rhs;
+                    }
+                } else {
+                    if rhs_kind.is_untyped() && self.can_convert(lhs, rhs).await? {
+                        rhs_kind = lhs_kind;
+                        rhs = lhs;
+                    }
+                }
+
+                let lhs_class = lhs_kind.underlying_class(self.db).await?;
+                let rhs_class = rhs_kind.underlying_class(self.db).await?;
+
+                let overlap = lhs_class.intersection(rhs_class);
+                let both_numeric = lhs_class.intersects(TypeClass::NUMERIC)
+                    && rhs_class.intersects(TypeClass::NUMERIC);
+
+                let valid_combination = match op {
+                    BinOp::Add => both_numeric || overlap.intersects(TypeClass::STRING),
+                    BinOp::Sub | BinOp::Mul | BinOp::Div => both_numeric,
+                    BinOp::Rem | BinOp::BitOr | BinOp::BitXor | BinOp::BitAnd | BinOp::BitNand => {
+                        overlap.intersects(TypeClass::INTEGER)
+                    }
+                    _ => unreachable!(),
+                };
+
+                if valid_combination {
+                    if lhs == rhs || lhs_class.is_untyped() || rhs_class.is_untyped() {
+                        if lhs_class.is_untyped() && rhs_class.is_untyped() {
+                            let order = [
+                                TypeClass::COMPLEX,
+                                TypeClass::FLOAT,
+                                TypeClass::RUNE,
+                                TypeClass::INTEGER,
+                            ];
+
+                            for order in order {
+                                if lhs_class.contains(order) {
+                                    return Ok(lhs);
+                                }
+                                if rhs_class.contains(order) {
+                                    return Ok(rhs);
+                                }
+                            }
+
+                            return Ok(lhs);
+                        } else if lhs_class.is_untyped() {
+                            return Ok(rhs);
+                        } else {
+                            return Ok(lhs);
+                        }
+                    }
+                }
+
+                return Err(error!("incompatible types for `{op}`")
+                    .label(
+                        op_span(self),
+                        "both operands must be of the same type ({classes:?})",
+                    )
+                    .label(
+                        lhs_span(self),
+                        format!("this is found to be of type `{lhs}`"),
+                    )
+                    .label(
+                        rhs_span(self),
+                        format!("this is found to be of type `{rhs}`"),
+                    ));
+            }
+
+            BinOp::ShiftLeft | BinOp::ShiftRight => {
+                let lhs_class = lhs.lookup(self.db).underlying_class(self.db).await?;
+                let rhs_class = rhs.lookup(self.db).underlying_class(self.db).await?;
+
+                if lhs_class.is_integer() && rhs_class.is_integer() {
+                    return Ok(lhs);
+                }
+
+                return Err(error!("incompatible types for `{op}`")
+                    .label(op_span(self), "both operands must be integers")
+                    .label(
+                        lhs_span(self),
+                        format!("this is found to be of type `{lhs}`"),
+                    )
+                    .label(
+                        rhs_span(self),
+                        format!("this is found to be of type `{rhs}`"),
+                    ));
+            }
+        }
     }
 
     async fn infer_composite_init_no_check(
@@ -1148,7 +1200,7 @@ impl<'db> TypingContext<'db> {
                 TypeKind::Array(len, inner) => {
                     break self.check_array_index(*inner, Some(*len), index).await?
                 }
-                TypeKind::String => {
+                TypeKind::String | TypeKind::Untyped(ConstantKind::String) => {
                     let inner = TypeKind::Uint8.insert(self.db);
                     break self.check_array_index(inner, None, index).await?;
                 }
@@ -1218,25 +1270,31 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn evaluate_integer(&mut self, expr: ExprId) -> Result<i64> {
-        let typ = self.infer_expr(expr).await?;
-        let kind = typ.lookup(self.db);
-        let class = kind.underlying_class(self.db).await?;
+        match self.evaluate(expr).await? {
+            ConstValue::Integer(value) => Ok(value.try_into().expect("handle large integers")),
+            _ => Err(error!("cannot be represented as an integer").label(self.node_span(expr), "")),
+        }
+    }
 
-        if !class.contains(TypeClass::INTEGER) {
-            return Err(error!("expected a constant integer expression")
-                .label(self.node_span(expr), format!("this has type `{typ}`")));
+    async fn evaluate_float(&mut self, expr: ExprId) -> Result<f64> {
+        match self.evaluate(expr).await? {
+            ConstValue::Integer(value) => Ok(value as f64),
+            _ => Err(error!("cannot be represented as a float").label(self.node_span(expr), "")),
+        }
+    }
+
+    async fn evaluate(&mut self, expr: ExprId) -> Result<ConstValue> {
+        if !self.types.nodes.contains_key(&expr.node) {
+            self.infer_expr(expr).await?;
         }
 
-        match self.nodes.kind(expr) {
-            Node::IntegerSmall(value) => Ok(value.try_into().expect("handle large integers")),
-            _ => Ok(self
-                .eval_context()
-                .eval(expr)
-                .await?
-                .integer()
-                .try_into()
-                .expect("handle large integers")),
-        }
+        let value = match self.nodes.kind(expr) {
+            Node::IntegerSmall(value) => ConstValue::Integer(value.into()),
+            _ => self.eval_context().eval(expr).await?,
+        };
+
+        // TODO: cache values to avoid repeated work
+        Ok(value)
     }
 
     fn eval_context(&self) -> EvalContext {
@@ -1269,10 +1327,6 @@ impl<'db> TypingContext<'db> {
         args: ExprRange,
         spread: Option<syntax::ArgumentSpread>,
     ) -> Result<TypeList> {
-        if spread.is_some() {
-            todo!("implement function spread");
-        }
-
         let target_type = match self.infer_expr_any(target).await? {
             InferredType::Value(value_type) => value_type,
             InferredType::Type(target_type) => {
@@ -1284,8 +1338,9 @@ impl<'db> TypingContext<'db> {
         };
 
         let arg_exprs = self.nodes.indirect(args);
+        let core_type = super::underlying_type(self.db, target_type).await?;
 
-        match target_type.lookup(self.db) {
+        match core_type.lookup(self.db) {
             TypeKind::Builtin(builtin) => {
                 match builtin {
                     super::BuiltinFunction::Close => {
@@ -1294,7 +1349,8 @@ impl<'db> TypingContext<'db> {
                                 .label(self.node_span(call_expr), ""));
                         }
                         let typ = self.infer_expr(arg_exprs[0]).await?;
-                        let TypeKind::Channel(kind, _) = typ.lookup(self.db) else {
+                        let core = super::underlying_type(self.db, typ).await?;
+                        let TypeKind::Channel(kind, _) = core.lookup(self.db) else {
                             return Err(error!("can only close channels")
                                 .label(self.node_span(arg_exprs[0]), "expected a channel"))
                         };
@@ -1306,14 +1362,146 @@ impl<'db> TypingContext<'db> {
 
                         Ok(smallvec![])
                     }
-                    super::BuiltinFunction::Copy => todo!("builtin copy"),
 
-                    super::BuiltinFunction::Append => todo!("builtin append"),
-                    super::BuiltinFunction::Delete => todo!("bulitin delete"),
+                    super::BuiltinFunction::Copy => {
+                        if arg_exprs.len() != 2 {
+                            return Err(error!("`copy` expects two arguments ([]T, []T)")
+                                .label(self.node_span(call_expr), ""));
+                        }
 
-                    super::BuiltinFunction::Complex => todo!("builtin complex"),
-                    super::BuiltinFunction::Imag => todo!("builtin imag"),
-                    super::BuiltinFunction::Real => todo!("builtin real"),
+                        let dst = self.infer_expr(arg_exprs[0]).await?;
+                        let core = super::underlying_type(self.db, dst).await?;
+                        let &TypeKind::Slice(inner) = core.lookup(self.db) else {
+                            return Err(error!("can only copy to slices")
+                                .label(self.node_span(arg_exprs[0]), "expected a slice"))
+                        };
+
+                        let src = self.infer_expr(arg_exprs[1]).await?;
+
+                        let is_byte_slice = *inner.lookup(self.db) == TypeKind::Uint8;
+                        if is_byte_slice && src.lookup(self.db).is_string() {
+                            // ok
+                        } else {
+                            self.check_assignable(dst, src, arg_exprs[1]).await?;
+                        }
+
+                        Ok(smallvec![TypeKind::Int.insert(self.db)])
+                    }
+
+                    super::BuiltinFunction::Append => {
+                        if arg_exprs.is_empty() {
+                            return Err(error!(
+                                "`append` expects at least a single argument ([]T, ...T)"
+                            )
+                            .label(self.node_span(call_expr), ""));
+                        }
+                        let slice = self.infer_expr(arg_exprs[0]).await?;
+                        let core = super::underlying_type(self.db, slice).await?;
+                        let &TypeKind::Slice(inner) = core.lookup(self.db) else {
+                            return Err(error!("can only append to slices")
+                                .label(self.node_span(arg_exprs[0]), "expected a slice"))
+                        };
+
+                        let is_byte_slice = *inner.lookup(self.db) == TypeKind::Uint8;
+
+                        let last_arg = arg_exprs.len() - 1;
+                        for (i, &arg) in arg_exprs[..].iter().enumerate().skip(1) {
+                            let arg_type = self.infer_expr(arg).await?;
+
+                            if i == last_arg && spread.is_some() {
+                                if is_byte_slice && arg_type.lookup(self.db).is_string() {
+                                    // ok
+                                } else {
+                                    self.check_assignable(slice, arg_type, arg).await?;
+                                }
+                            } else {
+                                self.check_assignable(inner, arg_type, arg).await?;
+                            }
+                        }
+
+                        Ok(smallvec![slice])
+                    }
+                    super::BuiltinFunction::Delete => {
+                        if arg_exprs.len() != 2 {
+                            return Err(error!("`delete` expects two arguments (map[K]V, K)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let map = self.infer_expr(arg_exprs[0]).await?;
+                        let core = super::underlying_type(self.db, map).await?;
+                        let &TypeKind::Map(key, _value) = core.lookup(self.db) else {
+                            return Err(error!("can only append to slices")
+                                .label(self.node_span(arg_exprs[0]), "expected a map"))
+                        };
+
+                        self.check_expr(arg_exprs[1], key).await?;
+
+                        Ok(smallvec![])
+                    }
+
+                    super::BuiltinFunction::Complex => {
+                        if arg_exprs.len() != 2 {
+                            return Err(error!("`complex` expects two arguments (floatT, floatT)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+
+                        let real_expr = arg_exprs[0];
+                        let imag_expr = arg_exprs[1];
+
+                        let real = self.infer_expr(real_expr).await?;
+                        let imag = self.infer_expr(imag_expr).await?;
+
+                        let real_kind = real.lookup(self.db);
+                        let imag_kind = imag.lookup(self.db);
+
+                        let actual = if real_kind.is_untyped() && imag_kind.is_untyped() {
+                            let _real_val = self.evaluate_float(real_expr).await?;
+                            let _imag_val = self.evaluate_float(imag_expr).await?;
+                            TypeKind::Untyped(ConstantKind::Complex).insert(self.db)
+                        } else if real_kind.is_untyped() {
+                            let actual = match imag.lookup(self.db) {
+                                TypeKind::Float32 => TypeKind::Complex64,
+                                TypeKind::Float64 => TypeKind::Complex128,
+                                _ => {
+                                    return Err(error!("expected a float")
+                                        .label(self.node_span(imag_expr), ""))
+                                }
+                            };
+                            self.check_assignable(imag, real, real_expr).await?;
+                            actual.insert(self.db)
+                        } else {
+                            let actual = match real.lookup(self.db) {
+                                TypeKind::Float32 => TypeKind::Complex64,
+                                TypeKind::Float64 => TypeKind::Complex128,
+                                _ => {
+                                    return Err(error!("expected a float")
+                                        .label(self.node_span(real_expr), ""))
+                                }
+                            };
+                            self.check_assignable(real, imag, imag_expr).await?;
+                            actual.insert(self.db)
+                        };
+
+                        Ok(smallvec![actual])
+                    }
+
+                    super::BuiltinFunction::Real | super::BuiltinFunction::Imag => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!("`{builtin}` expects one arguments (complex)")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let complex = self.infer_expr(arg_exprs[0]).await?;
+                        let out = match complex.lookup(self.db) {
+                            TypeKind::Untyped(ConstantKind::Complex) => complex,
+                            TypeKind::Complex64 => TypeKind::Float32.insert(self.db),
+                            TypeKind::Complex128 => TypeKind::Float64.insert(self.db),
+                            _ => {
+                                return Err(error!("expected a complex number")
+                                    .label(self.node_span(arg_exprs[0]), ""))
+                            }
+                        };
+
+                        Ok(smallvec![out])
+                    }
 
                     super::BuiltinFunction::Cap => {
                         if arg_exprs.len() != 1 {
@@ -1321,16 +1509,17 @@ impl<'db> TypingContext<'db> {
                                 .label(self.node_span(call_expr), ""));
                         }
                         let typ = self.infer_expr(arg_exprs[0]).await?;
-                        if let Some(cap_typ) = typ.lookup(self.db).capacity(self.db) {
+                        let core = super::underlying_type(self.db, typ).await?;
+                        if let Some(cap_typ) = core.lookup(self.db).capacity(self.db) {
                             Ok(smallvec![cap_typ])
                         } else {
-                            return Err(error!(
-                                "cannot only get capacity of arrays, slices and channels"
+                            Err(
+                                error!("cannot only get capacity of arrays, slices and channels")
+                                    .label(
+                                        self.node_span(arg_exprs[0]),
+                                        format!("this has type `{typ}`"),
+                                    ),
                             )
-                            .label(
-                                self.node_span(arg_exprs[0]),
-                                format!("this has type `{typ}`"),
-                            ));
                         }
                     }
                     super::BuiltinFunction::Len => {
@@ -1339,11 +1528,12 @@ impl<'db> TypingContext<'db> {
                                 .label(self.node_span(call_expr), ""));
                         }
                         let typ = self.infer_expr(arg_exprs[0]).await?;
-                        if let Some(len_typ) = typ.lookup(self.db).length(self.db) {
+                        let core = super::underlying_type(self.db, typ).await?;
+                        if let Some(len_typ) = core.lookup(self.db).length(self.db) {
                             Ok(smallvec![len_typ])
                         } else {
-                            return Err(error!("cannot only get length of strings, arrays, slices, maps and channels")
-                                .label(self.node_span(arg_exprs[0]), format!("this has type `{typ}`")));
+                            Err(error!("cannot only get length of strings, arrays, slices, maps and channels")
+                                .label(self.node_span(arg_exprs[0]), format!("this has type `{typ}`")))
                         }
                     }
 
@@ -1429,6 +1619,26 @@ impl<'db> TypingContext<'db> {
                         }
                         let typ = self.resolve_type(TypeId::new(arg_exprs[0].node)).await?;
                         Ok(smallvec![TypeKind::Pointer(typ).insert(self.db)])
+                    }
+
+                    super::BuiltinFunction::Panic => {
+                        if arg_exprs.len() != 1 {
+                            return Err(error!(
+                                "`panic` expects a single argument (interface{{}})"
+                            )
+                            .label(self.node_span(call_expr), ""));
+                        }
+                        self.infer_expr(arg_exprs[0]).await?;
+                        Ok(smallvec![])
+                    }
+
+                    super::BuiltinFunction::Recover => {
+                        if !arg_exprs.is_empty() {
+                            return Err(error!("`recover` does not accept any arguments")
+                                .label(self.node_span(call_expr), ""));
+                        }
+                        let interface = InterfaceType::Methods([].into());
+                        Ok(smallvec![TypeKind::Interface(interface).insert(self.db)])
                     }
 
                     _ => {
@@ -1543,12 +1753,12 @@ impl<'db> TypingContext<'db> {
     /// Determines if the two types are comparable.
     async fn is_comparable(&self, lhs: Type, rhs: Type) -> Result<bool> {
         if self.is_assignable(lhs, rhs).await? {
-            if rhs.lookup(self.db).is_nil() && lhs.lookup(self.db).is_nillable() {
+            if rhs.lookup(self.db).is_nil() && lhs.lookup(self.db).is_nillable(self.db).await? {
                 return Ok(true);
             }
             return super::comparable(self.db, lhs).await;
         } else if self.is_assignable(rhs, lhs).await? {
-            if lhs.lookup(self.db).is_nil() && rhs.lookup(self.db).is_nillable() {
+            if lhs.lookup(self.db).is_nil() && rhs.lookup(self.db).is_nillable(self.db).await? {
                 return Ok(true);
             }
             return super::comparable(self.db, rhs).await;
@@ -1574,7 +1784,11 @@ impl<'db> TypingContext<'db> {
             (target, TypeKind::Untyped(ConstantKind::Float)) if target.is_float() => true,
             (target, TypeKind::Untyped(ConstantKind::Complex)) if target.is_complex() => true,
             (target, TypeKind::Untyped(ConstantKind::String)) if target.is_string() => true,
-            (target, TypeKind::Untyped(ConstantKind::Nil)) if target.is_nillable() => true,
+            (target, TypeKind::Untyped(ConstantKind::Nil))
+                if target.is_nillable(self.db).await? =>
+            {
+                true
+            }
 
             (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => true,
             (
@@ -1592,16 +1806,12 @@ impl<'db> TypingContext<'db> {
                 let target_core_kind = target_core.lookup(self.db);
 
                 if let TypeKind::Interface(interface) = target_core_kind {
-                    self.check_interface_satisfied(target, interface, source)
-                        .await?;
-                    return Ok(true);
+                    return self.is_interface_satisfied(interface, source).await;
                 }
 
                 if let TypeKind::Pointer(inner) = target_core_kind {
                     if let TypeKind::Interface(interface) = inner.lookup(self.db) {
-                        self.check_interface_satisfied(target, interface, source)
-                            .await?;
-                        return Ok(true);
+                        return self.is_interface_satisfied(interface, source).await;
                     }
                 }
 
@@ -1625,18 +1835,26 @@ impl<'db> TypingContext<'db> {
         interface: &InterfaceType,
         source: Type,
     ) -> Result<()> {
-        if interface.is_empty() {
-            // all types trivially implement the empty interface
-            return Ok(());
-        }
-
-        if !super::satisfies_interface(self.db, source, interface.clone()).await? {
+        if !self.is_interface_satisfied(interface, source).await? {
             return Err(error!(
                 "the type `{source}` does not implement the interface `{target}`"
             ));
         }
 
         Ok(())
+    }
+
+    async fn is_interface_satisfied(
+        &self,
+        interface: &InterfaceType,
+        source: Type,
+    ) -> Result<bool> {
+        if interface.is_empty() {
+            // all types trivially implement the empty interface
+            return Ok(true);
+        }
+
+        super::satisfies_interface(self.db, source, interface.clone()).await
     }
 
     fn is_arbitrary_type(&self, kind: &TypeKind) -> bool {
@@ -1754,10 +1972,31 @@ impl<'db> TypingContext<'db> {
         loop {
             break match self.nodes.kind(stmt) {
                 Node::ConstDecl(names, typ, exprs) => {
-                    self.check_var_decl(stmt, names, typ, Some(exprs)).await
+                    self.check_var_decl(stmt, names, typ, Some(exprs), true)
+                        .await
                 }
                 Node::VarDecl(names, typ, exprs) => {
-                    self.check_var_decl(stmt, names, typ, exprs).await
+                    self.check_var_decl(stmt, names, typ, exprs, false).await
+                }
+
+                Node::TypeList(list) | Node::VarList(list) | Node::ConstList(list) => {
+                    for &node in self.nodes.indirect(list) {
+                        self.check_stmt_boxed(StmtId::new(node)).await?;
+                    }
+                    Ok(())
+                }
+
+                Node::TypeDef(_spec) => {
+                    Err(bug!("handle inline type def").label(self.node_span(stmt), ""))
+                }
+                Node::TypeAlias(spec) => {
+                    let typ = self.resolve_type(spec.inner).await?;
+                    let local = naming::Local {
+                        node: stmt.node,
+                        index: 0,
+                    };
+                    self.types.locals.insert(local, InferredType::Type(typ));
+                    Ok(())
                 }
 
                 Node::Assign(targets, values) => {
@@ -1838,10 +2077,236 @@ impl<'db> TypingContext<'db> {
                     self.check_return(stmt, self.nodes.indirect(exprs)).await
                 }
 
+                Node::For(init, cond, post, block) => {
+                    if let Some(init) = init {
+                        self.check_stmt_boxed(init).await?;
+                    }
+                    if let Some(cond) = cond {
+                        self.check_expr(cond, TypeKind::Bool.insert(self.db))
+                            .await?;
+                    }
+                    if let Some(post) = post {
+                        self.check_stmt_boxed(post).await?;
+                    }
+
+                    self.check_block_boxed(block).await
+                }
+
+                Node::ForRange(first, second, syntax::AssignOrDefine::Assign, list, block) => {
+                    let first_type = self.infer_expr(first).await?;
+                    let second_type = match second {
+                        Some(second) => Some(self.infer_expr(second).await?),
+                        None => None,
+                    };
+
+                    let list_type = self.infer_expr(list).await?;
+                    let list_core = super::underlying_type(self.db, list_type).await?;
+
+                    let Some((first_expected, second_expected)) = self.range_bindings(list_core) else {
+                        return Err(error!("cannot iterate over `{list_type}`")
+                            .label(self.node_span(list), "expected array, slice, string, map or channel"))
+                    };
+
+                    self.check_range_bindings(
+                        first_expected,
+                        second_expected,
+                        (first_type, first),
+                        second_type.map(|typ| (typ, second.unwrap())),
+                    )
+                    .await?;
+
+                    self.check_block_boxed(block).await
+                }
+
+                Node::ForRange(_first, second, syntax::AssignOrDefine::Define, list, block) => {
+                    let list_type = self.infer_expr(list).await?;
+                    let list_core = super::underlying_type(self.db, list_type).await?;
+
+                    let Some((first_type, second_type)) = self.range_bindings(list_core) else {
+                        return Err(error!("cannot iterate over `{list_type}`")
+                            .label(self.node_span(list), "expected array, slice, string, map or channel"))
+                    };
+
+                    self.types.locals.insert(
+                        naming::Local {
+                            node: stmt.node,
+                            index: 0,
+                        },
+                        InferredType::Value(first_type),
+                    );
+
+                    if let Some(second) = second {
+                        let Some(second_type) = second_type else {
+                            return Err(error!("range only yields one value")
+                                .label(self.node_span(second), "unexpected binding"))
+                        };
+
+                        self.types.locals.insert(
+                            naming::Local {
+                                node: stmt.node,
+                                index: 1,
+                            },
+                            InferredType::Value(second_type),
+                        );
+                    }
+
+                    self.check_block_boxed(block).await
+                }
+
+                Node::ForRangePlain(list, block) => {
+                    let list_type = self.infer_expr(list).await?;
+                    let list_core = super::underlying_type(self.db, list_type).await?;
+                    if self.range_bindings(list_core).is_none() {
+                        return Err(error!("cannot iterate over `{list_type}`").label(
+                            self.node_span(list),
+                            "expected array, slice, string, map or channel",
+                        ));
+                    }
+                    self.check_block_boxed(block).await
+                }
+
+                Node::Switch(init, cond, cases) => {
+                    if let Some(init) = init {
+                        self.check_stmt_boxed(init).await?;
+                    }
+
+                    let cond_type = if let Some(cond) = cond {
+                        if let Node::TypeSwitch(binding, inner) = self.nodes.kind(cond) {
+                            return Err(bug!("TODO: type switch").label(self.node_span(cond), ""));
+                        } else {
+                            self.infer_expr(cond).await?
+                        }
+                    } else {
+                        TypeKind::Bool.insert(self.db)
+                    };
+
+                    for &case in self.nodes.indirect(cases) {
+                        let Node::SwitchCase(exprs, block) = self.nodes.kind(case) else {
+                            unreachable!("switch must only contain switch-cases")
+                        };
+
+                        let exprs = exprs.map(|exprs| self.nodes.indirect(exprs)).unwrap_or(&[]);
+                        for &expr in exprs {
+                            self.check_expr(expr, cond_type).await?;
+                        }
+
+                        self.check_block_boxed(block).await?;
+                    }
+
+                    Ok(())
+                }
+
+                Node::Label(_label, inner) => {
+                    stmt = inner;
+                    continue;
+                }
+                Node::Continue(_) | Node::Break(_) | Node::Goto(_) => Ok(()),
+
+                Node::Block(block) => self.check_block_boxed(block).await,
+
+                Node::Increment(expr) | Node::Decrement(expr) => {
+                    let typ = self.infer_expr(expr).await?;
+                    let core = super::underlying_type(self.db, typ).await?;
+                    let class = core.lookup(self.db).class();
+                    if !class.intersects(TypeClass::INTEGER | TypeClass::FLOAT) {
+                        return Err(
+                            error!("expected an integer or float").label(self.node_span(expr), "")
+                        );
+                    }
+                    Ok(())
+                }
+
+                Node::AssignOp(lhs, op, rhs) => {
+                    let lhs_type = self.infer_expr(lhs).await?;
+                    let rhs_type = self.infer_expr(rhs).await?;
+
+                    let output = self
+                        .infer_binary_op(
+                            lhs_type,
+                            op,
+                            rhs_type,
+                            |this| this.node_span(lhs),
+                            |this| this.node_span(lhs).join(this.node_span(rhs)),
+                            |this| this.node_span(rhs),
+                        )
+                        .await?;
+
+                    self.check_assignable(lhs_type, output, ExprId::new(stmt.node))
+                        .await
+                }
+
+                Node::Defer(call) => {
+                    let Node::Call(target, args, spread) = self.nodes.kind(call) else {
+                        return Err(error!("only calls may be deferred")
+                            .label(self.node_span(call), "expected a call expression"))
+                    };
+                    self.infer_function_call(call, target, args, spread).await?;
+                    Ok(())
+                }
+
+                Node::Go(call) => {
+                    let Node::Call(target, args, spread) = self.nodes.kind(call) else {
+                        return Err(error!("only calls may be started in a goroutine")
+                            .label(self.node_span(call), "expected a call expression"))
+                    };
+                    self.infer_function_call(call, target, args, spread).await?;
+                    Ok(())
+                }
+
+                Node::Unary(syntax::UnaryOperator::Recv, expr) => {
+                    self.infer_recv_expr(expr).await?;
+                    Ok(())
+                }
+
                 kind => Err(bug!("not a statement: {:?}", kind)
                     .label(self.node_span(stmt), "expected a statement")),
             };
         }
+    }
+
+    fn range_bindings(&mut self, list_type: Type) -> Option<(Type, Option<Type>)> {
+        match list_type.lookup(self.db) {
+            TypeKind::String => Some((
+                TypeKind::Int.insert(self.db),
+                Some(TypeKind::Int32.insert(self.db)),
+            )),
+            &TypeKind::Slice(inner) | &TypeKind::Array(_, inner) => {
+                Some((TypeKind::Int.insert(self.db), Some(inner)))
+            }
+            TypeKind::Pointer(inner) => {
+                if let &TypeKind::Array(_, inner) = inner.lookup(self.db) {
+                    Some((TypeKind::Int.insert(self.db), Some(inner)))
+                } else {
+                    None
+                }
+            }
+            &TypeKind::Map(key, value) => Some((key, Some(value))),
+            &TypeKind::Channel(_, inner) => Some((inner, None)),
+            _ => None,
+        }
+    }
+
+    async fn check_range_bindings(
+        &mut self,
+        first_expected: Type,
+        second_expected: Option<Type>,
+        first: (Type, ExprId),
+        second: Option<(Type, ExprId)>,
+    ) -> Result<()> {
+        self.check_assignable(first_expected, first.0, first.1)
+            .await?;
+
+        if let Some((second_type, second)) = second {
+            let Some(second_expected) = second_expected else {
+                return Err(error!("range only yields one value")
+                    .label(self.node_span(second), "unexpected binding"))
+            };
+
+            self.check_assignable(second_expected, second_type, second)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn check_var_decl(
@@ -1850,6 +2315,7 @@ impl<'db> TypingContext<'db> {
         names: NodeRange,
         typ: Option<TypeId>,
         exprs: Option<ExprRange>,
+        constant: bool,
     ) -> std::result::Result<(), crate::Diagnostic> {
         let required_names;
         let types = if let Some(typ) = typ {
@@ -1893,6 +2359,17 @@ impl<'db> TypingContext<'db> {
         }
 
         for (index, typ) in (0..).zip(types) {
+            let typ = if constant {
+                typ
+            } else {
+                typ.value_type(self.db).map_err(|error| {
+                    error.label(
+                        self.node_span(self.nodes.indirect(exprs.unwrap())[index]),
+                        "",
+                    )
+                })?
+            };
+
             let local = naming::Local {
                 node: stmt.node,
                 index: index as u16,

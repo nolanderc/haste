@@ -409,7 +409,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let packages = resolved
         .iter()
         .flatten()
-        .map(|&package| compile_package_files(db, package))
+        .map(|&package| compile_package_files::spawn(db, package))
         .start_all();
 
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
@@ -417,45 +417,19 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     let mut futures = Vec::new();
     for &name in package_scope.keys() {
         let decl = naming::DeclId::new(db, package, name);
-        let signature = typing::signature(db, naming::GlobalSymbol::Decl(decl));
+        let signature = typing::decl_signature::spawn(db, decl);
+        let typing = typing::type_check_body::spawn(db, decl);
         futures.push(async move {
             let signature = match signature.await? {
                 typing::Signature::Type(typ) | typing::Signature::Value(typ) => typ,
                 typing::Signature::Package(_) => unreachable!("packages are not declarations"),
             };
+            let _typing = typing.await.as_ref()?;
             // eprintln!("{decl:?}: {signature}");
             Ok((name, signature))
         });
     }
     let signatures = futures.try_join_all().await?.into_iter().collect();
-
-    let decls = package_scope
-        .keys()
-        .map(|&name| naming::decl_symbols(db, naming::DeclId::new(db, package, name)))
-        .try_join_all()
-        .await?;
-
-    let mut futures = Vec::new();
-
-    for ((_name, path), symbols) in package_scope.iter().zip(decls.iter()) {
-        for (&node, &symbol) in symbols.iter() {
-            if let naming::Symbol::Global(naming::GlobalSymbol::Decl(decl)) = symbol {
-                let symbols = naming::decl_symbols(db, decl);
-                futures.push(async move {
-                    match symbols.await {
-                        Ok(_) => Ok(()),
-                        Err(error) => {
-                            let ast = syntax::parse_file(db, path.source).await.as_ref()?;
-                            let span = ast.node_span(path.index, node);
-                            Err(error.clone().label(span, "referenced from here"))
-                        }
-                    }
-                });
-            }
-        }
-    }
-
-    let _resolved_symbols = futures.try_join_all().await?;
 
     let package_names = resolved
         .iter()

@@ -54,7 +54,9 @@ impl<'a> EvalContext<'a> {
                         .label(self.node_span(expr), ""));
                 };
                 match symbol {
-                    naming::Symbol::Local(_) => todo!("const-evaluate local variable"),
+                    naming::Symbol::Local(_) => {
+                        Err(bug!("const-evaluate local variable").label(self.node_span(expr), ""))
+                    }
                     naming::Symbol::Global(global) => match global {
                         GlobalSymbol::Package(_) => unreachable!("not a value"),
                         GlobalSymbol::Builtin(builtin) => match builtin {

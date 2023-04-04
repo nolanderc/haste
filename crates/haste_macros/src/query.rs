@@ -142,16 +142,23 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
     };
 
     tokens.extend(quote! {
-        #[allow(unused)]
         #vis fn #ident<'db>(
             #db_ident: &'db dyn #db_path,
             #(#input_idents: #input_types),*
         ) -> impl std::future::Future<Output = #return_type> + 'db {
-            let future = haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*));
-            haste::util::future::map(future, |x| #clone(x))
+            #ident::spawn(db, #(#input_idents),*)
         }
 
         impl #ident {
+            #[allow(unused)]
+            #vis fn spawn<'db>(
+                #db_ident: &'db dyn #db_path,
+                #(#input_idents: #input_types),*
+            ) -> impl std::future::Future<Output = #return_type> + 'db {
+                let future = haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*));
+                haste::util::future::map(future, |x| #clone(x))
+            }
+
             #[allow(unused)]
             #vis fn prefetch(#db_ident: &dyn #db_path, #(#input_idents: #input_types),*) {
                 haste::DatabaseExt::prefetch::<#ident>(#db_ident, (#(#input_idents),*));

@@ -292,26 +292,29 @@ impl Label {
             start_line_text.len()
         };
 
+        let whitespace_map = |ch: char| match ch {
+            '\t' => "    ",
+            _ => " ",
+        };
+        let underline_map = |ch: char| match ch {
+            '\t' => "^^^^",
+            _ => "^",
+        };
+
         let start_underline = start_line_text[..start_column]
             .chars()
-            .map(|ch| match ch {
-                '\t' => "\t",
-                _ => " ",
-            })
+            .map(whitespace_map)
             .chain(
                 start_line_text[start_column..start_end_column]
                     .chars()
-                    .map(|_| "^"),
+                    .map(underline_map),
             )
             .collect::<String>();
 
         let end_underline = end_line_text[..end_column]
             .chars()
-            .map(|_| "^")
-            .chain(end_line_text[end_column..].chars().map(|ch| match ch {
-                '\t' => "\t",
-                _ => " ",
-            }))
+            .map(underline_map)
+            .chain(end_line_text[end_column..].chars().map(whitespace_map))
             .collect::<String>();
 
         let severity = parent_severity.style();
@@ -328,7 +331,7 @@ impl Label {
             out,
             "{Bold}{Blue}{} |{Default} {}",
             start_line + 1,
-            start_line_text
+            BStr::new(&start_line_text.replace(b"\t", b"    "))
         )?;
 
         let mid_gutter = if start_line == end_line { '|' } else { ':' };
@@ -344,7 +347,7 @@ impl Label {
                 out,
                 "\n{Bold}{Blue}{} |{Default} {}",
                 end_line + 1,
-                end_line_text
+                BStr::new(&end_line_text.replace(b"\t", b"    "))
             )?;
             write!(
                 out,

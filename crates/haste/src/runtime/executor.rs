@@ -124,7 +124,7 @@ struct WorkerState {
 
 type LocalQueue = crossbeam_deque::Worker<Task>;
 type Stealer = crossbeam_deque::Stealer<Task>;
-type Injector = crossbeam_deque::Injector<Task>;
+type Injector = injector::Injector;
 
 pub fn worker_threads() -> usize {
     if let Ok(var) = std::env::var(WORKERS_ENV) {
@@ -546,25 +546,11 @@ impl LocalScheduler {
     }
 
     fn try_next_global(&self) -> Option<Task> {
-        loop {
-            let steal = self
-                .shared
-                .injector
-                .steal_batch_with_limit_and_pop(&self.queue, 32);
-
-            if steal.is_retry() {
-                std::hint::spin_loop();
-                continue;
-            }
-
-            break steal.success();
-        }
+        self.shared.injector.pop()
     }
 
     fn try_next_steal(&self) -> Option<Task> {
         use crossbeam_deque::Steal;
-
-        let _guard = crate::enter_span(|| "steal worker");
 
         let workers = &self.shared.workers;
 
@@ -593,7 +579,9 @@ impl LocalScheduler {
     }
 
     fn next_task(&self) -> Option<Task> {
-        for _ in 0..100 {
+        let backoff = crossbeam_utils::Backoff::new();
+
+        for _ in 0..10 {
             if self.shared.state.load(Relaxed) != State::Running {
                 break;
             }
@@ -602,7 +590,7 @@ impl LocalScheduler {
                 return Some(task);
             }
 
-            std::hint::spin_loop();
+            backoff.spin();
         }
 
         self.suspend()

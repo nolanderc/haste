@@ -123,7 +123,8 @@ impl DeclId {
                 let package = package_name(db, self.package(db).files).await?;
                 Err(error!(
                     "`{}` is not a member of `{}`",
-                    self.name(db).base, package
+                    self.name(db).base,
+                    package
                 ))
             }
         }
@@ -714,3 +715,4 @@ pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<Nod
 
     context.finish()
 }
+

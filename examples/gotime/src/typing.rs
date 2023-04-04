@@ -110,6 +110,10 @@ impl TypeClass {
     pub fn is_numeric(self) -> bool {
         self.intersects(Self::NUMERIC)
     }
+
+    pub fn is_nillable(self) -> bool {
+        self.intersects(Self::NILLABLE)
+    }
 }
 
 impl TypeKind {
@@ -218,8 +222,11 @@ impl TypeKind {
         matches!(self, TypeKind::Untyped(ConstantKind::Nil))
     }
 
-    pub fn is_nillable(&self) -> bool {
-        self.class().contains(TypeClass::NILLABLE)
+    pub async fn is_nillable(&self, db: &dyn crate::Db) -> Result<bool> {
+        Ok(self
+            .underlying_class(db)
+            .await?
+            .contains(TypeClass::NILLABLE))
     }
 
     pub fn is_ordered(&self) -> bool {
@@ -601,6 +608,10 @@ impl std::fmt::Display for InterfaceType {
         match self {
             Self::Error => write!(f, "error"),
             Self::Methods(methods) => {
+                if methods.is_empty() {
+                    return write!(f, "interface{{}}");
+                }
+
                 write!(f, "interface {{")?;
 
                 for (i, method) in methods.iter().enumerate() {
@@ -613,11 +624,7 @@ impl std::fmt::Display for InterfaceType {
                     method.signature.fmt_with_name(f, Some(method.name))?;
                 }
 
-                if methods.is_empty() {
-                    write!(f, "}}")
-                } else {
-                    write!(f, " }}")
-                }
+                write!(f, " }}")
             }
         }
     }
@@ -659,7 +666,7 @@ pub async fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Resu
 #[haste::query]
 #[clone]
 #[lookup(haste::query_cache::TrackedStrategy)]
-async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
+pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
 
@@ -868,6 +875,10 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
                         ));
                 }
             }
+
+            ctx.types
+                .nodes
+                .insert(expr.node, InferredType::Value(found_type));
 
             ctx.finish()
         }
@@ -1129,15 +1140,10 @@ async fn satisfies_interface(
         return Ok(true);
     }
 
-    let decl = match typ.lookup(db) {
-        &TypeKind::Declared(decl) => Some(decl),
-        TypeKind::Pointer(inner) => match inner.lookup(db) {
-            &TypeKind::Declared(decl) => Some(decl),
-            _ => None,
-        },
-        _ => None,
+    let inner_type = match typ.lookup(db) {
+        &TypeKind::Pointer(inner) => inner,
+        _ => typ,
     };
-    let Some(decl) = decl else { return Ok(false) };
 
     let error_method;
     let methods = match &interface {
@@ -1149,7 +1155,7 @@ async fn satisfies_interface(
     };
 
     for method in methods.iter() {
-        let Some(found) = method_signature(db, decl, method.name).await.as_ref()? else {
+        let Some(found) = method_signature(db, inner_type, method.name).await.as_ref()? else {
             // missing method
             return Ok(false);
         };
@@ -1165,6 +1171,33 @@ async fn satisfies_interface(
 
 #[haste::query]
 async fn method_signature(
+    db: &dyn crate::Db,
+    typ: Type,
+    name: Text,
+) -> Result<Option<FunctionType>> {
+    let core = if let &TypeKind::Declared(decl) = typ.lookup(db) {
+        if let Some(method) = declared_method_signature(db, decl, name).await? {
+            return Ok(Some(method));
+        }
+
+        underlying_type_for_decl(db, decl).await?
+    } else {
+        typ
+    };
+
+    if let TypeKind::Interface(interface) = core.lookup(db) {
+        let mut buffer = None;
+        for method in interface.methods(db, &mut buffer) {
+            if method.name == name {
+                return Ok(Some(method.signature.clone()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn declared_method_signature(
     db: &dyn crate::Db,
     decl: DeclId,
     name: Text,

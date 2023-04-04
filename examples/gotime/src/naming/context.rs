@@ -271,8 +271,8 @@ impl<'db> NamingContext<'db> {
                     self.resolve_type(typ);
                 }
                 self.resolve_range(exprs);
-                for (i, &node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(Some(name)) = self.nodes.kind(node) else { continue };
+                for (i, &name_node) in self.nodes.indirect(names).iter().enumerate() {
+                    let Node::Name(Some(name)) = self.nodes.kind(name_node) else { continue };
                     self.local_scope.insert_local(name, node, i as u16);
                 }
             }

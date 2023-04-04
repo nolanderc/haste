@@ -12,7 +12,14 @@ func main() {
 }
 
 var bar = func() {
-	const stackBufSize = 128
-	buf := make([]byte, 0, stackBufSize)
+    x := Parent{}
+    x.Method()
 }
 
+type Parent struct {
+    Inner
+}
+
+type Inner struct {}
+
+func (c Inner) Method() {}

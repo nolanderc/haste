@@ -12,7 +12,7 @@ use crate::{
     index_map::IndexMap,
     naming::{self, AssignmentExpr, Builtin, DeclId, PackageId},
     syntax::{self, NodeId},
-    Result,
+    HashMap, HashSet, Result,
 };
 
 use self::{context::TypingContext, eval::EvalContext};
@@ -24,7 +24,8 @@ pub struct Storage(
     type_check_body,
     underlying_type_for_decl,
     const_value,
-    selector_candidates,
+    recursive_members,
+    selection_members,
     resolve_selector,
     method_signature,
     comparable,
@@ -1022,62 +1023,96 @@ fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Selection {
-    /// A field or interface method.
-    Element(Type),
-    /// A function with a receiver elsewhere in the package.
+    /// A struct field.
+    Field(Type),
+    /// A function type (without the reciever) denoting a defined method function or interface
+    /// method.
     Method(Type),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SelectionCandidate {
-    depth: u32,
-    selection: SmallVec<[Selection; 2]>,
-}
+type SelectionList = SmallVec<[Selection; 2]>;
 
 #[haste::query]
 #[clone]
-async fn resolve_selector(
-    db: &dyn crate::Db,
-    mut typ: Type,
-    name: Text,
-) -> Result<Option<Selection>> {
-    if let TypeKind::Pointer(inner) = typ.lookup(db) {
-        typ = *inner;
-    }
+async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
+    let inner = if let TypeKind::Pointer(inner) = typ.lookup(db) {
+        *inner
+    } else {
+        typ
+    };
 
-    let candidates = selector_candidates(db, typ).await.as_ref()?;
-    let Some(candidate) = candidates.get(&name) else { return Ok(None) };
+    let members = recursive_members(db, inner).await.as_ref()?;
+    let Some(selection) = members.get(&name) else { return Ok(None) };
 
-    if candidate.selection.len() > 1 {
+    if selection.len() > 1 {
         return Err(error!(
             "ambiguous selection `{typ}.{name}`: multiple alternatives ({:?})",
-            candidate.selection
+            selection
         ));
     }
 
-    Ok(Some(candidate.selection[0]))
+    Ok(selection.get(0).copied())
 }
 
 #[haste::query]
-async fn selector_candidates(
-    db: &dyn crate::Db,
-    mut typ: Type,
-) -> Result<IndexMap<Text, SelectionCandidate>> {
-    let mut candidates = IndexMap::<Text, SelectionCandidate>::new();
+async fn recursive_members(db: &dyn crate::Db, typ: Type) -> Result<HashMap<Text, SelectionList>> {
+    let mut selections = HashMap::<Text, SelectionList>::default();
 
-    let mut add_candidate = |name: Text, depth: u32, selection: Selection| {
-        let old = candidates.get_or_insert_with(name, || SelectionCandidate {
-            depth: u32::MAX,
-            selection: SmallVec::new(),
-        });
+    let mut curr_depth = TypeList::new();
+    let mut next_depth = TypeList::new();
 
-        if depth < old.depth {
-            old.depth = depth;
-            old.selection.clear();
-            old.selection.push(selection);
-        } else if depth == old.depth {
-            old.selection.push(selection);
+    let mut visited = HashSet::default();
+
+    visited.insert(typ);
+    curr_depth.push(typ);
+
+    while !curr_depth.is_empty() {
+        for mut curr in curr_depth.drain(..) {
+            if let TypeKind::Pointer(inner) = curr.lookup(db) {
+                curr = *inner;
+            }
+
+            let members = selection_members(db, curr).await.as_ref()?;
+            for (&name, list) in members.selections.iter() {
+                if selections.contains_key(&name) {
+                    continue;
+                }
+
+                selections.entry(name).or_default().extend_from_slice(list);
+            }
+
+            for &embedded in members.embedded.iter() {
+                if !visited.contains(&embedded) {
+                    next_depth.push(embedded);
+                }
+            }
         }
+
+        for next in next_depth.drain(..) {
+            if visited.insert(next) {
+                curr_depth.push(next);
+            }
+        }
+    }
+
+    Ok(selections)
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SelectionMembers {
+    selections: IndexMap<Text, SelectionList>,
+    embedded: TypeList,
+}
+
+#[haste::query]
+async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<SelectionMembers> {
+    let mut selections = IndexMap::<Text, SelectionList>::new();
+    let mut embedded = TypeList::new();
+
+    let mut add_candidate = |name: Text, selection: Selection| {
+        selections
+            .get_or_insert_with(name, SelectionList::new)
+            .push(selection);
     };
 
     if let &TypeKind::Declared(decl) = typ.lookup(db) {
@@ -1095,12 +1130,18 @@ async fn selector_candidates(
                 },
             );
 
-            let method_type = match decl_signature(db, method_decl).await? {
+            let decl_type = match decl_signature(db, method_decl).await? {
                 Signature::Value(typ) => typ,
                 _ => unreachable!("methods must be values"),
             };
 
-            add_candidate(method, 0, Selection::Method(method_type));
+            let TypeKind::Function(func) = decl_type.lookup(db) else {
+                unreachable!("methods have function type")
+            };
+
+            let method_func = func.without_receiver();
+            let method_type = TypeKind::Function(method_func).insert(db);
+            add_candidate(method, Selection::Method(method_type));
         }
 
         typ = underlying_type_for_decl(db, decl).await?;
@@ -1109,12 +1150,10 @@ async fn selector_candidates(
     match typ.lookup(db) {
         TypeKind::Struct(strukt) => {
             for field in strukt.fields.iter() {
-                if let Some(name) = field.name {
-                    add_candidate(name, 0, Selection::Element(field.typ));
-                }
-
+                let Some(name) = field.name else { continue };
+                add_candidate(name, Selection::Field(field.typ));
                 if field.embedded {
-                    tracing::warn!("resolve embedded fields");
+                    embedded.push(field.typ);
                 }
             }
         }
@@ -1122,51 +1161,75 @@ async fn selector_candidates(
             let mut buffer = None;
             for method in interface.methods(db, &mut buffer) {
                 let signature = TypeKind::Function(method.signature.clone()).insert(db);
-                add_candidate(method.name, 0, Selection::Element(signature));
+                add_candidate(method.name, Selection::Method(signature));
             }
         }
         _ => {}
     }
 
-    Ok(candidates)
+    Ok(SelectionMembers {
+        selections,
+        embedded,
+    })
+}
+
+pub enum InterfaceError {
+    MissingMethod(Text),
+    WrongSignature {
+        method: Text,
+        found: Type,
+        expected: Type,
+    },
+}
+
+impl std::fmt::Display for InterfaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterfaceError::MissingMethod(name) => write!(f, "missing method `{name}`"),
+            InterfaceError::WrongSignature {
+                method,
+                found,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "expected a method `{method}` with signature `{expected}`, but found `{found}`"
+                )
+            }
+        }
+    }
 }
 
 async fn satisfies_interface(
     db: &dyn crate::Db,
     typ: Type,
-    interface: InterfaceType,
-) -> Result<bool> {
-    if interface.is_empty() {
-        return Ok(true);
-    }
-
-    let inner_type = match typ.lookup(db) {
-        &TypeKind::Pointer(inner) => inner,
-        _ => typ,
-    };
-
-    let error_method;
-    let methods = match &interface {
-        InterfaceType::Methods(methods) => &methods[..],
-        InterfaceType::Error => {
-            error_method = [InterfaceType::error_method(db)];
-            &error_method
-        }
-    };
-
-    for method in methods.iter() {
-        let Some(found) = method_signature(db, inner_type, method.name).await.as_ref()? else {
+    interface: &InterfaceType,
+) -> Result<Result<(), InterfaceError>> {
+    let mut buffer = None;
+    for method in interface.methods(db, &mut buffer) {
+        let Some(selection) = resolve_selector(db, typ, method.name).await? else {
             // missing method
-            return Ok(false);
+            return Ok(Err(InterfaceError::MissingMethod(method.name)));
         };
 
-        if found != &method.signature {
-            // wrong signature
-            return Ok(false);
+        match selection {
+            Selection::Field(_) => return Ok(Err(InterfaceError::MissingMethod(method.name))),
+            Selection::Method(typ) => match typ.lookup(db) {
+                TypeKind::Function(func) => {
+                    if func != &method.signature {
+                        return Ok(Err(InterfaceError::WrongSignature {
+                            method: method.name,
+                            found: typ,
+                            expected: TypeKind::Function(method.signature.clone()).insert(db),
+                        }));
+                    }
+                }
+                _ => unreachable!("methods have function type"),
+            },
         }
     }
 
-    Ok(true)
+    Ok(Ok(()))
 }
 
 #[haste::query]

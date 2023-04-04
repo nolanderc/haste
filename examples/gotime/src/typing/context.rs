@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    eval::EvalContext, ConstValue, ConstantKind, FunctionType, InferredType, InterfaceMethod,
-    InterfaceType, Signature, StructType, Type, TypeKind, TypeList,
+    eval::EvalContext, ConstValue, ConstantKind, FunctionType, InferredType, InterfaceError,
+    InterfaceMethod, InterfaceType, Signature, StructType, Type, TypeKind, TypeList,
 };
 
 pub(super) struct TypingContext<'db> {
@@ -399,13 +399,21 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn check_assignable(&self, expected: Type, found: Type, expr: ExprId) -> Result<()> {
-        if !self.is_assignable(expected, found).await? {
-            let span = self.node_span(expr);
-            return Err(error!("type mismatch")
-                .label(span, format!("found `{found}`, but expected `{expected}`")));
+        match self.is_assignable(expected, found).await? {
+            AssignResult::Ok => Ok(()),
+            AssignResult::Incompatible => {
+                let span = self.node_span(expr);
+                Err(error!("type mismatch")
+                    .label(span, format!("found `{found}`, but expected `{expected}`")))
+            }
+            AssignResult::Interface(error) => {
+                let span = self.node_span(expr);
+                Err(
+                    error!("`{found}` does not implement the interface `{expected}`")
+                        .label(span, format!("{}", error)),
+                )
+            }
         }
-
-        Ok(())
     }
 
     /// Infers the type of an expression without necessarily verifying that the entire expression
@@ -535,9 +543,14 @@ impl<'db> TypingContext<'db> {
                         .label(self.node_span(base), "must be an interface"))
                 };
 
-                self.check_interface_satisfied(base_type, interface, target_type)
-                    .await
-                    .map_err(|error| error.label(self.node_span(expr), "in this type assertion"))?;
+                let target_core = super::underlying_type(self.db, target_type).await?;
+                if !matches!(target_core.lookup(self.db), TypeKind::Interface(_)) {
+                    self.check_interface_satisfied(base_type, interface, target_type)
+                        .await
+                        .map_err(|error| {
+                            error.label(self.node_span(expr), "required by this type assertion")
+                        })?;
+                }
 
                 Ok(Value(target_type))
             }
@@ -608,36 +621,8 @@ impl<'db> TypingContext<'db> {
             }
 
             Node::Index(target, index) => {
-                let target_type = self.infer_expr(target).await?;
-                let core_type = super::underlying_type(self.db, target_type).await?;
-                match core_type.lookup(self.db) {
-                    &TypeKind::Array(_, inner) | &TypeKind::Slice(inner) => {
-                        let index_type = self.infer_expr(index).await?;
-                        if !index_type.lookup(self.db).is_integer() {
-                            return Err(error!("expecetd an integer index").label(
-                                self.node_span(index),
-                                format!("this is of type `{index_type}`"),
-                            ));
-                        }
-                        Ok(Value(inner))
-                    }
-                    TypeKind::String => {
-                        let index_type = self.infer_expr(index).await?;
-                        if !index_type.lookup(self.db).is_integer() {
-                            return Err(error!("expecetd an integer index").label(
-                                self.node_span(index),
-                                format!("this is of type `{index_type}`"),
-                            ));
-                        }
-                        Ok(Value(TypeKind::Uint8.insert(self.db)))
-                    }
-                    &TypeKind::Map(key, value) => {
-                        self.check_expr(index, key).await?;
-                        Ok(Value(value))
-                    }
-                    _ => Err(error!("cannot index into value of type `{target_type}`")
-                        .label(self.node_span(expr), "")),
-                }
+                let (typ, _) = self.infer_index_type(target, index).await?;
+                Ok(Value(typ))
             }
             Node::SliceIndex(target, start, end) => {
                 let check_integer = |this: &Self, index: ExprId, typ: Type| {
@@ -812,15 +797,8 @@ impl<'db> TypingContext<'db> {
 
         if let Some(selection) = selection {
             match selection {
-                super::Selection::Element(typ) => Ok(InferredType::Value(typ)),
-                super::Selection::Method(typ) => {
-                    // the result is the method signature, with the first parameter
-                    // removed.
-                    let TypeKind::Function(func) = typ.lookup(self.db) else { unreachable!() };
-                    let applied_method = func.without_receiver();
-                    Ok(InferredType::Value(
-                        TypeKind::Function(applied_method).insert(self.db),
-                    ))
+                super::Selection::Field(typ) | super::Selection::Method(typ) => {
+                    Ok(InferredType::Value(typ))
                 }
             }
         } else {
@@ -1189,11 +1167,13 @@ impl<'db> TypingContext<'db> {
         target: ExprId,
         index: ExprId,
     ) -> Result<(Type, Option<Type>)> {
-        let mut target_type = self.infer_expr(target).await?;
+        let typ = self.infer_expr(target).await?;
+        let mut target_type = super::underlying_type(self.db, typ).await?;
 
         let typ = loop {
             match target_type.lookup(self.db) {
                 TypeKind::Pointer(inner) => target_type = *inner,
+
                 TypeKind::Slice(inner) => {
                     break self.check_array_index(*inner, None, index).await?
                 }
@@ -1211,12 +1191,10 @@ impl<'db> TypingContext<'db> {
                 }
 
                 _ => {
-                    return Err(
-                        error!("cannot index into value of type `{target_type}`").label(
-                            self.node_span(target),
-                            "expected an array, slice, string or map",
-                        ),
-                    )
+                    return Err(error!("cannot index into value of type `{typ}`").label(
+                        self.node_span(target),
+                        "expected an array, slice, string or map",
+                    ))
                 }
             }
         };
@@ -1648,6 +1626,13 @@ impl<'db> TypingContext<'db> {
                 }
             }
             TypeKind::Function(func) => {
+                if spread.is_some() && !func.variadic {
+                    return Err(error!(
+                        "spread oprator (...) may only be used for variadic functions"
+                    )
+                    .label(self.node_span(call_expr), ""));
+                }
+
                 if args.len() == 1 && func.inputs > 1 {
                     let arg_call = arg_exprs[0];
                     if let Node::Call(arg_target, arg_args, arg_spread) = self.nodes.kind(arg_call)
@@ -1674,8 +1659,15 @@ impl<'db> TypingContext<'db> {
                     return Err(self.emit_invalid_argument_count(target, func, args, call_expr));
                 }
 
-                for (expected, &arg) in func.inputs().zip(arg_exprs) {
-                    self.check_expr(arg, expected).await?;
+                let last_index = arg_exprs.len().saturating_sub(1);
+
+                for (index, (expected, &arg)) in func.inputs().zip(arg_exprs).enumerate() {
+                    if spread.is_some() && index == last_index {
+                        self.check_expr(arg, TypeKind::Slice(expected).insert(self.db))
+                            .await?;
+                    } else {
+                        self.check_expr(arg, expected).await?;
+                    }
                 }
 
                 Ok(TypeList::from(func.outputs()))
@@ -1752,12 +1744,12 @@ impl<'db> TypingContext<'db> {
 
     /// Determines if the two types are comparable.
     async fn is_comparable(&self, lhs: Type, rhs: Type) -> Result<bool> {
-        if self.is_assignable(lhs, rhs).await? {
+        if self.is_assignable(lhs, rhs).await?.is_ok() {
             if rhs.lookup(self.db).is_nil() && lhs.lookup(self.db).is_nillable(self.db).await? {
                 return Ok(true);
             }
             return super::comparable(self.db, lhs).await;
-        } else if self.is_assignable(rhs, lhs).await? {
+        } else if self.is_assignable(rhs, lhs).await?.is_ok() {
             if lhs.lookup(self.db).is_nil() && rhs.lookup(self.db).is_nillable(self.db).await? {
                 return Ok(true);
             }
@@ -1769,36 +1761,52 @@ impl<'db> TypingContext<'db> {
     }
 
     /// Can `source` be assigned to a destination of type `target`?
-    async fn is_assignable(&self, target: Type, source: Type) -> Result<bool> {
+    async fn is_assignable(&self, target: Type, source: Type) -> Result<AssignResult> {
         if target == source {
-            return Ok(true);
+            return Ok(AssignResult::Ok);
         }
 
         let target_kind = target.lookup(self.db);
         let source_kind = source.lookup(self.db);
 
-        let assignable = match (target_kind, source_kind) {
-            (target, TypeKind::Untyped(ConstantKind::Boolean)) if target.is_bool() => true,
-            (target, TypeKind::Untyped(ConstantKind::Integer)) if target.is_integer() => true,
-            (target, TypeKind::Untyped(ConstantKind::Rune)) if target.is_integer() => true,
-            (target, TypeKind::Untyped(ConstantKind::Float)) if target.is_float() => true,
-            (target, TypeKind::Untyped(ConstantKind::Complex)) if target.is_complex() => true,
-            (target, TypeKind::Untyped(ConstantKind::String)) if target.is_string() => true,
+        Ok(match (target_kind, source_kind) {
+            (target, TypeKind::Untyped(ConstantKind::Boolean)) if target.is_bool() => {
+                AssignResult::Ok
+            }
+            (target, TypeKind::Untyped(ConstantKind::Integer)) if target.is_integer() => {
+                AssignResult::Ok
+            }
+            (target, TypeKind::Untyped(ConstantKind::Rune)) if target.is_integer() => {
+                AssignResult::Ok
+            }
+            (target, TypeKind::Untyped(ConstantKind::Float)) if target.is_float() => {
+                AssignResult::Ok
+            }
+            (target, TypeKind::Untyped(ConstantKind::Complex)) if target.is_complex() => {
+                AssignResult::Ok
+            }
+            (target, TypeKind::Untyped(ConstantKind::String)) if target.is_string() => {
+                AssignResult::Ok
+            }
             (target, TypeKind::Untyped(ConstantKind::Nil))
                 if target.is_nillable(self.db).await? =>
             {
-                true
+                AssignResult::Ok
             }
 
-            (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => true,
+            (_, TypeKind::Untyped(_)) if self.is_representable(target, source).await? => {
+                AssignResult::Ok
+            }
             (
                 &TypeKind::Channel(target_dir, target_inner),
                 &TypeKind::Channel(source_dir, source_inner),
-            ) if target_inner == source_inner && target_dir.is_subset_of(source_dir) => true,
+            ) if target_inner == source_inner && target_dir.is_subset_of(source_dir) => {
+                AssignResult::Ok
+            }
 
             _ => {
                 if self.is_arbitrary_type(target_kind) {
-                    return Ok(true);
+                    return Ok(AssignResult::Ok);
                 }
 
                 let target_core = super::underlying_type(self.db, target).await?;
@@ -1806,27 +1814,31 @@ impl<'db> TypingContext<'db> {
                 let target_core_kind = target_core.lookup(self.db);
 
                 if let TypeKind::Interface(interface) = target_core_kind {
-                    return self.is_interface_satisfied(interface, source).await;
+                    match self.is_interface_satisfied(interface, source).await? {
+                        Ok(()) => return Ok(AssignResult::Ok),
+                        Err(error) => return Ok(AssignResult::Interface(error)),
+                    }
                 }
 
                 if let TypeKind::Pointer(inner) = target_core_kind {
                     if let TypeKind::Interface(interface) = inner.lookup(self.db) {
-                        return self.is_interface_satisfied(interface, source).await;
+                        match self.is_interface_satisfied(interface, source).await? {
+                            Ok(()) => return Ok(AssignResult::Ok),
+                            Err(error) => return Ok(AssignResult::Interface(error)),
+                        }
                     }
                 }
 
                 if !target_kind.is_declared() || !source_kind.is_declared() {
                     let source_core = super::underlying_type(self.db, source).await?;
                     if target_core == source_core {
-                        return Ok(true);
+                        return Ok(AssignResult::Ok);
                     }
                 }
 
-                false
+                AssignResult::Incompatible
             }
-        };
-
-        Ok(assignable)
+        })
     }
 
     async fn check_interface_satisfied(
@@ -1835,26 +1847,25 @@ impl<'db> TypingContext<'db> {
         interface: &InterfaceType,
         source: Type,
     ) -> Result<()> {
-        if !self.is_interface_satisfied(interface, source).await? {
-            return Err(error!(
-                "the type `{source}` does not implement the interface `{target}`"
-            ));
+        match self.is_interface_satisfied(interface, source).await? {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error!(
+                "`{source}` does not implement the interface `{target}`: {error}"
+            )),
         }
-
-        Ok(())
     }
 
     async fn is_interface_satisfied(
         &self,
         interface: &InterfaceType,
         source: Type,
-    ) -> Result<bool> {
+    ) -> Result<Result<(), InterfaceError>> {
         if interface.is_empty() {
             // all types trivially implement the empty interface
-            return Ok(true);
+            return Ok(Ok(()));
         }
 
-        super::satisfies_interface(self.db, source, interface.clone()).await
+        super::satisfies_interface(self.db, source, interface).await
     }
 
     fn is_arbitrary_type(&self, kind: &TypeKind) -> bool {
@@ -1898,9 +1909,9 @@ impl<'db> TypingContext<'db> {
 
     /// Determines if the two types are ordered.
     async fn is_ordered(&self, lhs: Type, rhs: Type) -> Result<bool> {
-        if self.is_assignable(lhs, rhs).await? {
+        if self.is_assignable(lhs, rhs).await?.is_ok() {
             return super::ordered(self.db, lhs).await;
-        } else if self.is_assignable(rhs, lhs).await? {
+        } else if self.is_assignable(rhs, lhs).await?.is_ok() {
             return super::ordered(self.db, rhs).await;
         }
 
@@ -1909,7 +1920,7 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn can_convert(&mut self, target: Type, source: Type) -> Result<bool> {
-        if self.is_assignable(target, source).await?
+        if self.is_assignable(target, source).await?.is_ok()
             || self.is_representable(target, source).await?
         {
             return Ok(true);
@@ -2396,11 +2407,11 @@ impl<'db> TypingContext<'db> {
         if exprs.len() == 1 && output_types.len() > 1 {
             let types = self.infer_assignment(exprs[0]).await?;
 
-            if types.len() < output_types.len() {
-                return Err(error!("too few values in return")
+            if types.len() != output_types.len() {
+                return Err(error!("invalid number of return arguments")
                     .label(
                         self.node_span(exprs[0]),
-                        format!("found {}", crate::util::fmt_tuple(&output_types)),
+                        format!("found {}", crate::util::fmt_tuple(&types)),
                     )
                     .label(
                         self.range_span(output_nodes).unwrap(),
@@ -2408,11 +2419,8 @@ impl<'db> TypingContext<'db> {
                     ));
             }
 
-            if types[..output_types.len()] != output_types[..] {
-                return Err(error!("invalid return type").label(
-                    self.node_span(stmt),
-                    format!("expected {}", crate::util::fmt_tuple(&output_types)),
-                ));
+            for (&found, &expected) in types.iter().zip(&output_types) {
+                self.check_assignable(expected, found, exprs[0]).await?;
             }
         } else {
             if exprs.len() < output_types.len() {
@@ -2446,5 +2454,21 @@ impl<'db> TypingContext<'db> {
             self.check_stmt(*stmt).await?;
         }
         Ok(())
+    }
+}
+
+enum AssignResult {
+    Ok,
+    Incompatible,
+    Interface(InterfaceError),
+}
+
+impl AssignResult {
+    /// Returns `true` if the assign result is [`Ok`].
+    ///
+    /// [`Ok`]: AssignResult::Ok
+    #[must_use]
+    fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok)
     }
 }

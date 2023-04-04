@@ -1189,6 +1189,7 @@ impl<'a> Parser<'a> {
                 self.emit_type(Node::Selector(base, member), span)
             } else {
                 self.try_type()?.unwrap_or_else(|| {
+                    is_embedded = true;
                     let name = idents[0];
                     self.emit_type(Node::Name(name.text), name.span)
                 })

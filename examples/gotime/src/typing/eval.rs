@@ -6,7 +6,7 @@ use crate::{
     index_map::IndexMap,
     naming::{self, DeclId, DeclPath, GlobalSymbol, Symbol},
     syntax::{self, ExprId, Node, NodeId},
-    typing::{ConstantKind, TypeKind},
+    typing::{ConstantKind, Float, TypeKind},
     Result,
 };
 
@@ -54,8 +54,12 @@ impl<'a> EvalContext<'a> {
                         .label(self.node_span(expr), ""));
                 };
                 match symbol {
-                    naming::Symbol::Local(_) => {
-                        Err(bug!("const-evaluate local variable").label(self.node_span(expr), ""))
+                    naming::Symbol::Local(local) => {
+                        if let Some(value) = self.types.constants.get(&local) {
+                            return Ok(value.clone());
+                        }
+                        Err(error!("cannot evaluate variable at compile-time")
+                            .label(self.node_span(expr), ""))
                     }
                     naming::Symbol::Global(global) => match global {
                         GlobalSymbol::Package(_) => unreachable!("not a value"),
@@ -63,7 +67,10 @@ impl<'a> EvalContext<'a> {
                             naming::Builtin::Iota => {
                                 Ok(ConstValue::Integer(self.path.sub.row.into()))
                             }
-                            _ => unreachable!("not a constant"),
+                            naming::Builtin::True => Ok(ConstValue::Bool(true)),
+                            naming::Builtin::False => Ok(ConstValue::Bool(false)),
+                            _ => Err(error!("the value cannot be known at compile-time")
+                                .label(self.node_span(expr), "")),
                         },
                         GlobalSymbol::Decl(decl) => super::const_value(self.db, decl).await,
                     },
@@ -80,11 +87,19 @@ impl<'a> EvalContext<'a> {
             )),
             Node::Rune(rune) => Ok(ConstValue::Integer((rune as u32).into())),
 
+            Node::FloatSmall(value) => Ok(ConstValue::Float(Float { bits: value.bits })),
+
             Node::Unary(op, expr) => {
                 let value = self.eval_boxed(expr).await?;
                 match op {
                     syntax::UnaryOperator::Plus => Ok(value),
-                    syntax::UnaryOperator::Minus => Ok(ConstValue::Integer(-value.integer())),
+                    syntax::UnaryOperator::Minus => match value {
+                        ConstValue::Integer(integer) => {
+                            Ok(ConstValue::Integer(integer.wrapping_neg()))
+                        }
+                        ConstValue::Float(float) => Ok(ConstValue::Float(Float::new(-float.get()))),
+                        _ => unreachable!("cannot negate `{value:?}`"),
+                    },
                     syntax::UnaryOperator::Not => Ok(ConstValue::Bool(!value.bool())),
                     syntax::UnaryOperator::Xor => {
                         let typ = self.types.nodes[&expr.node].value();
@@ -127,17 +142,46 @@ impl<'a> EvalContext<'a> {
                             (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
                                 ConstValue::Integer(lhs + rhs)
                             }
+                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
+                                ConstValue::Float(Float::new(lhs.get() + rhs.get()))
+                            }
+
+                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
+                                ConstValue::Float(Float::new(*lhs as f64 + rhs.get()))
+                            }
+                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
+                                ConstValue::Float(Float::new(lhs.get() + *rhs as f64))
+                            }
+
+                            (ConstValue::String(lhs), ConstValue::String(rhs)) => {
+                                let mut buffer = Vec::with_capacity(lhs.len() + rhs.len());
+                                buffer.extend_from_slice(lhs);
+                                buffer.extend_from_slice(rhs);
+                                ConstValue::String(crate::util::bstr_arc(buffer.into()))
+                            }
                             _ => unreachable!("cannot add `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Sub => match (&lhs, &rhs) {
                             (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
                                 ConstValue::Integer(lhs - rhs)
                             }
+                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
+                                ConstValue::Float(Float::new(lhs.get() - rhs.get()))
+                            }
+                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
+                                ConstValue::Float(Float::new(*lhs as f64 - rhs.get()))
+                            }
+                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
+                                ConstValue::Float(Float::new(lhs.get() - *rhs as f64))
+                            }
                             _ => unreachable!("cannot subtract `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Mul => match (&lhs, &rhs) {
                             (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
                                 ConstValue::Integer(lhs * rhs)
+                            }
+                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
+                                ConstValue::Float(Float::new(lhs.get() * rhs.get()))
                             }
                             _ => unreachable!("cannot multiply `{lhs}` and `{rhs}`"),
                         },
@@ -150,6 +194,32 @@ impl<'a> EvalContext<'a> {
                                 }
                                 ConstValue::Integer(lhs / rhs)
                             }
+                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
+                                if rhs.get() == 0.0 {
+                                    return Err(error!("divison by zero")
+                                        .label(self.node_span(pair[0]), "in this division")
+                                        .label(self.node_span(pair[1]), "this was zero"));
+                                }
+                                ConstValue::Float(Float::new(lhs.get() / rhs.get()))
+                            }
+
+                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
+                                if rhs.get() == 0.0 {
+                                    return Err(error!("divison by zero")
+                                        .label(self.node_span(pair[0]), "in this division")
+                                        .label(self.node_span(pair[1]), "this was zero"));
+                                }
+                                ConstValue::Float(Float::new(*lhs as f64 / rhs.get()))
+                            }
+                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
+                                if *rhs == 0 {
+                                    return Err(error!("divison by zero")
+                                        .label(self.node_span(pair[0]), "in this division")
+                                        .label(self.node_span(pair[1]), "this was zero"));
+                                }
+                                ConstValue::Float(Float::new(lhs.get() / *rhs as f64))
+                            }
+
                             _ => unreachable!("cannot divide `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Rem => {
@@ -196,6 +266,7 @@ impl<'a> EvalContext<'a> {
                 enum ConstFunc {
                     IntCast,
                     Sizeof,
+                    Offsetof,
                     Len,
                     Cap,
                     Real,
@@ -228,6 +299,8 @@ impl<'a> EvalContext<'a> {
                         Some(Symbol::Global(GlobalSymbol::Decl(decl))) => {
                             if super::is_unsafe_decl(self.db, *decl, "Sizeof") {
                                 Some(ConstFunc::Sizeof)
+                            } else if super::is_unsafe_decl(self.db, *decl, "Offsetof") {
+                                Some(ConstFunc::Offsetof)
                             } else {
                                 None
                             }
@@ -255,8 +328,9 @@ impl<'a> EvalContext<'a> {
                         }
                     },
 
-                    // TODO: actually compute the size of types
+                    // TODO: actually compute the memory layout of types
                     ConstFunc::Sizeof => ConstValue::Integer(8),
+                    ConstFunc::Offsetof => ConstValue::Integer(0),
 
                     ConstFunc::Len => {
                         let inferred = self.types.nodes.get(&exprs[0].node).ok_or_else(|| {

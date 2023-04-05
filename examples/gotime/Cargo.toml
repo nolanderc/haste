@@ -23,6 +23,7 @@ phf = { version = "0.11.1", features = ["macros"] }
 arrayvec = "0.7.2"
 tikv-jemallocator = "0.5.0"
 bitflags = "2.0.2"
+rug = { version = "1.19.2", features = ["complex"] }
 
 [dependencies.bstr]
 version = "1.2.0"

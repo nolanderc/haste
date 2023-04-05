@@ -798,6 +798,7 @@ fn write_node(
                     _ => unreachable!(),
                 }
 
+                write!(out, "<-")?;
                 write_node(out, nodes, channel.node)?;
                 write!(out, ":")?;
                 write_case_statements(out, nodes, block)

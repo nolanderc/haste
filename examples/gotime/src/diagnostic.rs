@@ -174,13 +174,41 @@ struct VisitedSet {
     formatted: HashSet<*const Inner>,
 }
 
+#[derive(Default)]
+struct Stats {
+    errors: usize,
+    bugs: usize,
+}
+
 impl Diagnostic {
     pub async fn write(&self, db: &dyn crate::Db, out: &mut impl Write) -> std::fmt::Result {
         // for each source file: get its text and line numbers
         let sources = self.get_source_infos(db).await;
 
+        let mut stats = Stats::default();
+
         let mut visited = VisitedSet::default();
-        self.format(&sources, &mut Vec::new(), out, &mut visited)?;
+        self.format(&sources, &mut Vec::new(), out, &mut visited, &mut stats)?;
+
+        let numbers = [
+            (Severity::Error, "errors", stats.errors),
+            (Severity::Bug, "compiler bugs", stats.bugs),
+        ];
+        let mut total = 0;
+        for (severity, name, count) in numbers {
+            if count == 0 {
+                continue;
+            }
+
+            use Style::{Bold, Default};
+            let style = severity.style();
+            writeln!(out, "{style}{Bold}{name}{Default}: {}", count)?;
+            total += count;
+        }
+
+        if total != 0 {
+            writeln!(out)?;
+        }
 
         Ok(())
     }
@@ -191,6 +219,7 @@ impl Diagnostic {
         attachments: &mut Vec<&'a Attachment>,
         out: &mut impl Write,
         visited: &mut VisitedSet,
+        stats: &mut Stats,
     ) -> FmtResult<()> {
         if !visited.formatted.insert(Arc::as_ptr(&self.inner)) {
             return Ok(());
@@ -198,9 +227,14 @@ impl Diagnostic {
 
         match &*self.inner {
             Inner::Message(message) => {
+                match message.severity {
+                    Severity::Error => stats.errors += 1,
+                    Severity::Bug => stats.bugs += 1,
+                }
+
                 let severity_text = match message.severity {
                     Severity::Error => "error",
-                    Severity::Bug => "bug",
+                    Severity::Bug => "compiler bug",
                 };
                 let severity_style = message.severity.style();
                 let bold = Style::Bold;
@@ -222,12 +256,12 @@ impl Diagnostic {
             }
             Inner::Attachment(parent, new_attachments) => {
                 attachments.extend(new_attachments.iter().rev());
-                parent.format(sources, attachments, out, visited)?;
+                parent.format(sources, attachments, out, visited, stats)?;
                 attachments.truncate(attachments.len() - new_attachments.len());
             }
             Inner::Combine(combined) => {
                 for diagnostic in combined {
-                    diagnostic.format(sources, attachments, out, visited)?;
+                    diagnostic.format(sources, attachments, out, visited, stats)?;
                 }
             }
         }

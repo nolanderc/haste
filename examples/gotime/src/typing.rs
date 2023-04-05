@@ -23,6 +23,7 @@ pub struct Storage(
     decl_signature,
     type_check_body,
     underlying_type_for_decl,
+    inner_type_for_decl,
     const_value,
     recursive_members,
     selection_members,
@@ -164,7 +165,7 @@ impl TypeKind {
             TypeKind::Pointer(_) => nillable | comparable,
             TypeKind::Slice(_) => nillable,
             TypeKind::Map(_, _) => nillable,
-            TypeKind::Channel(_, _) => nillable,
+            TypeKind::Channel(_, _) => nillable | comparable,
             TypeKind::Function(_) => nillable,
 
             TypeKind::Struct(_) => TypeClass::empty(),
@@ -238,34 +239,46 @@ impl TypeKind {
         self.class().contains(TypeClass::UNTYPED)
     }
 
-    pub fn length(&self, db: &dyn crate::Db) -> Option<Type> {
-        match self {
-            Self::Pointer(inner) if matches!(inner.lookup(db), TypeKind::Array(_, _)) => {
-                Some(Self::Untyped(ConstantKind::Integer).insert(db))
+    pub async fn length(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
+        let mut kind = self;
+
+        if let &TypeKind::Pointer(inner) = kind {
+            let inner_core = underlying_type(db, inner).await?;
+            let inner_kind = inner_core.lookup(db);
+            if let TypeKind::Array(_, _) = inner_kind {
+                kind = inner_kind;
             }
-            Self::Array(_, _) => Some(Self::Untyped(ConstantKind::Integer).insert(db)),
+        }
+
+        Ok(Some(match kind {
+            Self::Array(_, _) => Self::Untyped(ConstantKind::Integer).insert(db),
 
             Self::Untyped(ConstantKind::String)
             | Self::String
             | Self::Slice(_)
             | Self::Map(_, _)
-            | Self::Channel(_, _) => Some(Self::Int.insert(db)),
+            | Self::Channel(_, _) => Self::Int.insert(db),
 
-            _ => None,
-        }
+            _ => return Ok(None),
+        }))
     }
 
-    pub fn capacity(&self, db: &dyn crate::Db) -> Option<Type> {
-        match self {
-            Self::Pointer(inner) if matches!(inner.lookup(db), TypeKind::Array(_, _)) => {
-                Some(Self::Untyped(ConstantKind::Integer).insert(db))
+    pub async fn capacity(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
+        let mut kind = self;
+
+        if let &TypeKind::Pointer(inner) = kind {
+            let inner_core = underlying_type(db, inner).await?;
+            let inner_kind = inner_core.lookup(db);
+            if let TypeKind::Array(_, _) = inner_kind {
+                kind = inner_kind;
             }
-            Self::Array(_, _) => Some(Self::Untyped(ConstantKind::Integer).insert(db)),
-
-            Self::Slice(_) | Self::Channel(_, _) => Some(Self::Int.insert(db)),
-
-            _ => None,
         }
+
+        Ok(Some(match kind {
+            Self::Array(_, _) => Self::Untyped(ConstantKind::Integer).insert(db),
+            Self::Slice(_) | Self::Channel(_, _) => Self::Int.insert(db),
+            _ => return Ok(None),
+        }))
     }
 
     pub fn bits(&self) -> Option<u32> {
@@ -381,6 +394,17 @@ impl FunctionType {
         FunctionType {
             types: self.types[1..].into(),
             inputs: self.inputs - 1,
+            variadic: self.variadic,
+        }
+    }
+
+    fn with_receiever(&self, typ: Type) -> FunctionType {
+        let mut types = TypeList::with_capacity(self.types.len() + 1);
+        types.push(typ);
+        types.extend_from_slice(&self.types);
+        FunctionType {
+            types,
+            inputs: self.inputs + 1,
             variadic: self.variadic,
         }
     }
@@ -653,6 +677,12 @@ impl InferredType {
             InferredType::Type(_) => unreachable!("expected a value but found a type"),
         }
     }
+
+    fn inner(self) -> Type {
+        match self {
+            Self::Value(typ) | Self::Type(typ) => typ,
+        }
+    }
 }
 
 /// Get the type of the given symbol
@@ -808,6 +838,8 @@ pub struct TypingInfo {
     nodes: IndexMap<NodeId, InferredType>,
     /// The type of local variables.
     locals: IndexMap<naming::Local, InferredType>,
+    /// Value of all constants in the declaration.
+    constants: IndexMap<naming::Local, ConstValue>,
 }
 
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
@@ -919,6 +951,14 @@ async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
 #[clone]
 #[lookup(haste::query_cache::TrackedStrategy)]
 async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
+    let inner = inner_type_for_decl(db, decl).await?;
+    underlying_type(db, inner).await
+}
+
+#[haste::query]
+#[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
+async fn inner_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
     let mut ctx = TypingContext::new(db, decl).await?;
     let path = ctx.path;
 
@@ -926,8 +966,7 @@ async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Ty
 
     match path.sub.lookup_in(declaration) {
         naming::SingleDecl::TypeDef(spec) | naming::SingleDecl::TypeAlias(spec) => {
-            let inner = ctx.resolve_precise(spec.inner).await?;
-            underlying_type(db, inner).await
+            ctx.resolve_precise(spec.inner).await
         }
 
         _ => Err(error!("expected a type, but found a value")
@@ -939,6 +978,7 @@ async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Ty
 pub enum ConstValue {
     Bool(bool),
     Integer(i128),
+    Float(Float),
     String(Arc<BStr>),
 }
 
@@ -947,6 +987,7 @@ impl std::fmt::Display for ConstValue {
         match self {
             ConstValue::Bool(value) => value.fmt(f),
             ConstValue::Integer(value) => value.fmt(f),
+            ConstValue::Float(value) => value.fmt(f),
             ConstValue::String(value) => write!(f, "{:?}", value),
         }
     }
@@ -972,6 +1013,33 @@ impl ConstValue {
             (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => lhs.cmp(rhs),
             _ => unreachable!("cannot compare `{self}` and `{other}`"),
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Float {
+    bits: u64,
+}
+
+impl std::fmt::Debug for Float {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl std::fmt::Display for Float {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl Float {
+    pub fn new(x: f64) -> Self {
+        Self { bits: x.to_bits() }
+    }
+
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.bits)
     }
 }
 

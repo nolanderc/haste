@@ -487,7 +487,7 @@ macro_rules! node_id_wrapper {
 
         #[allow(unused)]
         impl $range {
-            fn new(nodes: NodeRange) -> Self {
+            pub fn new(nodes: NodeRange) -> Self {
                 Self { nodes }
             }
 

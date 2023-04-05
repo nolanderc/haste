@@ -765,7 +765,7 @@ impl<'a> Parser<'a> {
             Ok(())
         })?;
 
-        let typ = self.try_type()?.or(*prev_type);
+        let mut typ = self.try_type()?;
 
         let values = if self.eat(Token::Assign) {
             ExprRange::new(self.multi(|this| loop {
@@ -776,6 +776,7 @@ impl<'a> Parser<'a> {
                 }
             })?)
         } else if let Some(prev) = prev_value {
+            typ = typ.or(*prev_type);
             *prev
         } else {
             return Err(self.emit_expected("a constant initializer: `= <expr>`"));
@@ -1699,44 +1700,49 @@ impl<'a> Parser<'a> {
 
     fn try_select_case(&mut self) -> Result<Option<NodeId>> {
         if let Some(token) = self.try_expect(Token::Case) {
-            let expr = self.expression()?;
-
             enum Kind {
                 Send(SendStmt),
                 Recv(Option<RecvBindings>, Option<AssignOrDefine>, ExprId),
             }
 
             let kind = if self.eat(Token::LThinArrow) {
-                let channel = expr;
-                let value = self.expression()?;
-                Kind::Send(SendStmt { channel, value })
+                let channel = self.expression()?;
+                Kind::Recv(None, None, channel)
             } else {
-                let value = expr;
-                let success = if self.eat(Token::Comma) {
-                    Some(self.expression()?)
+                let expr = self.expression()?;
+                if self.eat(Token::LThinArrow) {
+                    let channel = expr;
+                    let value = self.expression()?;
+                    Kind::Send(SendStmt { channel, value })
                 } else {
-                    None
-                };
+                    let value = expr;
+                    let success = if self.eat(Token::Comma) {
+                        Some(self.expression()?)
+                    } else {
+                        None
+                    };
 
-                let assign_kind = match () {
-                    _ if self.eat(Token::Define) => Some(AssignOrDefine::Define),
-                    _ if self.eat(Token::Assign) => Some(AssignOrDefine::Assign),
-                    _ if success.is_some() => return Err(self.emit_unexpected_token()),
-                    _ => None,
-                };
+                    let assign_kind = match () {
+                        _ if self.eat(Token::Define) => Some(AssignOrDefine::Define),
+                        _ if self.eat(Token::Assign) => Some(AssignOrDefine::Assign),
+                        _ if success.is_some() => return Err(self.emit_unexpected_token()),
+                        _ => None,
+                    };
 
-                let bindings;
-                let channel;
+                    let bindings;
+                    let channel;
 
-                if assign_kind.is_none() {
-                    bindings = None;
-                    channel = value;
-                } else {
-                    bindings = Some(RecvBindings { value, success });
-                    channel = self.expression()?;
+                    if assign_kind.is_none() {
+                        bindings = None;
+                        channel = value;
+                    } else {
+                        bindings = Some(RecvBindings { value, success });
+                        self.expect(Token::LThinArrow)?;
+                        channel = self.expression()?;
+                    }
+
+                    Kind::Recv(bindings, assign_kind, channel)
                 }
-
-                Kind::Recv(bindings, assign_kind, channel)
             };
 
             let colon = self.expect(Token::Colon)?;

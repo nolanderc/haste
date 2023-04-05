@@ -394,33 +394,45 @@ impl<'db> NamingContext<'db> {
                         if let Some(success) = bindings.success {
                             self.resolve_expr(success);
                         }
-
                         self.resolve_block(block);
                     }
+                } else {
+                    self.resolve_block(block);
                 }
             }
             Node::SelectDefault(block) => self.resolve_block(block),
 
-            Node::Switch(init, expr, cases) => {
+            Node::Switch(init, cond, cases) => {
                 self.local_scope.enter();
                 if let Some(init) = init {
                     self.resolve_stmt(init);
                 }
-                if let Some(expr) = expr {
-                    self.resolve_expr(expr);
+                if let Some(cond) = cond {
+                    if let Node::TypeSwitch(name, expr) = self.nodes.kind(cond) {
+                        self.resolve_expr(expr);
+                        for (index, case) in self.nodes.indirect(cases).iter().enumerate() {
+                            self.local_scope.enter();
+                            if let Some(name) = name.and_then(|n| n.text) {
+                                self.local_scope.insert_local(
+                                    name,
+                                    cond.node,
+                                    index.try_into().expect("too many switch cases"),
+                                );
+                            }
+                            self.resolve_node(*case);
+                            self.local_scope.exit();
+                        }
+                    } else {
+                        self.resolve_expr(cond);
+                        self.resolve_range(cases);
+                    }
+                } else {
+                    self.resolve_range(cases);
                 }
-                self.resolve_range(cases);
                 self.local_scope.exit();
             }
-            Node::TypeSwitch(name, expr) => {
-                self.resolve_expr(expr);
-                if let Some(name) = name {
-                    if let Some(text) = name.text {
-                        // this will insert the binding into the parent switch's scope
-                        self.local_scope.insert_local(text, node, 0);
-                    }
-                }
-            }
+            Node::TypeSwitch(_, _) => unreachable!("handled as part of the switch case"),
+
             Node::SwitchCase(exprs, block) => {
                 if let Some(exprs) = exprs {
                     self.resolve_range(exprs);

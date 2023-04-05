@@ -7,19 +7,10 @@ import (
     "github.com/gin-gonic/gin"
 )
 
+type A struct {}
+type B A
+
 func main() {
-    fmt.Printf("hello")
+    const N = 3
+    var index [N]int
 }
-
-var bar = func() {
-    x := Parent{}
-    x.Method()
-}
-
-type Parent struct {
-    Inner
-}
-
-type Inner struct {}
-
-func (c Inner) Method() {}

@@ -810,7 +810,8 @@ impl<'db> TypingContext<'db> {
 
     async fn infer_recv_expr(&mut self, expr: ExprId) -> Result<Type> {
         let arg_type = self.infer_expr(expr).await?;
-        match arg_type.lookup(self.db) {
+        let core = super::underlying_type(self.db, arg_type).await?;
+        match core.lookup(self.db) {
             TypeKind::Channel(kind, inner) => {
                 if !kind.is_recv() {
                     return Err(error!("cannot receive values from a send-only channel")
@@ -1221,7 +1222,8 @@ impl<'db> TypingContext<'db> {
 
     async fn infer_recv_channel(&mut self, channel: ExprId) -> Result<(ChannelKind, Type)> {
         let typ = self.infer_expr(channel).await?;
-        match *typ.lookup(self.db) {
+        let core_type = super::underlying_type(self.db, typ).await?;
+        match *core_type.lookup(self.db) {
             TypeKind::Channel(kind, typ) if kind.is_recv() => Ok((kind, typ)),
             _ => Err(error!("unexpected type `{typ}`")
                 .label(self.node_span(channel), "expected a receive channel")),
@@ -1307,15 +1309,26 @@ impl<'db> TypingContext<'db> {
     }
 
     async fn evaluate_integer(&mut self, expr: ExprId) -> Result<i64> {
-        match self.evaluate(expr).await? {
-            ConstValue::Integer(value) => Ok(value.try_into().expect("handle large integers")),
+        match self.evaluate(expr).await?.as_integer() {
+            Some(value) => match value.to_i64() {
+                Some(value) => Ok(value),
+                None => {
+                    Err(error!("integer is too large: {value}").label(self.node_span(expr), ""))
+                }
+            },
             _ => Err(error!("cannot be represented as an integer").label(self.node_span(expr), "")),
         }
     }
 
     async fn evaluate_float(&mut self, expr: ExprId) -> Result<f64> {
         match self.evaluate(expr).await? {
-            ConstValue::Integer(value) => Ok(value as f64),
+            ConstValue::Number(value) => {
+                if value.imag().is_zero() {
+                    Ok(value.real().to_f64())
+                } else {
+                    Err(error!("cannot be represented as a float").label(self.node_span(expr), ""))
+                }
+            }
             _ => Err(error!("cannot be represented as a float").label(self.node_span(expr), "")),
         }
     }
@@ -1326,7 +1339,7 @@ impl<'db> TypingContext<'db> {
         }
 
         let value = match self.nodes.kind(expr) {
-            Node::IntegerSmall(value) => ConstValue::Integer(value.into()),
+            Node::IntegerSmall(value) => ConstValue::number(value),
             _ => self.eval_context().eval(expr).await?,
         };
 
@@ -2102,10 +2115,19 @@ impl<'db> TypingContext<'db> {
             }
             _ => {
                 if let &TypeKind::Declared(decl) = source.lookup(self.db) {
-                    if super::inner_type_for_decl(self.db, decl).await? == target {
+                    let source_inner = super::inner_type_for_decl(self.db, decl).await?;
+                    if source_inner == target {
                         return Ok(true);
                     }
+
+                    if let &TypeKind::Declared(decl) = target.lookup(self.db) {
+                        let target_inner = super::inner_type_for_decl(self.db, decl).await?;
+                        if source_inner == target_inner {
+                            return Ok(true);
+                        }
+                    }
                 }
+
                 Ok(false)
             }
         }

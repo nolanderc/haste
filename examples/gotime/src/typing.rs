@@ -974,26 +974,49 @@ async fn inner_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     Bool(bool),
-    Integer(i128),
-    Float(Float),
+    Number(Arc<rug::Complex>),
     String(Arc<BStr>),
+}
+
+impl Eq for ConstValue {}
+
+impl std::hash::Hash for ConstValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            ConstValue::Bool(bool) => bool.hash(state),
+            ConstValue::Number(number) => number.as_ord().hash(state),
+            ConstValue::String(string) => string.hash(state),
+        }
+    }
 }
 
 impl std::fmt::Display for ConstValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConstValue::Bool(value) => value.fmt(f),
-            ConstValue::Integer(value) => value.fmt(f),
-            ConstValue::Float(value) => value.fmt(f),
+            ConstValue::Number(value) => value.fmt(f),
             ConstValue::String(value) => write!(f, "{:?}", value),
         }
     }
 }
 
 impl ConstValue {
+    fn new_complex() -> rug::Complex {
+        rug::Complex::new(512)
+    }
+
+    pub fn number<T>(value: T) -> Self
+    where
+        rug::Complex: rug::Assign<T>,
+    {
+        let mut x = Self::new_complex();
+        rug::Assign::assign(&mut x, value);
+        Self::Number(Arc::new(x))
+    }
+
     fn bool(&self) -> bool {
         match self {
             ConstValue::Bool(value) => *value,
@@ -1001,45 +1024,25 @@ impl ConstValue {
         }
     }
 
-    fn integer(&self) -> i128 {
+    fn as_integer(&self) -> Option<rug::Integer> {
         match self {
-            ConstValue::Integer(value) => *value,
-            _ => unreachable!("expected an integer but found `{self}`"),
+            ConstValue::Number(value) => {
+                if value.imag().is_zero() && value.real().is_integer() {
+                    value.real().to_integer()
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
     fn try_order(&self, other: &ConstValue) -> std::cmp::Ordering {
         match (self, other) {
-            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => lhs.cmp(rhs),
+            (ConstValue::Number(lhs), ConstValue::Number(rhs)) => lhs.as_ord().cmp(rhs.as_ord()),
+            (ConstValue::String(lhs), ConstValue::String(rhs)) => lhs.cmp(rhs),
             _ => unreachable!("cannot compare `{self}` and `{other}`"),
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Float {
-    bits: u64,
-}
-
-impl std::fmt::Debug for Float {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.get().fmt(f)
-    }
-}
-
-impl std::fmt::Display for Float {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.get().fmt(f)
-    }
-}
-
-impl Float {
-    pub fn new(x: f64) -> Self {
-        Self { bits: x.to_bits() }
-    }
-
-    pub fn get(self) -> f64 {
-        f64::from_bits(self.bits)
     }
 }
 

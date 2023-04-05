@@ -5,8 +5,9 @@ use crate::{
     error,
     index_map::IndexMap,
     naming::{self, DeclId, DeclPath, GlobalSymbol, Symbol},
+    span::Span,
     syntax::{self, ExprId, Node, NodeId},
-    typing::{ConstantKind, Float, TypeKind},
+    typing::{ConstantKind, TypeKind},
     Result,
 };
 
@@ -64,9 +65,7 @@ impl<'a> EvalContext<'a> {
                     naming::Symbol::Global(global) => match global {
                         GlobalSymbol::Package(_) => unreachable!("not a value"),
                         GlobalSymbol::Builtin(builtin) => match builtin {
-                            naming::Builtin::Iota => {
-                                Ok(ConstValue::Integer(self.path.sub.row.into()))
-                            }
+                            naming::Builtin::Iota => Ok(ConstValue::number(self.path.sub.row)),
                             naming::Builtin::True => Ok(ConstValue::Bool(true)),
                             naming::Builtin::False => Ok(ConstValue::Bool(false)),
                             _ => Err(error!("the value cannot be known at compile-time")
@@ -82,34 +81,30 @@ impl<'a> EvalContext<'a> {
                 Ok(ConstValue::String(crate::util::bstr_arc(bytes.into())))
             }
 
-            Node::IntegerSmall(value) => Ok(ConstValue::Integer(
-                value.try_into().expect("handle large integers"),
-            )),
-            Node::Rune(rune) => Ok(ConstValue::Integer((rune as u32).into())),
+            Node::IntegerSmall(value) => Ok(ConstValue::number(value)),
+            Node::Rune(rune) => Ok(ConstValue::number(rune as u32)),
 
-            Node::FloatSmall(value) => Ok(ConstValue::Float(Float { bits: value.bits })),
+            Node::FloatSmall(value) => Ok(ConstValue::number(value.get())),
 
             Node::Unary(op, expr) => {
                 let value = self.eval_boxed(expr).await?;
                 match op {
                     syntax::UnaryOperator::Plus => Ok(value),
                     syntax::UnaryOperator::Minus => match value {
-                        ConstValue::Integer(integer) => {
-                            Ok(ConstValue::Integer(integer.wrapping_neg()))
-                        }
-                        ConstValue::Float(float) => Ok(ConstValue::Float(Float::new(-float.get()))),
+                        ConstValue::Number(value) => Ok(ConstValue::number(-&*value)),
                         _ => unreachable!("cannot negate `{value:?}`"),
                     },
                     syntax::UnaryOperator::Not => Ok(ConstValue::Bool(!value.bool())),
                     syntax::UnaryOperator::Xor => {
                         let typ = self.types.nodes[&expr.node].value();
                         let kind = typ.lookup(self.db);
+                        let int = self.as_integer(&value, || self.node_span(expr))?;
                         if kind.is_signed() {
-                            Ok(ConstValue::Integer((-1) ^ value.integer()))
+                            Ok(ConstValue::number((-1) ^ int))
                         } else {
                             let bits = kind.bits().unwrap();
-                            let mask = (1i128 << bits) - 1;
-                            Ok(ConstValue::Integer(mask ^ value.integer()))
+                            let mask = (1u128 << bits) - 1;
+                            Ok(ConstValue::number(mask ^ int))
                         }
                     }
                     syntax::UnaryOperator::Deref
@@ -125,6 +120,9 @@ impl<'a> EvalContext<'a> {
                 let interleaved = self.nodes.indirect(exprs);
                 let mut lhs = self.eval_boxed(interleaved[0]).await?;
 
+                let start = interleaved[0];
+                let mut end = interleaved[0];
+
                 for pair in interleaved[1..].chunks_exact(2) {
                     let Node::BinaryOp(op) = self.nodes.kind(pair[0]) else { unreachable!() };
                     let rhs = self.eval_boxed(pair[1]).await?;
@@ -139,18 +137,8 @@ impl<'a> EvalContext<'a> {
                         BinOp::Greater => ConstValue::Bool(lhs.try_order(&rhs).is_gt()),
                         BinOp::GreaterEqual => ConstValue::Bool(lhs.try_order(&rhs).is_ge()),
                         BinOp::Add => match (&lhs, &rhs) {
-                            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
-                                ConstValue::Integer(lhs + rhs)
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
-                                ConstValue::Float(Float::new(lhs.get() + rhs.get()))
-                            }
-
-                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
-                                ConstValue::Float(Float::new(*lhs as f64 + rhs.get()))
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
-                                ConstValue::Float(Float::new(lhs.get() + *rhs as f64))
+                            (ConstValue::Number(lhs), ConstValue::Number(rhs)) => {
+                                ConstValue::number(&**lhs + &**rhs)
                             }
 
                             (ConstValue::String(lhs), ConstValue::String(rhs)) => {
@@ -162,101 +150,95 @@ impl<'a> EvalContext<'a> {
                             _ => unreachable!("cannot add `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Sub => match (&lhs, &rhs) {
-                            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
-                                ConstValue::Integer(lhs - rhs)
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
-                                ConstValue::Float(Float::new(lhs.get() - rhs.get()))
-                            }
-                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
-                                ConstValue::Float(Float::new(*lhs as f64 - rhs.get()))
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
-                                ConstValue::Float(Float::new(lhs.get() - *rhs as f64))
+                            (ConstValue::Number(lhs), ConstValue::Number(rhs)) => {
+                                ConstValue::number(&**lhs - &**rhs)
                             }
                             _ => unreachable!("cannot subtract `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Mul => match (&lhs, &rhs) {
-                            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
-                                ConstValue::Integer(lhs * rhs)
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
-                                ConstValue::Float(Float::new(lhs.get() * rhs.get()))
+                            (ConstValue::Number(lhs), ConstValue::Number(rhs)) => {
+                                ConstValue::number(&**lhs * &**rhs)
                             }
                             _ => unreachable!("cannot multiply `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Div => match (&lhs, &rhs) {
-                            (ConstValue::Integer(lhs), ConstValue::Integer(rhs)) => {
-                                if *rhs == 0 {
+                            (ConstValue::Number(lhs), ConstValue::Number(rhs)) => {
+                                if rhs.real().is_zero() && rhs.imag().is_zero() {
                                     return Err(error!("divison by zero")
                                         .label(self.node_span(pair[0]), "in this division")
                                         .label(self.node_span(pair[1]), "this was zero"));
                                 }
-                                ConstValue::Integer(lhs / rhs)
-                            }
-                            (ConstValue::Float(lhs), ConstValue::Float(rhs)) => {
-                                if rhs.get() == 0.0 {
-                                    return Err(error!("divison by zero")
-                                        .label(self.node_span(pair[0]), "in this division")
-                                        .label(self.node_span(pair[1]), "this was zero"));
-                                }
-                                ConstValue::Float(Float::new(lhs.get() / rhs.get()))
-                            }
+                                let result = ConstValue::number(&**lhs / &**rhs);
 
-                            (ConstValue::Integer(lhs), ConstValue::Float(rhs)) => {
-                                if rhs.get() == 0.0 {
-                                    return Err(error!("divison by zero")
-                                        .label(self.node_span(pair[0]), "in this division")
-                                        .label(self.node_span(pair[1]), "this was zero"));
+                                if self.types.nodes[&pair[1].node]
+                                    .inner()
+                                    .lookup(self.db)
+                                    .is_integer()
+                                {
+                                    let ConstValue::Number(value) = result else { unreachable!() };
+                                    ConstValue::number(value.real().trunc_ref())
+                                } else {
+                                    result
                                 }
-                                ConstValue::Float(Float::new(*lhs as f64 / rhs.get()))
                             }
-                            (ConstValue::Float(lhs), ConstValue::Integer(rhs)) => {
-                                if *rhs == 0 {
-                                    return Err(error!("divison by zero")
-                                        .label(self.node_span(pair[0]), "in this division")
-                                        .label(self.node_span(pair[1]), "this was zero"));
-                                }
-                                ConstValue::Float(Float::new(lhs.get() / *rhs as f64))
-                            }
-
                             _ => unreachable!("cannot divide `{lhs}` and `{rhs}`"),
                         },
                         BinOp::Rem => {
-                            let lhs = lhs.integer();
-                            let rhs = rhs.integer();
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
                             if rhs == 0 {
                                 return Err(error!("divison by zero")
                                     .label(self.node_span(pair[0]), "in this remainder")
                                     .label(self.node_span(pair[1]), "this was zero"));
                             }
-                            ConstValue::Integer(lhs % rhs)
+                            ConstValue::number(lhs % rhs)
                         }
                         BinOp::ShiftLeft => {
-                            let lhs = lhs.integer();
-                            let rhs = rhs.integer();
-                            if !(0..127).contains(&rhs) {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            if rhs < 0 || rhs > (1 << 10) {
                                 return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this left shift")
                                     .label(self.node_span(pair[1]), format!("this was {rhs}")));
                             }
-                            ConstValue::Integer(lhs << rhs)
+                            let rhs = rhs.to_u32().unwrap();
+                            ConstValue::number(lhs << rhs)
                         }
                         BinOp::ShiftRight => {
-                            let lhs = lhs.integer();
-                            let rhs = rhs.integer();
-                            if !(0..127).contains(&rhs) {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            if rhs < 0 || rhs > (1 << 10) {
                                 return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this right shift")
                                     .label(self.node_span(pair[1]), format!("this was {rhs}")));
                             }
-                            ConstValue::Integer(lhs >> rhs)
+                            let rhs = rhs.to_u32().unwrap();
+                            ConstValue::number(lhs >> rhs)
                         }
-                        BinOp::BitOr => ConstValue::Integer(lhs.integer() | rhs.integer()),
-                        BinOp::BitXor => ConstValue::Integer(lhs.integer() ^ rhs.integer()),
-                        BinOp::BitAnd => ConstValue::Integer(lhs.integer() & rhs.integer()),
-                        BinOp::BitNand => ConstValue::Integer(lhs.integer() & !rhs.integer()),
+
+                        BinOp::BitOr => {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            ConstValue::number(lhs | rhs)
+                        }
+                        BinOp::BitXor => {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            ConstValue::number(lhs ^ rhs)
+                        }
+                        BinOp::BitAnd => {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            ConstValue::number(lhs & rhs)
+                        }
+                        BinOp::BitNand => {
+                            let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
+                            let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
+                            ConstValue::number(lhs & !rhs)
+                        }
                     };
+
+                    end = pair[1];
                 }
 
                 Ok(lhs)
@@ -319,7 +301,9 @@ impl<'a> EvalContext<'a> {
 
                 let value = match func {
                     ConstFunc::IntCast => match self.eval_boxed(exprs[0]).await? {
-                        ConstValue::Integer(value) => ConstValue::Integer(value),
+                        ConstValue::Number(value) if value.imag().is_zero() => {
+                            ConstValue::number(value.real().trunc_ref())
+                        }
                         value => {
                             return Err(error!("cannot perform cast").label(
                                 self.node_span(exprs[0]),
@@ -329,8 +313,8 @@ impl<'a> EvalContext<'a> {
                     },
 
                     // TODO: actually compute the memory layout of types
-                    ConstFunc::Sizeof => ConstValue::Integer(8),
-                    ConstFunc::Offsetof => ConstValue::Integer(0),
+                    ConstFunc::Sizeof => ConstValue::number(8),
+                    ConstFunc::Offsetof => ConstValue::number(0),
 
                     ConstFunc::Len => {
                         let inferred = self.types.nodes.get(&exprs[0].node).ok_or_else(|| {
@@ -354,9 +338,7 @@ impl<'a> EvalContext<'a> {
                         };
 
                         match len {
-                            Some(len) => {
-                                ConstValue::Integer(len.try_into().expect("arbitrary integers"))
-                            }
+                            Some(len) => ConstValue::number(len),
                             None => {
                                 return Err(error!("length not known at compile-time")
                                     .label(self.node_span(exprs[0]), format!("found `{typ}`")))
@@ -380,9 +362,7 @@ impl<'a> EvalContext<'a> {
                         };
 
                         match len {
-                            Some(len) => {
-                                ConstValue::Integer(len.try_into().expect("arbitrary integers"))
-                            }
+                            Some(len) => ConstValue::number(len),
                             None => {
                                 return Err(error!("length not known at compile-time")
                                     .label(self.node_span(exprs[0]), format!("found `{typ}`")))
@@ -403,7 +383,17 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    fn as_integer(&self, value: &ConstValue, span: impl FnOnce() -> Span) -> Result<rug::Integer> {
+        value.as_integer().ok_or_else(|| {
+            error!("cannot represent as an integer").label(span(), format!("this was {}", value))
+        })
+    }
+
     fn node_span(&self, node: impl Into<NodeId>) -> crate::span::Span {
         self.ast.node_span(self.path.index, node)
+    }
+
+    fn join_span(&self, start: impl Into<NodeId>, end: impl Into<NodeId>) -> Span {
+        self.node_span(start).join(self.node_span(end))
     }
 }

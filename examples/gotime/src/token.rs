@@ -175,11 +175,16 @@ pub fn tokenize(text: &BStr) -> Vec<SpannedToken> {
             break;
         }
 
-        if whitespace.newline && needs_semicolon(tokens.last()) {
-            tokens.push(SpannedToken::new(Token::SemiColon, offset as u32, 0));
+        offset += whitespace.len;
+
+        if (whitespace.newline || offset == text.len()) && needs_semicolon(tokens.last()) {
+            tokens.push(SpannedToken::new(
+                Token::SemiColon,
+                (offset - whitespace.len) as u32,
+                0,
+            ));
         }
 
-        offset += whitespace.len;
         if offset == text.len() {
             break;
         }

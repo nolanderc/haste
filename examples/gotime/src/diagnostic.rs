@@ -317,11 +317,13 @@ impl Label {
         let gutter_width = 1 + (1 + end_line).ilog10() as usize;
         let gutter = " ".repeat(gutter_width);
 
-        let start_column = range.start.get() as usize - start_line_range.start;
-        let end_column = range.end.get() as usize - end_line_range.start;
+        let start_column =
+            (range.start.get() as usize - start_line_range.start).min(start_line_text.len());
+        let end_column =
+            (range.end.get() as usize - end_line_range.start).min(end_line_text.len());
 
         let start_end_column = if start_line == end_line {
-            end_column
+            end_column.min(start_line_text.len())
         } else {
             start_line_text.len()
         };

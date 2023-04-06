@@ -794,22 +794,6 @@ impl<'a> Parser<'a> {
                         format!("found {} expressions", values.nodes.length),
                     ),
             );
-        } else if let Some(prev) = *prev_value {
-            if prev.nodes.length != values.nodes.length {
-                self.emit(
-                    Diagnostic::error(
-                        "the number of expressions must match across all constants in the list",
-                    )
-                    .label(
-                        self.get_span(prev),
-                        format!("this has {} expressions", prev.nodes.length),
-                    )
-                    .label(
-                        self.get_span(values),
-                        format!("this has {} expressions", values.nodes.length),
-                    ),
-                );
-            }
         }
 
         *prev_type = typ;

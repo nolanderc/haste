@@ -4,6 +4,7 @@ mod eval;
 use std::sync::Arc;
 
 use bstr::BStr;
+use futures::future::BoxFuture;
 use smallvec::SmallVec;
 
 use crate::{
@@ -329,6 +330,58 @@ impl Type {
 
     pub fn untyped_bool(db: &dyn crate::Db) -> Self {
         Self::insert(db, TypeKind::Untyped(ConstantKind::Boolean))
+    }
+
+    pub fn structural_eq_boxed(self, db: &dyn crate::Db, other: Type) -> BoxFuture<Result<bool>> {
+        use futures::FutureExt;
+        self.structurally_equivalent(db, other).boxed()
+    }
+
+    pub async fn structurally_equivalent(self, db: &dyn crate::Db, other: Type) -> Result<bool> {
+        if self == other {
+            return Ok(true);
+        }
+
+        let mut self_kind = self.lookup(db);
+        let mut other_kind = self.lookup(db);
+
+        if let TypeKind::Declared(decl) = self_kind {
+            self_kind = underlying_type_for_decl(db, *decl).await?.lookup(db);
+        }
+        if let TypeKind::Declared(decl) = other_kind {
+            other_kind = underlying_type_for_decl(db, *decl).await?.lookup(db);
+        }
+
+        match (self_kind, other_kind) {
+            (TypeKind::Struct(a), TypeKind::Struct(b)) => {
+                if a.fields.len() != b.fields.len() {
+                    return Ok(false);
+                }
+
+                for (a, b) in a.fields.iter().zip(b.fields.iter()) {
+                    if !(a.name == b.name && a.typ.structural_eq_boxed(db, b.typ).await?) {
+                        return Ok(false);
+                    }
+                }
+
+                Ok(true)
+            }
+
+            (TypeKind::Pointer(a), TypeKind::Pointer(b)) => a.structural_eq_boxed(db, *b).await,
+            (TypeKind::Slice(a), TypeKind::Slice(b)) => a.structural_eq_boxed(db, *b).await,
+            (TypeKind::Map(a_key, a_value), TypeKind::Map(b_key, b_value)) => {
+                Ok(a_key.structural_eq_boxed(db, *b_key).await?
+                    && a_value.structural_eq_boxed(db, *b_value).await?)
+            }
+            (TypeKind::Channel(a_kind, a), TypeKind::Channel(b_kind, b)) => {
+                Ok(a_kind == b_kind && a.structural_eq_boxed(db, *b).await?)
+            }
+            (TypeKind::Array(a_len, a), TypeKind::Array(b_len, b)) => {
+                Ok(a_len == b_len && a.structural_eq_boxed(db, *b).await?)
+            }
+
+            _ => Ok(false),
+        }
     }
 }
 
@@ -1110,11 +1163,11 @@ type SelectionList = SmallVec<[Selection; 2]>;
 #[haste::query]
 #[clone]
 async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
-    let inner = if let TypeKind::Pointer(inner) = typ.lookup(db) {
-        *inner
-    } else {
-        typ
-    };
+    let mut inner = typ;
+
+    while let TypeKind::Pointer(pointee) = inner.lookup(db) {
+        inner = *pointee;
+    }
 
     let members = recursive_members(db, inner).await.as_ref()?;
     let Some(selection) = members.get(&name) else { return Ok(None) };
@@ -1142,9 +1195,15 @@ async fn recursive_members(db: &dyn crate::Db, typ: Type) -> Result<HashMap<Text
     curr_depth.push(typ);
 
     while !curr_depth.is_empty() {
-        for mut curr in curr_depth.drain(..) {
+        while let Some(mut curr) = curr_depth.pop() {
             if let TypeKind::Pointer(inner) = curr.lookup(db) {
                 curr = *inner;
+            }
+            if let TypeKind::Declared(decl) = curr.lookup(db) {
+                let inner = inner_type_for_decl(db, *decl).await?;
+                if let TypeKind::Pointer(inner) = inner.lookup(db) {
+                    curr_depth.push(*inner);
+                }
             }
 
             let members = selection_members(db, curr).await.as_ref()?;

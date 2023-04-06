@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use arrayvec::ArrayVec;
 use bstr::{BStr, ByteSlice};
 
 use crate::{
@@ -41,30 +40,52 @@ pub async fn resolve(
 ) -> Result<FileSet> {
     let name = import_name.get(db);
 
-    let mut candidates = ArrayVec::<_, 4>::new();
-
-    // check the standard library first
-    candidates.push(NormalPathData::GoRoot(Path::new("src").join(name).into()));
-
-    // then vendored dependencies
-    if let Some(mod_path) = go_mod {
-        let mod_dir = mod_path.lookup(db).parent().unwrap();
-        candidates.push(mod_dir.join("vendor").unwrap().join(name).unwrap());
-    }
-
-    // and GOPATH last (if coming from the standard library we don't want to reduce its durability
-    // by depending on files outside the root directory)
-    candidates.push(NormalPathData::GoPath(Path::new("src").join(name).into()));
-
-    for path in candidates {
-        let path = NormalPath::insert(db, path);
+    async fn try_candidate(db: &dyn crate::Db, candidate: NormalPathData) -> Option<FileSet> {
+        let path = NormalPath::insert(db, candidate);
         if fs::is_dir(db, path).await {
-            return Ok(FileSet::insert(db, FileSetData::Directory(path)));
+            Some(FileSet::insert(db, FileSetData::Directory(path)))
+        } else {
+            None
         }
     }
 
-    Err(error!("could not resolve the module `{import_name}`")
-        .help("make sure that all dependencies are vendored using `go mod vendor`"))
+    // check the standard library first
+    let std_lib = NormalPathData::GoRoot(Path::new("src").join(name).into());
+    if let Some(files) = try_candidate(db, std_lib).await {
+        return Ok(files);
+    }
+
+    // then vendored dependencies
+    let mut vendor_candidate = go_mod;
+    while let Some(mod_path) = vendor_candidate.take() {
+        let mod_dir = mod_path.parent(db).unwrap();
+        let vendor_dir = mod_dir.lookup(db).join("vendor").unwrap();
+        let vendor_path = vendor_dir.join(name).unwrap();
+        if let Some(files) = try_candidate(db, vendor_path).await {
+            return Ok(files);
+        }
+
+        if let Some(parent) = mod_dir.parent(db) {
+            vendor_candidate = closest_go_mod(db, parent).await?;
+        }
+    }
+
+    // and GOPATH last (if coming from the standard library we don't want to reduce the query's
+    // durability by depending on files outside the root directory)
+    let gopath = NormalPathData::GoPath(Path::new("src").join(name).into());
+    if let Some(files) = try_candidate(db, gopath).await {
+        return Ok(files);
+    }
+
+    let mut error = error!("could not resolve the module `{import_name}`");
+
+    // for path in candidates.iter() {
+    //     error = error.note(format!("attempted path `{}`", path));
+    // }
+
+    error = error.help("make sure that all dependencies are vendored using `go mod vendor`");
+
+    Err(error)
 }
 
 /// In case our logic fails to resolve an import we fall back to the reference Go compiler.
@@ -90,10 +111,7 @@ async fn resolve_import_go_list(
 
 #[haste::query]
 #[clone]
-pub async fn closest_go_mod(
-    db: &dyn crate::Db,
-    path: NormalPath,
-) -> Result<Option<NormalPath>> {
+pub async fn closest_go_mod(db: &dyn crate::Db, path: NormalPath) -> Result<Option<NormalPath>> {
     let mod_path = path.join(db, "go.mod").unwrap();
 
     if fs::is_file(db, mod_path).await {
@@ -433,6 +451,18 @@ async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
     if tag == "gc" {
         // we pretend to be the reference Go Compiler (GC)
         return Ok(true);
+    }
+
+    if let Some(version) = tag.strip_prefix("go") {
+        if let Some(dot) = version.find('.') {
+            let major = &version[..dot];
+            let minor = &version[dot + 1..];
+            if let Ok(minor_value) = minor.parse::<u8>() {
+                if major == "1" && minor_value <= 17 {
+                    return Ok(true);
+                }
+            }
+        }
     }
 
     let goos = process::go_var(db, "GOOS").await.as_ref()?;

@@ -7,7 +7,7 @@ use std::{
 use crate::{error, Result, Storage};
 
 #[haste::intern(NormalPath)]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalPathData {
     /// Relative to the current directory. May not point outside the working directory.
     Relative(Box<Path>),

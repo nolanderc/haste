@@ -5,6 +5,7 @@ use std::{
 };
 
 use bstr::{BStr, ByteSlice};
+use smallvec::SmallVec;
 
 use crate::{
     common::Text,
@@ -38,16 +39,31 @@ pub async fn resolve(
     import_name: Text,
     go_mod: Option<NormalPath>,
 ) -> Result<FileSet> {
+    resolve_impl(db, import_name, go_mod).await
+}
+
+#[allow(clippy::needless_lifetimes)]
+pub async fn resolve_impl<'db>(
+    db: &'db dyn crate::Db,
+    import_name: Text,
+    go_mod: Option<NormalPath>,
+) -> Result<FileSet> {
     let name = import_name.get(db);
 
-    async fn try_candidate(db: &dyn crate::Db, candidate: NormalPathData) -> Option<FileSet> {
+    let mut checked_candidates = SmallVec::<[_; 8]>::new();
+
+    let mut try_candidate = |db: &'db dyn crate::Db, candidate: NormalPathData| {
         let path = NormalPath::insert(db, candidate);
-        if fs::is_dir(db, path).await {
-            Some(FileSet::insert(db, FileSetData::Directory(path)))
-        } else {
-            None
+        checked_candidates.push(path);
+
+        async move {
+            if fs::is_dir(db, path).await {
+                Some(FileSet::insert(db, FileSetData::Directory(path)))
+            } else {
+                None
+            }
         }
-    }
+    };
 
     // check the standard library first
     let std_lib = NormalPathData::GoRoot(Path::new("src").join(name).into());
@@ -59,6 +75,19 @@ pub async fn resolve(
     let mut vendor_candidate = go_mod;
     while let Some(mod_path) = vendor_candidate.take() {
         let mod_dir = mod_path.parent(db).unwrap();
+
+        // maybe it is a submodule?
+        if let Some(module_name) = module_name(db, mod_path).await? {
+            if let Some(suffix) = name.strip_prefix(module_name.get(db)) {
+                let suffix = suffix.trim_start_matches('/');
+                if let Some(sub_dir) = mod_dir.lookup(db).join(suffix) {
+                    if let Some(files) = try_candidate(db, sub_dir).await {
+                        return Ok(files);
+                    }
+                }
+            }
+        }
+
         let vendor_dir = mod_dir.lookup(db).join("vendor").unwrap();
         let vendor_path = vendor_dir.join(name).unwrap();
         if let Some(files) = try_candidate(db, vendor_path).await {
@@ -78,12 +107,11 @@ pub async fn resolve(
     }
 
     let mut error = error!("could not resolve the module `{import_name}`");
-
-    // for path in candidates.iter() {
-    //     error = error.note(format!("attempted path `{}`", path));
-    // }
-
     error = error.help("make sure that all dependencies are vendored using `go mod vendor`");
+
+    for candidate in checked_candidates {
+        error = error.note(format!("not found in `{}`", candidate));
+    }
 
     Err(error)
 }
@@ -121,6 +149,28 @@ pub async fn closest_go_mod(db: &dyn crate::Db, path: NormalPath) -> Result<Opti
     let Some(parent) = path.parent(db) else { return Ok(None) };
 
     closest_go_mod(db, parent).await
+}
+
+#[haste::query]
+#[clone]
+pub async fn module_name(db: &dyn crate::Db, path: NormalPath) -> Result<Option<Text>> {
+    let bytes = fs::read(db, path).await.as_ref()?;
+
+    for line in bytes.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with_str("//") {
+            continue;
+        }
+
+        let mut words = line.fields();
+        let Some(b"module") = words.next() else { return Ok(None) };
+        let Some(name) = words.next() else { return Ok(None) };
+        return Ok(std::str::from_utf8(name)
+            .ok()
+            .map(|text| Text::new(db, text)));
+    }
+
+    Ok(None)
 }
 
 /// A set of files which together represent an entire package.

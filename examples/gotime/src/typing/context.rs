@@ -408,12 +408,21 @@ impl<'db> TypingContext<'db> {
 
     /// Check that the given expression is valid for the given type
     pub async fn check_expr(&mut self, expr: ExprId, expected: Type) -> Result<()> {
-        if let Node::CompositeLiteral(composite) = self.nodes.kind(expr) {
-            return self
-                .check_composite_literal_boxed(expr, expected, composite, move |this| {
-                    this.node_span(expr)
-                })
-                .await;
+        match self.nodes.kind(expr) {
+            Node::CompositeLiteral(composite) => {
+                return self
+                    .check_composite_literal_boxed(expr, expected, composite, move |this| {
+                        this.node_span(expr)
+                    })
+                    .await;
+            }
+            Node::Name(None) => {
+                self.types
+                    .nodes
+                    .insert(expr.node, InferredType::Value(expected));
+                return Ok(());
+            }
+            _ => (),
         }
 
         let inferred = self.infer_expr(expr).await?;
@@ -422,22 +431,27 @@ impl<'db> TypingContext<'db> {
         Ok(())
     }
 
-    async fn check_assignable(&self, expected: Type, found: Type, expr: ExprId) -> Result<()> {
-        match self.is_assignable(expected, found).await? {
+    async fn check_assignable(
+        &self,
+        target: Type,
+        source: Type,
+        source_expr: ExprId,
+    ) -> Result<()> {
+        match self.is_assignable(target, source).await? {
             AssignResult::Ok => Ok(()),
             AssignResult::Incompatible => {
-                let span = self.node_span(expr);
+                let span = self.node_span(source_expr);
                 Err(error!("type mismatch")
-                    .label(span, format!("expected `{expected}`, but found `{found}`"))
+                    .label(span, format!("expected `{target}`, but found `{source}`"))
                     .label(
                         span,
-                        format!("expected `{expected:?}`, but found `{found:?}`"),
+                        format!("expected `{target:?}`, but found `{source:?}`"),
                     ))
             }
             AssignResult::Interface(error) => {
-                let span = self.node_span(expr);
+                let span = self.node_span(source_expr);
                 Err(
-                    error!("`{found}` does not implement the interface `{expected}`")
+                    error!("`{source}` does not implement the interface `{target}`")
                         .label(span, format!("{}", error)),
                 )
             }
@@ -912,9 +926,8 @@ impl<'db> TypingContext<'db> {
 
     async fn infer_expr_name(&mut self, expr: ExprId, name: Option<Text>) -> Result<InferredType> {
         if name.is_none() {
-            return Ok(InferredType::Value(
-                TypeKind::Interface(InterfaceType::Methods([].into())).insert(self.db),
-            ));
+            return Err(error!("blank name not allowed in expression context")
+                .label(self.node_span(expr), ""));
         }
 
         match self.lookup_node(expr.node).await? {
@@ -973,8 +986,20 @@ impl<'db> TypingContext<'db> {
 
         match op {
             BinOp::LogicalOr | BinOp::LogicalAnd => {
-                if lhs.lookup(self.db).is_bool() && rhs.lookup(self.db).is_bool() {
-                    return Ok(Type::untyped_bool(self.db));
+                let lhs_core = super::underlying_type(self.db, lhs).await?;
+                let rhs_core = super::underlying_type(self.db, rhs).await?;
+
+                if lhs_core.lookup(self.db).is_bool() && rhs_core.lookup(self.db).is_bool() {
+                    let lhs_class = lhs.lookup(self.db).class();
+                    let rhs_class = rhs.lookup(self.db).class();
+
+                    if lhs_class.is_untyped() && rhs_class.is_untyped() {
+                        return Ok(Type::untyped_bool(self.db));
+                    } else if lhs_class.is_untyped() {
+                        return Ok(rhs);
+                    } else {
+                        return Ok(lhs);
+                    }
                 }
                 Err(error!("incompatible types for `{op}`")
                     .label(op_span(self), "expected both operands to be of type `bool`")
@@ -1894,7 +1919,10 @@ impl<'db> TypingContext<'db> {
         let target_kind = target.lookup(self.db);
         let source_kind = source.lookup(self.db);
 
-        Ok(match (target_kind, source_kind) {
+        let target_core = super::underlying_type(self.db, target).await?;
+        let target_core_kind = target_core.lookup(self.db);
+
+        Ok(match (target_core_kind, source_kind) {
             (target, TypeKind::Untyped(ConstantKind::Boolean)) if target.is_bool() => {
                 AssignResult::Ok
             }
@@ -1939,10 +1967,6 @@ impl<'db> TypingContext<'db> {
                         return Ok(AssignResult::Ok);
                     }
                 }
-
-                let target_core = super::underlying_type(self.db, target).await?;
-
-                let target_core_kind = target_core.lookup(self.db);
 
                 if let TypeKind::Interface(interface) = target_core_kind {
                     match self.is_interface_satisfied(interface, source).await? {
@@ -2211,11 +2235,6 @@ impl<'db> TypingContext<'db> {
                     let target_exprs = self.nodes.indirect(targets);
                     let value_exprs = self.nodes.indirect(values);
 
-                    let mut target_types = TypeList::with_capacity(target_exprs.len());
-                    for target in target_exprs {
-                        target_types.push(self.infer_expr(*target).await?);
-                    }
-
                     if value_exprs.len() == 1 {
                         let value_types = self.infer_assignment(value_exprs[0]).await?;
                         if targets.len() > value_types.len() {
@@ -2230,9 +2249,14 @@ impl<'db> TypingContext<'db> {
                                 ));
                         }
 
-                        for (expected, value) in target_types.iter().zip(value_types) {
-                            self.check_assignable(*expected, value, value_exprs[0])
-                                .await?;
+                        for (&target, value_type) in target_exprs.iter().zip(value_types) {
+                            if let Node::Name(None) = self.nodes.kind(target) {
+                                continue;
+                            } else {
+                                let target_type = self.infer_expr(target).await?;
+                                self.check_assignable(target_type, value_type, target)
+                                    .await?;
+                            }
                         }
                     } else {
                         if value_exprs.len() != target_exprs.len() {
@@ -2247,8 +2271,13 @@ impl<'db> TypingContext<'db> {
                                 ));
                         }
 
-                        for (value, expected) in value_exprs.iter().zip(target_types) {
-                            self.check_expr(*value, expected).await?;
+                        for (&target, &value) in target_exprs.iter().zip(value_exprs) {
+                            if let Node::Name(None) = self.nodes.kind(target) {
+                                self.infer_expr(value).await?;
+                            } else {
+                                let target_type = self.infer_expr(target).await?;
+                                self.check_expr(value, target_type).await?;
+                            }
                         }
                     }
 
@@ -2299,12 +2328,6 @@ impl<'db> TypingContext<'db> {
                 }
 
                 Node::ForRange(first, second, syntax::AssignOrDefine::Assign, list, block) => {
-                    let first_type = self.infer_expr(first).await?;
-                    let second_type = match second {
-                        Some(second) => Some(self.infer_expr(second).await?),
-                        None => None,
-                    };
-
                     let list_type = self.infer_expr(list).await?;
                     let list_core = super::underlying_type(self.db, list_type).await?;
 
@@ -2313,13 +2336,8 @@ impl<'db> TypingContext<'db> {
                             .label(self.node_span(list), "expected array, slice, string, map or channel"))
                     };
 
-                    self.check_range_bindings(
-                        first_expected,
-                        second_expected,
-                        (first_type, first),
-                        second_type.map(|typ| (typ, second.unwrap())),
-                    )
-                    .await?;
+                    self.check_range_bindings(first_expected, second_expected, first, second)
+                        .await?;
 
                     self.check_block_boxed(block).await
                 }
@@ -2409,7 +2427,8 @@ impl<'db> TypingContext<'db> {
                 )
                 .label(self.node_span(stmt), "")),
 
-                Node::Label(_label, inner) => {
+                Node::Label(_label, None) => Ok(()),
+                Node::Label(_label, Some(inner)) => {
                     stmt = inner;
                     continue;
                 }
@@ -2640,22 +2659,28 @@ impl<'db> TypingContext<'db> {
 
     async fn check_range_bindings(
         &mut self,
-        first_expected: Type,
-        second_expected: Option<Type>,
-        first: (Type, ExprId),
-        second: Option<(Type, ExprId)>,
+        first_value: Type,
+        second_value: Option<Type>,
+        first: ExprId,
+        second: Option<ExprId>,
     ) -> Result<()> {
-        self.check_assignable(first.0, first_expected, first.1)
-            .await?;
+        if self.nodes.kind(first) != Node::Name(None) {
+            let first_type = self.infer_expr(first).await?;
+            self.check_assignable(first_type, first_value, first)
+                .await?;
+        }
 
-        if let Some((second_type, second)) = second {
-            let Some(second_expected) = second_expected else {
+        if let Some(second) = second {
+            let Some(second_value) = second_value else {
                 return Err(error!("range only yields one value")
                     .label(self.node_span(second), "unexpected binding"))
             };
 
-            self.check_assignable(second_type, second_expected, second)
-                .await?;
+            if self.nodes.kind(second) != Node::Name(None) {
+                let second_type = self.infer_expr(second).await?;
+                self.check_assignable(second_type, second_value, second)
+                    .await?;
+            }
         }
 
         Ok(())

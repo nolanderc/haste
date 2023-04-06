@@ -751,7 +751,11 @@ fn write_node(
 
             Node::Label(name, stmt) => {
                 out.dedented(|out| writeln!(out, "{name}:"))?;
-                recurse!(stmt.node);
+                if let Some(stmt) = stmt {
+                    recurse!(stmt.node);
+                } else {
+                    Ok(())
+                }
             }
 
             Node::Defer(expr) => {

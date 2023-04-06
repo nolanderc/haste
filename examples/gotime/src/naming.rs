@@ -12,6 +12,7 @@ use crate::{
     path::NormalPath,
     span::Span,
     syntax::{self, DeclKind, ExprId, FuncDecl, Node, NodeId, SpanId, TypeId},
+    util::future::IteratorExt,
     Diagnostic, HashSet, Result,
 };
 
@@ -119,14 +120,11 @@ impl DeclId {
     pub async fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
         match self.try_get_path(db).await? {
             Some(path) => Ok(path),
-            None => {
-                let package = package_name(db, self.package(db).files).await?;
-                Err(error!(
-                    "`{}` is not a member of `{}`",
-                    self.name(db).base,
-                    package
-                ))
-            }
+            None => Err(error!(
+                "`{}` is not a member of `{}`",
+                self.name(db).base,
+                self.package(db).name,
+            )),
         }
     }
 }
@@ -550,29 +548,37 @@ pub async fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSe
 #[haste::query]
 #[clone]
 pub async fn package_name(db: &dyn crate::Db, files: FileSet) -> Result<Text> {
-    let asts = files.lookup(db).parse(db).await?;
+    let file_data = files.lookup(db);
+    let paths = file_data.sources(db).await?;
 
-    let package_name = asts[0].package_name();
+    let package_names = paths
+        .iter()
+        .map(|path| syntax::parse_package_name::spawn(db, *path))
+        .try_join_all()
+        .await?;
+
+    let (expected_name, _) = package_names[0];
 
     // make sure all files are part of the same package:
-    for i in 1..asts.len() {
-        if asts[i].package_name() != package_name {
+    for i in 1..package_names.len() {
+        let (name, _) = package_names[i];
+        if name != expected_name {
             return Err(error!(
                 "files `{}` and `{}` are part of different packages",
-                asts[0].source, asts[i].source,
+                paths[0], paths[i],
             )
             .label(
-                asts[0].package_span(),
-                format!("this is part of the `{}` package", asts[0].package_name()),
+                package_names[0].1,
+                format!("this is part of the `{}` package", package_names[0].0),
             )
             .label(
-                asts[i].package_span(),
-                format!("this is part of the `{}` package", asts[i].package_name()),
+                package_names[i].1,
+                format!("this is part of the `{}` package", package_names[i].0),
             ));
         }
     }
 
-    Ok(package_name)
+    Ok(*expected_name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -715,4 +721,3 @@ pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<Nod
 
     context.finish()
 }
-

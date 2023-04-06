@@ -17,7 +17,6 @@ pub fn invalidate_path(db: &mut dyn crate::Db, path: NormalPath) {
 }
 
 #[haste::query]
-#[clone]
 #[input]
 pub async fn read(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[u8]>> {
     db.touch_path(path);

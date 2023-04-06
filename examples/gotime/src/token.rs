@@ -158,45 +158,55 @@ define_tokens! {
 }
 
 pub fn tokenize(text: &BStr) -> Vec<SpannedToken> {
-    assert!(text.len() < u32::MAX as usize);
-
     let mut tokens = Vec::with_capacity(text.len() / 4);
 
-    let mut offset = 0;
-
-    loop {
-        let whitespace = strip_whitespace(&text[offset..]);
-        if whitespace.error {
-            tokens.push(SpannedToken::new(
-                Token::Error,
-                offset as u32,
-                whitespace.len as u32,
-            ));
-            break;
-        }
-
-        offset += whitespace.len;
-
-        if (whitespace.newline || offset == text.len()) && needs_semicolon(tokens.last()) {
-            tokens.push(SpannedToken::new(
-                Token::SemiColon,
-                (offset - whitespace.len) as u32,
-                0,
-            ));
-        }
-
-        if offset == text.len() {
-            break;
-        }
-
-        let (token, length) = Token::strip(&text[offset..]);
-        tokens.push(SpannedToken::new(token, offset as u32, length as u32));
-        offset += length;
+    for token in token_stream(text) {
+        tokens.push(token);
     }
 
     tokens.shrink_to_fit();
 
     tokens
+}
+
+pub fn token_stream(text: &BStr) -> impl Iterator<Item = SpannedToken> + '_ {
+    assert!(text.len() < u32::MAX as usize);
+
+    let mut offset = 0;
+    let mut last_token = None;
+
+    std::iter::from_fn(move || {
+        let whitespace = strip_whitespace(&text[offset..]);
+
+        if whitespace.error {
+            return Some(SpannedToken::new(
+                Token::Error,
+                offset as u32,
+                whitespace.len as u32,
+            ));
+        }
+
+        offset += whitespace.len;
+
+        if (whitespace.newline || offset == text.len()) && needs_semicolon(last_token.as_ref()) {
+            last_token = Some(SpannedToken::new(
+                Token::SemiColon,
+                (offset - whitespace.len) as u32,
+                0,
+            ));
+            return last_token;
+        }
+
+        if offset == text.len() {
+            return None;
+        }
+
+        let (token, length) = Token::strip(&text[offset..]);
+        last_token = Some(SpannedToken::new(token, offset as u32, length as u32));
+        offset += length;
+
+        last_token
+    })
 }
 
 fn needs_semicolon(last: Option<&SpannedToken>) -> bool {

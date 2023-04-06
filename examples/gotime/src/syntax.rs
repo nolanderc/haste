@@ -20,6 +20,12 @@ pub async fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<F
     self::parse::parse(db, &source, path)
 }
 
+#[haste::query]
+pub async fn parse_package_name(db: &dyn crate::Db, path: NormalPath) -> crate::Result<(Text, Span)> {
+    let source = crate::source::source_text(db, path).await?;
+    self::parse::parse_package_name(db, &source, path)
+}
+
 pub type KeyList<K, V> = Box<KeySlice<K, V>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -642,7 +648,7 @@ pub enum Node {
     /// Execute a sequence of statements
     Block(Block),
     /// A labeled statement: `label: ...`
-    Label(Identifier, StmtId),
+    Label(Identifier, Option<StmtId>),
 
     /// Return a single value
     Return(Option<ExprId>),
@@ -1099,7 +1105,7 @@ where
                 self.dfs_all(list)
             }
             Node::Block(block) => self.dfs_all(block.statements),
-            Node::Label(_, stmt) => self.dfs(stmt),
+            Node::Label(_, stmt) => self.try_dfs(stmt),
             Node::Return(expr) => self.try_dfs(expr),
             Node::ReturnMulti(exprs) => self.dfs_all(exprs),
             Node::Assign(targets, exprs) => {

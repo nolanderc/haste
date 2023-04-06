@@ -171,10 +171,7 @@ impl<'db> NamingContext<'db> {
                 let resolved = self.resolved.get(&base);
                 if let Some(Symbol::Global(GlobalSymbol::Package(package))) = resolved {
                     if !name.get(self.db).starts_with(char::is_uppercase) {
-                        self.emit(
-                            error!("`{name}` exists but is private")
-                                .label(self.node_span(node), ""),
-                        );
+                        self.emit(error!("`{name}` is private").label(self.node_span(node), ""));
                         return;
                     }
 
@@ -298,8 +295,10 @@ impl<'db> NamingContext<'db> {
             }
 
             Node::Block(block) => self.resolve_block(block),
-            Node::Label(_name, stmt) => {
-                // labels are registered in the function they are defined in
+            
+            // NOTE: labels are already registered in the function they are defined in
+            Node::Label(_name, None) => {}
+            Node::Label(_name, Some(stmt)) => {
                 self.resolve_stmt(stmt);
             }
 

@@ -1,5 +1,6 @@
 use std::{borrow::Cow, ops::Range};
 
+use arrayvec::ArrayVec;
 use bstr::{BString, ByteSlice, ByteVec};
 use fxhash::FxHashMap;
 use haste::integer::NonMaxU32;
@@ -13,6 +14,31 @@ use crate::{
 };
 
 use super::*;
+
+pub fn parse_package_name(
+    db: &dyn crate::Db,
+    source: &BStr,
+    path: NormalPath,
+) -> crate::Result<(Text, Span)> {
+    let tokens: ArrayVec<SpannedToken, 4> = crate::token::token_stream(source).take(4).collect();
+
+    let mut parser = Parser {
+        db,
+        path,
+        tokens: &tokens,
+        source,
+        current_token: 0,
+        expression_depth: 0,
+        expected: TokenSet::default(),
+        diagnostics: Vec::new(),
+        data: Data::default(),
+    };
+
+    match parser.package() {
+        Ok(ident) => Ok((ident.text.unwrap(), parser.get_span(ident.span))),
+        Err(_) => Err(Diagnostic::combine(parser.diagnostics)),
+    }
+}
 
 pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
     let tokens = crate::token::tokenize(source);
@@ -1277,13 +1303,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn statement(&mut self) -> Result<StmtId> {
-        match self.try_statement()? {
-            Some(stmt) => Ok(stmt),
-            None => Err(self.emit_expected("a statement")),
-        }
-    }
-
     fn try_statement(&mut self) -> Result<Option<StmtId>> {
         static STATEMENTS: LookupTable<ParseFn<StmtId>, 15> = LookupTable::new([
             (Token::LCurly, |this| this.block()),
@@ -1345,8 +1364,8 @@ impl<'a> Parser<'a> {
         } else if self.peek_is(Token::Identifier) && self.peek2_is(Token::Colon) {
             let label = self.identifier()?;
             self.eat(Token::Colon);
-            let inner = self.statement()?;
-            let span = self.emit_join(label, inner);
+            let inner = self.try_statement()?;
+            let span = self.try_emit_join(label, inner);
             let stmt = self.emit_stmt(Node::Label(label, inner), span);
             self.data.node.labels.push(stmt);
             Ok(Some(stmt))

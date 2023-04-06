@@ -55,11 +55,13 @@ pub struct Storage(
     path::NormalPath,
     source::line_starts,
     syntax::parse_file,
+    syntax::parse_package_name,
     import::resolve,
     import::FileSet,
     import::file_set,
     import::sources_in_dir,
     import::closest_go_mod,
+    import::module_name,
     compile,
     compile_package_files,
 );
@@ -327,8 +329,8 @@ fn run(db: &mut Database, arguments: Arguments) {
         let result = scope.block_on(compile(db, arguments.config));
 
         match result {
-            Ok(output) => {
-                eprintln!("output: {:#?}", output);
+            Ok(_output) => {
+                // eprintln!("output: {:#?}", output);
             }
             Err(diagnostic) => {
                 let mut string = String::with_capacity(4096);
@@ -425,7 +427,6 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
                 typing::Signature::Package(_) => unreachable!("packages are not declarations"),
             };
             let _typing = typing.await.as_ref()?;
-            // eprintln!("{decl:?}: {signature}");
             Ok((name, signature))
         });
     }

@@ -1,13 +1,16 @@
-package concurrent
+package main
 
 import (
-	"os"
-	"log"
-	"io/ioutil"
+    "fmt"
+    "github.com/valyala/fasthttp"
+    "aahframe.work"
+    "github.com/gin-gonic/gin"
+    "gorm.io/gorm"
+    "github.com/beego/beego/v2"
+    "github.com/beego/beego/v2/server/web"
 )
 
-// ErrorLogger is used to print out error, can be set to writer other than stderr
-var ErrorLogger = log.New(os.Stderr, "", 0)
-
-// InfoLogger is used to print informational message, default to off
-var InfoLogger = log.New(ioutil.Discard, "", 0)
+func main() {
+    const N = 3
+    var index [N]int
+}

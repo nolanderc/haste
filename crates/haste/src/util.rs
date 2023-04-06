@@ -1,6 +1,7 @@
 pub mod arc;
 pub mod fmt;
 pub mod future;
+pub mod alloc;
 
 pub struct CallOnDrop<T, F: FnMut() -> T>(pub F);
 

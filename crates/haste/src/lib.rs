@@ -2,6 +2,9 @@
 #![feature(trivial_bounds)]
 #![feature(waker_getters)]
 #![feature(const_collections_with_hasher)]
+#![feature(unsize)]
+#![feature(coerce_unsized)]
+
 #![allow(clippy::uninlined_format_args)]
 
 mod arena;
@@ -521,9 +524,11 @@ impl<'a> Scope<'a> {
 struct Metrics {
     /// For each span, its name, duration and count.
     spans: HashMap<SpanName, Span, ConstHasher>,
+}
 
-    /// For each active span, the time it was started and its name.
-    stack: Vec<(SpanName, std::time::Instant)>,
+struct ActiveSpan {
+    name: SpanName,
+    start: std::time::Instant,
 }
 
 struct ConstHasher;
@@ -540,7 +545,6 @@ impl Metrics {
     const fn new() -> Self {
         Self {
             spans: HashMap::with_hasher(ConstHasher),
-            stack: Vec::new(),
         }
     }
 }
@@ -556,6 +560,7 @@ type SpanName = Cow<'static, str>;
 
 thread_local! {
     static METRICS: RefCell<Metrics> = RefCell::new(Metrics::new());
+    static ACTIVE_STACK: RefCell<Vec<ActiveSpan>> = RefCell::new(Vec::new());
 }
 
 static GLOBAL_METRICS: Mutex<Metrics> = Mutex::new(Metrics::new());
@@ -582,11 +587,11 @@ where
     T: Into<SpanName>,
 {
     if metrics_enabled!() {
-        METRICS.with(|metrics| {
-            let mut metrics = metrics.borrow_mut();
-            metrics
-                .stack
-                .push((name().into(), std::time::Instant::now()));
+        ACTIVE_STACK.with(|active| {
+            active.borrow_mut().push(ActiveSpan {
+                name: name().into(),
+                start: std::time::Instant::now(),
+            })
         })
     }
 
@@ -602,11 +607,15 @@ impl Drop for SpanGuard {
     #[inline]
     fn drop(&mut self) {
         if metrics_enabled!() {
+            let active = ACTIVE_STACK
+                .with(|active| active.borrow_mut().pop())
+                .expect("unbalanced spans");
+
+            let duration = active.start.elapsed();
+
             METRICS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
-                let (name, start) = metrics.stack.pop().expect("unbalanced number of spans");
-                let duration = start.elapsed();
-                let span = metrics.spans.entry(name).or_default();
+                let span = metrics.spans.entry(active.name).or_default();
                 span.duration += duration;
                 span.max_duration = duration.max(span.max_duration);
                 span.count += 1;

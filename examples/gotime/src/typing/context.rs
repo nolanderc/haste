@@ -23,6 +23,7 @@ use super::{
 
 pub(super) struct TypingContext<'db> {
     pub db: &'db dyn crate::Db,
+
     pub ast: &'db syntax::File,
     pub references: &'db IndexMap<NodeId, naming::Symbol>,
     pub nodes: &'db NodeView,
@@ -1429,7 +1430,13 @@ impl<'db> TypingContext<'db> {
                         let src = self.infer_expr(arg_exprs[1]).await?;
 
                         let is_byte_slice = *inner.lookup(self.db) == TypeKind::Uint8;
-                        if is_byte_slice && src.lookup(self.db).is_string() {
+                        if is_byte_slice
+                            && src
+                                .lookup(self.db)
+                                .underlying_class(self.db)
+                                .await?
+                                .is_string()
+                        {
                             // ok
                         } else {
                             self.check_assignable(dst, src, arg_exprs[1]).await?;
@@ -2039,6 +2046,10 @@ impl<'db> TypingContext<'db> {
         let target_core = super::underlying_type(self.db, target).await?;
         let source_core = super::underlying_type(self.db, source).await?;
 
+        if target_core == source_core {
+            return Ok(true);
+        }
+
         let target_kind = target_core.lookup(self.db);
         let source_kind = source_core.lookup(self.db);
 
@@ -2113,23 +2124,7 @@ impl<'db> TypingContext<'db> {
                 }
                 Ok(false)
             }
-            _ => {
-                if let &TypeKind::Declared(decl) = source.lookup(self.db) {
-                    let source_inner = super::inner_type_for_decl(self.db, decl).await?;
-                    if source_inner == target {
-                        return Ok(true);
-                    }
-
-                    if let &TypeKind::Declared(decl) = target.lookup(self.db) {
-                        let target_inner = super::inner_type_for_decl(self.db, decl).await?;
-                        if source_inner == target_inner {
-                            return Ok(true);
-                        }
-                    }
-                }
-
-                Ok(false)
-            }
+            _ => Ok(false),
         }
     }
 

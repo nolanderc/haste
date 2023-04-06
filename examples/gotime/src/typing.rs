@@ -116,6 +116,10 @@ impl TypeClass {
     pub fn is_nillable(self) -> bool {
         self.intersects(Self::NILLABLE)
     }
+
+    pub fn is_string(self) -> bool {
+        self.contains(Self::STRING)
+    }
 }
 
 impl TypeKind {

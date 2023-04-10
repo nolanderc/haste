@@ -91,14 +91,14 @@ impl<T> ArenaInterner<T> {
         let shard = self.entries.shard(hash);
 
         // check if the value already exists in the interner
-        let table = shard.read().unwrap();
+        let table = shard.read();
         if let Some(old) = table.get(hash, self.eq_fn(&value)) {
             return *old;
         }
 
         let len_before = table.len();
         drop(table);
-        let mut table = shard.write().unwrap();
+        let mut table = shard.write();
         let len_after = table.len();
 
         if len_before != len_after {
@@ -290,7 +290,7 @@ impl StringInterner {
         let shard = self.entries.shard(hash);
 
         // check if the value already exists in the interner
-        let table = shard.read().unwrap();
+        let table = shard.read();
         if let Some(old) = table.get(hash, self.eq_fn(string)) {
             return *old;
         }
@@ -298,7 +298,7 @@ impl StringInterner {
         let len_before = table.len();
         drop(table);
 
-        let mut table = shard.write().unwrap();
+        let mut table = shard.write();
         let len_after = table.len();
 
         if len_before != len_after {

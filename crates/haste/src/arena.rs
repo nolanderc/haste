@@ -1,20 +1,21 @@
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
-    ptr::NonNull,
-    sync::atomic::{
-        AtomicU8, AtomicUsize,
-        Ordering::{Acquire, Relaxed, Release},
+    sync::{
+        atomic::{
+            AtomicPtr, AtomicU8, AtomicUsize,
+            Ordering::{Acquire, Relaxed, Release},
+        },
+        Mutex,
     },
 };
 
-mod memory;
-
 pub struct RawArena<T> {
-    ptr: NonNull<T>,
+    allocation: region::Allocation,
     reserved: AtomicUsize,
     committed: AtomicUsize,
-    capacity: usize,
+    _phantom: PhantomData<T>,
 }
 
 unsafe impl<T: Send> Send for RawArena<T> {}
@@ -32,20 +33,29 @@ impl<T> RawArena<T> {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        let bytes = std::mem::size_of::<T>() * capacity;
-        let ptr = memory::reserve(bytes);
+        let bytes = std::mem::size_of::<T>()
+            .checked_add(capacity)
+            .expect("allocation exceeds system limits");
+
+        let allocation = region::alloc(bytes, region::Protection::NONE).expect("allocation failed");
+
+        let ptr = allocation.as_ptr::<u8>();
         assert_eq!(
-            ptr.as_ptr() as usize & (std::mem::align_of::<T>() - 1),
+            ptr as usize & (std::mem::align_of::<T>() - 1),
             0,
             "allocated memory was not aligned"
         );
 
         Self {
-            ptr: ptr.cast(),
+            allocation,
             reserved: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
-            capacity,
+            _phantom: PhantomData,
         }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.allocation.len() / std::mem::size_of::<T>()
     }
 
     /// Get a pointer to the value at the given offset.
@@ -54,7 +64,7 @@ impl<T> RawArena<T> {
     ///
     /// The caller must ensure that the given offset lies within the allocated memory region.
     pub unsafe fn get_raw(&self, offset: usize) -> *mut T {
-        self.ptr.as_ptr().add(offset)
+        self.allocation.as_ptr::<T>().cast_mut().add(offset)
     }
 
     /// Get a reference to the value at the given index.
@@ -141,20 +151,26 @@ where
     }
 
     unsafe fn grow(&self, current_len: usize, required: usize) {
-        if required > self.capacity {
+        if required > self.capacity() {
             panic!("out of memory");
         }
 
         let new = current_len
             .saturating_mul(8)
             .max(256)
-            .clamp(required.next_power_of_two(), self.capacity);
+            .clamp(required.next_power_of_two(), self.capacity());
 
         // SAFETY: we know that `new` is in the range `[0, self.capacity]`. Thus `old_ptr` will
         // also lie within the reserved memory range, and we can safely commit it.
-        let old_ptr = self.get_raw(current_len).cast();
-        let new_bytes = (new - current_len) * std::mem::size_of::<T>();
-        memory::commit(old_ptr, new_bytes);
+        let old_ptr = self.get_raw(current_len);
+        let additional_bytes = (new - current_len) * std::mem::size_of::<T>();
+
+        region::protect(
+            old_ptr.cast_const().cast::<u8>(),
+            additional_bytes,
+            region::Protection::READ_WRITE,
+        )
+        .expect("could not commit memory");
 
         self.committed.fetch_max(new, Relaxed);
     }
@@ -165,14 +181,141 @@ where
     }
 }
 
-impl<T> Drop for RawArena<T> {
-    fn drop(&mut self) {
-        unsafe {
-            memory::release(
-                self.ptr.as_ptr().cast(),
-                self.capacity * std::mem::size_of::<T>(),
-            );
+const INIT_BUCKET: usize = 32;
+const BUCKETS: usize = 32;
+
+#[allow(dead_code)]
+pub struct BucketArena<T> {
+    buckets: [Bucket<T>; BUCKETS],
+}
+
+pub struct Bucket<T> {
+    ptr: AtomicPtr<T>,
+    init_mutex: Mutex<()>,
+}
+
+impl<T> BucketArena<T> {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| Bucket::new()),
         }
+    }
+}
+
+impl<T> BucketArena<T>
+where
+    T: bytemuck::Zeroable,
+{
+    #[allow(dead_code)]
+    pub fn get(&self, index: usize) -> &T {
+        let bucket = find_bucket(index);
+        let bucket_size = bucket_size(bucket);
+        let subindex = index - bucket_size * (bucket != 0) as usize;
+        unsafe { &*self.buckets[bucket].get_or_init(subindex, bucket_size) }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_mut(&mut self, index: usize) -> &mut T {
+        let bucket = find_bucket(index);
+        let bucket_size = bucket_size(bucket);
+        let subindex = index - bucket_size * (bucket != 0) as usize;
+        unsafe { &mut *self.buckets[bucket].get_or_init(subindex, bucket_size) }
+    }
+}
+
+impl<T> Drop for BucketArena<T> {
+    fn drop(&mut self) {
+        for (i, bucket) in self.buckets.iter_mut().enumerate() {
+            let ptr = *bucket.ptr.get_mut();
+            if ptr.is_null() {
+                continue;
+            }
+            let size = bucket_size(i);
+            let layout = std::alloc::Layout::array::<T>(size).unwrap();
+            unsafe { std::alloc::dealloc(ptr.cast(), layout) };
+        }
+    }
+}
+
+/// Given the index of a bucket, its size.
+fn bucket_size(bucket_index: usize) -> usize {
+    INIT_BUCKET << bucket_index.saturating_sub(1)
+}
+
+/// Get the index of an element, the bucket it lies in.
+fn find_bucket(index: usize) -> usize {
+    // index norm norm+1 power ilog bucket size start
+    //     0    0      1     1    0      0    2     0
+    //     1    0      1     1    0      0    2     0
+    //     2    1      2     2    1      1    2     2
+    //     3    1      2     2    1      1    2     2
+    //     4    2      3     4    1      2    4     4
+    //     5    2      3     4    1      2    4     4
+    //     6    3      4     4    0      2    4     4
+    //     7    3      4     4    0      2    4     4
+    //     8    4      5     8    0      3    8     8
+    let norm = index / INIT_BUCKET;
+    let power = (norm + 1).next_power_of_two();
+    let bucket = power.trailing_zeros();
+    bucket as usize
+}
+
+#[test]
+fn bucket_indexing() {
+    assert_eq!(find_bucket(0), 0);
+    assert_eq!(find_bucket(INIT_BUCKET - 1), 0);
+
+    assert_eq!(find_bucket(INIT_BUCKET), 1);
+    assert_eq!(find_bucket(2 * INIT_BUCKET - 1), 1);
+
+    assert_eq!(find_bucket(2 * INIT_BUCKET), 2);
+    assert_eq!(find_bucket(4 * INIT_BUCKET - 1), 2);
+
+    assert_eq!(find_bucket(4 * INIT_BUCKET), 3);
+    assert_eq!(find_bucket(8 * INIT_BUCKET - 1), 3);
+}
+
+impl<T> Bucket<T> {
+    pub const fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            init_mutex: Mutex::new(()),
+        }
+    }
+}
+
+impl<T> Bucket<T>
+where
+    T: bytemuck::Zeroable,
+{
+    pub unsafe fn get_or_init(&self, index: usize, size: usize) -> *mut T {
+        let mut ptr = self.ptr.load(Relaxed);
+        if ptr.is_null() {
+            ptr = self.init(size);
+        }
+        ptr.add(index)
+    }
+
+    fn init(&self, size: usize) -> *mut T {
+        let _guard = self.init_mutex.lock();
+
+        // another thread may have beaten us to it
+        let ptr = self.ptr.load(Relaxed);
+        if !ptr.is_null() {
+            return ptr;
+        }
+
+        let layout = std::alloc::Layout::array::<T>(size).unwrap();
+
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout).cast::<T>() };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+
+        self.ptr.store(ptr, Relaxed);
+
+        ptr
     }
 }
 

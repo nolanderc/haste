@@ -8,4 +8,3 @@ import (
 func main() {
     fmt.Printf(quote.Hello())
 }
-

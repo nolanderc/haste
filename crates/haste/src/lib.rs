@@ -4,7 +4,6 @@
 #![feature(const_collections_with_hasher)]
 #![feature(unsize)]
 #![feature(coerce_unsized)]
-
 #![allow(clippy::uninlined_format_args)]
 
 mod arena;
@@ -21,8 +20,7 @@ mod storage;
 pub mod util;
 
 use std::{
-    borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     future::Future,
     marker::PhantomData,
@@ -282,6 +280,8 @@ pub trait DatabaseExt: Database {
         Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
+        let guard = enter_span("spawn");
+
         let (storage, runtime, db) = self.storage_with_db();
         let cache = storage.container();
 
@@ -292,9 +292,16 @@ pub trait DatabaseExt: Database {
         }
 
         let mut spawn = match cache.get_or_evaluate(db, input) {
-            EvalResult::Cached(cached) => SpawnResult::Cached(cached),
-            EvalResult::Pending(pending) => SpawnResult::Pending(pending),
+            EvalResult::Cached(cached) => {
+                guard.rename("spawn cached");
+                SpawnResult::Cached(cached)
+            },
+            EvalResult::Pending(pending) => {
+                guard.rename("spawn pending");
+                SpawnResult::Pending(pending)
+            },
             EvalResult::Eval(eval) => {
+                guard.rename("spawn eval");
                 // spawn the query, but postpone checking it for completion until the returned
                 // future is polled. That way the spawned task has a chance of completing first.
                 let id = runtime::QueryTask::path(&eval).resource;
@@ -385,14 +392,6 @@ pub trait DatabaseExt: Database {
     {
         assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
 
-        let _guard = tracing::debug_span!(
-            "invalidate",
-            query = %crate::util::fmt::from_fn(|f| {
-                crate::fmt::wrap(self.as_dyn(), f, |f| Q::fmt(&input, f))
-            }),
-        )
-        .entered();
-
         let (storage, runtime) = self.storage_mut();
         let cache = storage.container_mut();
         cache.invalidate(runtime, &input);
@@ -406,7 +405,7 @@ pub trait DatabaseExt: Database {
         <T::Container as ElementContainer>::Value: Sized,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(|| format!("insert {}", std::any::type_name::<T>()));
+        let _guard = enter_span("insert");
 
         let (storage, _runtime) = self.storage();
         let container = storage.container();
@@ -421,7 +420,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainerRef + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(|| format!("insert_ref {}", std::any::type_name::<T>()));
+        let _guard = enter_span("insert");
 
         let (storage, _runtime) = self.storage();
         let container = storage.container();
@@ -436,7 +435,7 @@ pub trait DatabaseExt: Database {
         T::Container: ElementContainer + Container<Self> + 'db,
         Self: WithStorage<T::Storage>,
     {
-        let _guard = crate::enter_span(|| format!("lookup {}", std::any::type_name::<T>()));
+        let _guard = crate::enter_span("lookup");
 
         let (storage, runtime) = self.storage();
         let container = storage.container();
@@ -549,18 +548,59 @@ impl Metrics {
     }
 }
 
-#[derive(Default)]
-struct Span {
-    duration: Duration,
-    max_duration: Duration,
-    count: usize,
+#[derive(Default, Clone, Copy)]
+pub struct Span {
+    pub duration: Duration,
+    pub max_duration: Duration,
+    pub count: usize,
 }
 
-type SpanName = Cow<'static, str>;
+impl Span {
+    pub fn extend(mut self, duration: Duration) -> Self {
+        self.count += 1;
+        self.duration += duration;
+        self.max_duration = std::cmp::max(self.max_duration, duration);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpanName {
+    name: &'static str,
+    typ: Option<&'static str>,
+}
+
+impl SpanName {
+    fn new<T>(name: &'static str) -> Self {
+        Self {
+            name,
+            typ: Some(std::any::type_name::<T>()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.name.len() + self.typ.map(|t| 1 + t.len()).unwrap_or(0)
+    }
+}
+
+impl std::fmt::Display for SpanName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+        if let Some(typ) = self.typ {
+            write!(f, " {}", typ)?;
+        }
+        Ok(())
+    }
+}
 
 thread_local! {
     static METRICS: RefCell<Metrics> = RefCell::new(Metrics::new());
     static ACTIVE_STACK: RefCell<Vec<ActiveSpan>> = RefCell::new(Vec::new());
+}
+
+thread_local! {
+    pub static ALLOC_SPAN: Cell<Span> = Cell::new(Span::default());
+    pub static DEALLOC_SPAN: Cell<Span> = Cell::new(Span::default());
 }
 
 static GLOBAL_METRICS: Mutex<Metrics> = Mutex::new(Metrics::new());
@@ -581,17 +621,21 @@ macro_rules! metrics_enabled {
     };
 }
 
+impl From<&'static str> for SpanName {
+    fn from(name: &'static str) -> Self {
+        Self { name, typ: None }
+    }
+}
+
 #[inline]
-pub fn enter_span<T>(name: impl FnOnce() -> T) -> SpanGuard
-where
-    T: Into<SpanName>,
-{
+pub fn enter_span(name: impl Into<SpanName>) -> SpanGuard {
     if metrics_enabled!() {
         ACTIVE_STACK.with(|active| {
-            active.borrow_mut().push(ActiveSpan {
-                name: name().into(),
-                start: std::time::Instant::now(),
-            })
+            let mut active = active.borrow_mut();
+            active.reserve(1);
+            let name = name.into();
+            let start = std::time::Instant::now();
+            active.push(ActiveSpan { name, start })
         })
     }
 
@@ -601,6 +645,14 @@ where
 #[must_use]
 pub struct SpanGuard {
     _private: (),
+}
+
+impl SpanGuard {
+    pub fn rename(&self, new: impl Into<SpanName>) {
+        if metrics_enabled!() {
+            ACTIVE_STACK.with(|active| active.borrow_mut().last_mut().unwrap().name = new.into());
+        }
+    }
 }
 
 impl Drop for SpanGuard {
@@ -616,9 +668,7 @@ impl Drop for SpanGuard {
             METRICS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
                 let span = metrics.spans.entry(active.name).or_default();
-                span.duration += duration;
-                span.max_duration = duration.max(span.max_duration);
-                span.count += 1;
+                *span = span.extend(duration);
             })
         }
     }
@@ -628,6 +678,20 @@ fn publish_metrics() {
     if metrics_enabled!() {
         METRICS.with(|metrics| {
             let mut metrics = metrics.borrow_mut();
+
+            ALLOC_SPAN.with(|span| {
+                let span = span.take();
+                if span.count != 0 {
+                    metrics.spans.insert("alloc".into(), span);
+                }
+            });
+            DEALLOC_SPAN.with(|span| {
+                let span = span.take();
+                if span.count != 0 {
+                    metrics.spans.insert("dealloc".into(), span);
+                }
+            });
+
             let mut global = GLOBAL_METRICS.lock().unwrap();
             for (name, span) in metrics.spans.drain() {
                 let global_span = global.spans.entry(name).or_default();
@@ -669,7 +733,7 @@ fn print_metrics_impl(metrics: &Metrics) -> std::io::Result<()> {
 
     writeln!(
         writer,
-        " {:>7}  {:>7}  {:>7}  {:>7}  {:<7}",
+        " {:>7}  {:>7}  {:>7}  {:>7}  {:<8}",
         "total", "max", "average", "count", name_header
     )?;
 
@@ -680,7 +744,7 @@ fn print_metrics_impl(metrics: &Metrics) -> std::io::Result<()> {
 
     writeln!(
         writer,
-        " -------  -------  -------  -------  {}",
+        " -------  -------  -------  --------  {}",
         "-".repeat(longest_name),
     )?;
 
@@ -688,7 +752,7 @@ fn print_metrics_impl(metrics: &Metrics) -> std::io::Result<()> {
         let rate = span.duration / span.count as u32;
         writeln!(
             writer,
-            " {:>7}  {:>7}  {:>7}  {:>7}  {}",
+            " {:>7}  {:>7}  {:>7}  {:>8}  {}",
             PrettyDuration(span.duration),
             PrettyDuration(span.max_duration),
             PrettyDuration(rate),

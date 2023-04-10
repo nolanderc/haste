@@ -30,10 +30,6 @@ pub struct Runtime {
     /// Our custom executor is used for compute-bound tasks.
     executor: Executor,
 
-    /// The tokio runtime is used to handle any IO-bound tasks.
-    #[allow(dead_code)]
-    tokio_runtime: tokio::runtime::Runtime,
-
     /// For each blocked task: the task it is blocked on.
     ///
     /// This is used to detect and resolve dependency cycles.
@@ -45,13 +41,8 @@ pub struct Runtime {
 
 impl Runtime {
     pub(crate) fn new() -> Self {
-        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let scheduler = Executor::new(tokio_runtime.handle().clone());
+        let scheduler = Executor::new();
         Self {
-            tokio_runtime,
             executor: scheduler,
             graph: Default::default(),
             revisions: ChangeHistory::new(),
@@ -395,7 +386,7 @@ impl Runtime {
             return;
         }
 
-        let _guard = crate::enter_span(|| "would_block_on");
+        let _guard = crate::enter_span("would_block_on");
 
         tracing::trace!(
             child = %crate::util::fmt::ingredient(db, child),

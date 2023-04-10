@@ -39,13 +39,6 @@ pub struct Executor {
 }
 
 struct Shared {
-    /// Handle to the tokio runtime.
-    ///
-    /// This is only used so that tasks in our executor can offload IO-bound work if necessary. No
-    /// tasks may be spawned in the tokio runtime, as we cannot guarantee that they are dropped
-    /// when `stop` is called.
-    tokio_handle: tokio::runtime::Handle,
-
     injector: Injector,
     workers: Vec<WorkerState>,
     state: SharedState,
@@ -144,7 +137,7 @@ pub fn worker_threads() -> usize {
 }
 
 impl Executor {
-    pub fn new(tokio_handle: tokio::runtime::Handle) -> Self {
+    pub fn new() -> Self {
         let worker_count = worker_threads();
 
         let workers = (0..worker_count + 1)
@@ -152,8 +145,6 @@ impl Executor {
             .collect::<Vec<_>>();
 
         let shared = Arc::new(Shared {
-            tokio_handle,
-
             injector: Injector::new(),
             workers: workers
                 .iter()
@@ -513,7 +504,6 @@ impl LocalScheduler {
 
                 let local_ref = cell.borrow();
                 let local = local_ref.as_ref().unwrap();
-                let _tokio_guard = local.shared.tokio_handle.enter();
 
                 f(local)
             };
@@ -590,7 +580,7 @@ impl LocalScheduler {
                 return Some(task);
             }
 
-            backoff.spin();
+            backoff.snooze();
         }
 
         self.suspend()
@@ -614,6 +604,8 @@ impl LocalScheduler {
     }
 
     fn suspend_running(&self) -> Option<Task> {
+        let _guard = crate::enter_span("idle");
+
         let shared = &*self.shared;
 
         shared.idle_workers_approx.fetch_add(1, Relaxed);

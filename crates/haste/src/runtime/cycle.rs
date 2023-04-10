@@ -146,14 +146,6 @@ impl CycleGraph {
             wakers[index].take().unwrap().wake();
         };
 
-        tracing::info!(
-            cycle = %Cycle {
-                start: 0,
-                participants: participants.clone()
-            }.fmt(db),
-            "found dependency cycle"
-        );
-
         if recovered.is_empty() {
             // distribute the cycle to all participants
             (0..participants.len()).for_each(wake_cycle);

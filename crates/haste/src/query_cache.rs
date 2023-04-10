@@ -120,13 +120,6 @@ where
         let slot = self.storage.slot(id);
         let current = self.storage.current_revision();
 
-        let _guard = tracing::debug_span!(
-            parent: None,
-            "last_change",
-            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
-        )
-        .entered();
-
         match self.claim(slot) {
             Err(Some(output)) => {
                 return LastChangeFuture::Ready(Change {
@@ -363,38 +356,22 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         id: Id,
         slot: &'a QuerySlot<Q>,
     ) -> EvalResult<'a, Q> {
-        let span = tracing::debug_span!(
-            "get_or_evaluate",
-            query = %crate::util::fmt::ingredient(db.as_dyn(), self.ingredient(id)),
-        );
-        let _guard = span.entered();
-
         match self.claim(slot) {
-            Ok(slot) => {
-                tracing::trace!("out of date");
-                match self.execute_query(db, id, slot) {
-                    Ok(task) => {
-                        tracing::trace!("execute");
-                        EvalResult::Eval(task)
-                    }
-                    Err(backdated) => EvalResult::Cached(QueryResult {
-                        id,
-                        slot: backdated,
-                    }),
-                }
-            }
+            Ok(slot) => match self.execute_query(db, id, slot) {
+                Ok(task) => EvalResult::Eval(task),
+                Err(backdated) => EvalResult::Cached(QueryResult {
+                    id,
+                    slot: backdated,
+                }),
+            },
             Err(None) => {
-                tracing::trace!("wait until completed");
                 // the query is executed elsewhere: await its result
                 let path = self.ingredient(id);
                 let current = self.storage.current_revision();
                 let pending = unsafe { wait_until_finished(db, slot, current, path) };
                 EvalResult::Pending(pending)
             }
-            Err(Some(slot)) => {
-                tracing::trace!("using cached output");
-                EvalResult::Cached(QueryResult { id, slot })
-            }
+            Err(Some(slot)) => EvalResult::Cached(QueryResult { id, slot }),
         }
     }
 
@@ -415,12 +392,6 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
         let state = match verify::verify_shallow(verify_data) {
             Ok(Ok(backdated)) => return Err(backdated),
             result => crate::runtime::BoxedQueryTask::new(db.runtime(), move || {
-                let span = tracing::debug_span!(
-                    parent: None,
-                    "evaluate",
-                    query = %crate::util::fmt::ingredient(db.as_dyn(), this),
-                );
-
                 let state = match result {
                     Ok(Ok(_backdated)) => unreachable!(),
                     Ok(Err(data)) => TaskState::execute(this, data),
@@ -430,7 +401,7 @@ impl<Q: Query, Lookup> QueryCacheImpl<Q, Lookup> {
                     },
                 };
 
-                QueryCacheTask { state, span }
+                QueryCacheTask { state }
             }),
         };
 
@@ -451,8 +422,6 @@ pub type BoxedQueryCacheTask<'a, Q> = crate::runtime::BoxedQueryTask<QueryCacheT
 pub struct QueryCacheTask<'a, Q: Query> {
     #[pin]
     state: TaskState<'a, Q>,
-    // /// A span representing the duration of the query.
-    span: tracing::Span,
 }
 
 #[pin_project::pin_project(project = TaskStateProj)]
@@ -468,8 +437,6 @@ enum TaskState<'a, Q: Query> {
 impl<'a, Q: Query> TaskState<'a, Q> {
     fn execute(path: IngredientPath, data: VerifyData<'a, Q>) -> Self {
         let VerifyData { db, slot, storage } = data;
-
-        tracing::trace!("execute");
 
         let input = slot.input().clone();
         let inner = db.runtime().execute_query(db, input, path);
@@ -500,8 +467,7 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        let _span_guard = this.span.enter();
-        let _guard = crate::enter_span(|| format!("poll {}", std::any::type_name::<Q>()));
+        let _guard = crate::enter_span(crate::SpanName::new::<Q>("poll"));
 
         loop {
             match this.state.as_mut().project() {
@@ -551,7 +517,6 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let poll_inner = this.inner.as_mut().poll(cx);
 
         let result = std::task::ready!(poll_inner);
-        tracing::trace!("output ready");
 
         let mut new = this.storage.create_output(result);
         let mut slot = this.slot.take().unwrap();
@@ -568,14 +533,10 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
                         old.transitive.as_mut().unwrap().add_input(last_changed);
                     }
 
-                    tracing::debug!(reason = "output unchanged", "backdating");
-
                     let slot = slot.backdate();
                     return Poll::Ready(QueryResult { id, slot });
                 }
             }
-
-            tracing::trace!("output changed");
         }
 
         if Q::IS_INPUT {
@@ -583,8 +544,6 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
             let current = this.inner.database().runtime().current_revision();
             new.transitive.as_mut().unwrap().add_input(current);
         }
-
-        tracing::debug!(durability = ?new.transitive.unwrap().durability(), "computed output");
 
         let slot = slot.finish(new);
         Poll::Ready(QueryResult { id, slot })

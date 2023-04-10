@@ -7,7 +7,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 ///
 /// ```
 /// # use std::mem::size_of;
-/// # use haste::non_max::NonMaxU32;
+/// # use haste::integer::NonMaxU32;
 /// assert_eq!(size_of::<NonMaxU32>(), size_of::<Option<NonMaxU32>>());
 /// ```
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -59,7 +59,7 @@ impl NonMaxU32 {
 ///
 /// ```
 /// # use std::mem::size_of;
-/// # use haste::non_max::NonMaxU16;
+/// # use haste::integer::NonMaxU16;
 /// assert_eq!(size_of::<NonMaxU16>(), size_of::<Option<NonMaxU16>>());
 /// ```
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]

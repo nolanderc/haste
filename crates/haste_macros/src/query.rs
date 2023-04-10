@@ -146,7 +146,7 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
             #db_ident: &'db dyn #db_path,
             #(#input_idents: #input_types),*
         ) -> impl std::future::Future<Output = #return_type> + 'db {
-            #ident::spawn(db, #(#input_idents),*)
+            #ident::spawn(#db_ident, #(#input_idents),*)
         }
 
         impl #ident {

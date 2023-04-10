@@ -46,8 +46,33 @@ mod token;
 mod typing;
 mod util;
 
+#[no_mangle]
+pub static mut malloc_conf: *const std::ffi::c_char =
+    b"background_thread:true,metadata_thp:always,percpu:phycpu\0".as_ptr() as _;
+
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// #[global_allocator]
+// static GLOBAL: DebugGlobal = DebugGlobal;
+
+struct DebugGlobal;
+
+unsafe impl std::alloc::GlobalAlloc for DebugGlobal {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let start = std::time::Instant::now();
+        let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
+        let duration = start.elapsed();
+        haste::ALLOC_SPAN.with(|span| span.set(span.get().extend(duration)));
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        let start = std::time::Instant::now();
+        tikv_jemallocator::Jemalloc.dealloc(ptr, layout);
+        let duration = start.elapsed();
+        haste::DEALLOC_SPAN.with(|span| span.set(span.get().extend(duration)));
+    }
+}
 
 #[haste::storage]
 pub struct Storage(

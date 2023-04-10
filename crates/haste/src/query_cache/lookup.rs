@@ -62,7 +62,7 @@ where
         let hash = self.entries.hash(&input);
 
         // First check if the value already exists.
-        let shard = self.entries.shard(hash).read().unwrap();
+        let shard = self.entries.shard(hash).read();
         if let Some(&id) = shard.get(hash, eq_fn) {
             return (id, unsafe { storage.get_slot_unchecked(id) });
         }
@@ -70,7 +70,7 @@ where
         let len_before = shard.len();
         drop(shard);
 
-        let mut shard = self.entries.shard(hash).write().unwrap();
+        let mut shard = self.entries.shard(hash).write();
         let len_after = shard.len();
 
         // Make sure the value was not inserted while we waited on the write lock
@@ -101,7 +101,7 @@ where
         let eq_fn = Self::eq_fn(input, storage);
         let hash = self.entries.hash(&input);
 
-        let shard = self.entries.shard_mut(hash).get_mut().unwrap();
+        let shard = self.entries.shard_mut(hash).get_mut();
         let id = *shard.get(hash, eq_fn)?;
 
         Some((id, storage.slot_mut(id)))
@@ -115,7 +115,7 @@ where
         let eq_fn = Self::eq_fn(input, storage);
         let hash = self.entries.hash(&input);
 
-        let shard = self.entries.shard_mut(hash).get_mut().unwrap();
+        let shard = self.entries.shard_mut(hash).get_mut();
         let id = shard.remove_entry(hash, eq_fn)?;
 
         Some((id, storage.slot_mut(id)))

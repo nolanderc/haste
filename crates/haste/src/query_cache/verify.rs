@@ -20,17 +20,14 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
         return Ok(Err(data))
     };
     let Some(previous) = data.slot.get_output() else {
-        tracing::trace!("never finished executing");
         return Ok(Err(data))
     };
     let Some(transitive) = previous.transitive else {
-        tracing::trace!("invalidated");
         return Ok(Err(data))
     };
 
     if previous.dependencies.is_empty() {
         // the query does not depend on any side-effects, so is trivially verified.
-        tracing::debug!(reason = "no dependencies", "backdating");
         return Ok(Ok(data.slot.backdate()));
     }
 
@@ -39,12 +36,6 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
     let inputs = transitive.inputs;
     let durability = transitive.durability();
     if inputs_unchanged(runtime, last_verified, inputs, durability) {
-        tracing::debug!(
-            reason = "inputs unchanged",
-            ?inputs,
-            ?durability,
-            "backdating"
-        );
         return Ok(Ok(data.slot.backdate()));
     }
 
@@ -79,8 +70,6 @@ fn verify_deep<'a, Q: Query>(
                 let previous = data.slot.get_output().unwrap();
                 let transitive = previous.transitive.as_mut().unwrap();
                 transitive.update_inputs(new_transitive);
-
-                tracing::debug!(reason = "dependencies unchanged", ?transitive, "backdating");
 
                 return Ok(data.slot.backdate());
             }
@@ -117,15 +106,12 @@ impl Future for CheckDeepFuture<'_> {
         let db = self.db;
 
         loop {
-            let dependency;
             let change;
 
-            if let Some((dep, ref mut future)) = self.pending {
-                dependency = dep;
+            if let Some((_dep, ref mut future)) = self.pending {
                 change = std::task::ready!(future.poll(cx));
                 self.pending = None;
-            } else if let Some(dep) = self.dependencies.next() {
-                dependency = *dep;
+            } else if let Some(&dependency) = self.dependencies.next() {
                 match db.last_change(dependency) {
                     LastChangeFuture::Ready(ready) => change = ready,
                     LastChangeFuture::Pending(pending) => {
@@ -138,18 +124,8 @@ impl Future for CheckDeepFuture<'_> {
             };
 
             if Some(self.last_verified) < change.changed_at {
-                tracing::debug!(
-                    dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
-                    "change detected"
-                );
                 return Poll::Ready(None);
             }
-
-            tracing::debug!(
-                dependency = %crate::util::fmt::ingredient(db, dependency.ingredient()),
-                "change: {:?}",
-                change.transitive
-            );
 
             self.transitive.extend(change.transitive);
         }

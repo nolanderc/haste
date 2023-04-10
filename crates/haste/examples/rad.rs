@@ -96,12 +96,6 @@ async fn run(db: &dyn crate::Db) -> (&String, u32, u32, u32) {
 }
 
 fn main() {
-    tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .without_time()
-        .with_target(false)
-        .init();
-
     let mut db = Database::default();
 
     let start = std::time::Instant::now();

@@ -30,8 +30,6 @@ impl Injector {
     }
 
     pub fn pop(&self) -> Option<Task> {
-        let _guard = crate::enter_span(|| "steal global");
-
         if self.approx_len.load(Relaxed) == 0 {
             return None;
         }

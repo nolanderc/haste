@@ -1,6 +1,7 @@
+use dashmap::RwLock;
 use std::{
     hash::{BuildHasher, Hash, Hasher},
-    sync::{atomic::AtomicUsize, RwLock},
+    sync::atomic::AtomicUsize,
 };
 
 use crossbeam_utils::CachePadded;
@@ -34,7 +35,7 @@ fn get_shard_count() -> usize {
 
     let threads = 1 + crate::runtime::executor::worker_threads();
 
-    let shard_count = (2 * threads).next_power_of_two();
+    let shard_count = (4 * threads).next_power_of_two();
     SHARDS.store(shard_count, std::sync::atomic::Ordering::Relaxed);
     shard_count
 }
@@ -48,7 +49,7 @@ impl<T, Hasher> ShardMap<T, Hasher> {
         let mut shards = Vec::with_capacity(shard_count);
 
         for _ in 0..shard_count {
-            shards.push(CachePadded::new(Shard::default()));
+            shards.push(CachePadded::new(Shard::new(RawTable::with_capacity(64))));
         }
 
         assert!(shards.len().is_power_of_two());

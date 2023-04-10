@@ -45,8 +45,6 @@ impl ChangeHistory {
         let new =
             Revision::new(self.histories[0].len() as u32 + 1).expect("exhausted revision IDs");
 
-        tracing::debug!("update {last_changed:?} -> {new:?} [{durability:?}]");
-
         let durability_level = durability.index() + 1;
         let (lower, higher) = self.histories.split_at_mut(durability_level);
 

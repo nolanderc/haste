@@ -24,7 +24,6 @@ use naming::DeclName;
 use notify::Watcher;
 use path::NormalPath;
 use util::future::IteratorExt;
-use util::future::StreamExt;
 
 use crate::common::Text;
 use crate::diagnostic::error;

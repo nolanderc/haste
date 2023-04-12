@@ -34,7 +34,7 @@ impl<T> RawArena<T> {
 
     pub fn with_capacity(capacity: usize) -> Self {
         let bytes = std::mem::size_of::<T>()
-            .checked_add(capacity)
+            .checked_mul(capacity)
             .expect("allocation exceeds system limits");
 
         let allocation = region::alloc(bytes, region::Protection::NONE).expect("allocation failed");

@@ -19,7 +19,7 @@ pub enum NormalPathData {
 
 impl NormalPath {
     pub async fn new(db: &dyn crate::Db, path: &Path) -> Result<Self> {
-        let data = NormalPathData::new(db, &path).await?;
+        let data = NormalPathData::new(db, path).await?;
         Ok(Self::insert(db, data))
     }
 
@@ -31,7 +31,7 @@ impl NormalPath {
         match self.lookup(db) {
             NormalPathData::Relative(path)
             | NormalPathData::GoPath(path)
-            | NormalPathData::GoRoot(path) => &path,
+            | NormalPathData::GoRoot(path) => path,
         }
     }
 
@@ -149,7 +149,7 @@ impl NormalPathData {
         match &self {
             NormalPathData::Relative(path)
             | NormalPathData::GoPath(path)
-            | NormalPathData::GoRoot(path) => &path,
+            | NormalPathData::GoRoot(path) => path,
         }
     }
 

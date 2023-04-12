@@ -2,7 +2,7 @@ use smallvec::SmallVec;
 
 use crate::common::Text;
 use crate::index_map::IndexMap;
-use crate::key::Key;
+use crate::key::{Key, KeyOps};
 use crate::span::Span;
 use crate::syntax::{self, ExprId, Node, NodeId, SpanId, StmtId};
 use crate::{error, Diagnostic, HashMap, Result};
@@ -16,6 +16,10 @@ pub struct NamingContext<'db> {
     ast: &'db syntax::File,
     decl: Key<syntax::Decl>,
     nodes: &'db syntax::NodeView,
+
+    node_kinds: &'db [Node],
+    node_indirect: &'db [NodeId],
+
     package: PackageId,
 
     local_scope: LocalScope,
@@ -44,6 +48,8 @@ impl<'db> NamingContext<'db> {
             ast,
             decl,
             nodes,
+            node_kinds: nodes.kinds(),
+            node_indirect: nodes.view_indirect(),
             package,
 
             package_scope: package_scope.await.as_ref()?,
@@ -54,6 +60,14 @@ impl<'db> NamingContext<'db> {
             resolved: IndexMap::with_capacity(nodes.len()),
             labels: HashMap::default(),
         })
+    }
+
+    fn indirect<R: syntax::IndirectRange>(&self, range: R) -> &'db [R::Output] {
+        range.extract(self.node_indirect)
+    }
+
+    fn kind(&self, node: impl Into<NodeId>) -> Node {
+        self.node_kinds[node.into().index()]
     }
 
     pub fn finish(mut self) -> Result<IndexMap<NodeId, Symbol>> {
@@ -73,12 +87,12 @@ impl<'db> NamingContext<'db> {
         self.local_scope.enter();
 
         let parameters = signature.inputs_and_outputs();
-        for &node in self.nodes.indirect(parameters) {
+        for &node in self.indirect(parameters) {
             let param = self.nodes.parameter(node);
             self.resolve_type(param.typ);
         }
 
-        for &node in self.nodes.indirect(parameters) {
+        for &node in self.indirect(parameters) {
             let param = self.nodes.parameter(node);
             if let Some(name) = param.name {
                 if let Some(name) = name.text {
@@ -92,8 +106,8 @@ impl<'db> NamingContext<'db> {
             let old_labels = std::mem::take(&mut self.labels);
 
             self.labels.reserve(body.labels.len());
-            for &label in self.nodes.indirect(body.labels) {
-                match self.nodes.kind(label) {
+            for &label in self.indirect(body.labels) {
+                match self.kind(label) {
                     Node::Label(name, _stmt) => {
                         let Some(name) = name.text else {
                             self.emit(error!("labels may not be blank").label(self.span(name.span), ""));
@@ -122,7 +136,7 @@ impl<'db> NamingContext<'db> {
 
     fn resolve_block(&mut self, block: syntax::Block) {
         self.local_scope.enter();
-        for stmt in self.nodes.indirect(block.statements) {
+        for stmt in self.indirect(block.statements) {
             self.resolve_stmt(*stmt);
         }
         self.local_scope.exit();
@@ -141,7 +155,7 @@ impl<'db> NamingContext<'db> {
     }
 
     fn resolve_range(&mut self, nodes: impl Into<syntax::NodeRange>) {
-        for &node in self.nodes.indirect(nodes.into()) {
+        for &node in self.indirect(nodes.into()) {
             self.resolve_node(node);
         }
     }
@@ -149,7 +163,7 @@ impl<'db> NamingContext<'db> {
     fn resolve_node(&mut self, node: NodeId) {
         // TODO: don't visit the same nodes twice (for example in multiline const decls)
 
-        match self.nodes.kind(node) {
+        match self.kind(node) {
             Node::Name(None) => {}
             Node::Name(Some(name)) => {
                 if let Some(symbol) = self.find_symbol(name) {
@@ -229,7 +243,7 @@ impl<'db> NamingContext<'db> {
             Node::Unary(_op, expr) => self.resolve_expr(expr),
 
             Node::Binary(interleaved) => {
-                for expr in self.nodes.indirect(interleaved).iter().step_by(2) {
+                for expr in self.indirect(interleaved).iter().step_by(2) {
                     self.resolve_expr(*expr);
                 }
             }
@@ -268,8 +282,8 @@ impl<'db> NamingContext<'db> {
                     self.resolve_type(typ);
                 }
                 self.resolve_range(exprs);
-                for (i, &name_node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(Some(name)) = self.nodes.kind(name_node) else { continue };
+                for (i, &name_node) in self.indirect(names).iter().enumerate() {
+                    let Node::Name(Some(name)) = self.kind(name_node) else { continue };
                     self.local_scope.insert_local(name, node, i as u16);
                 }
             }
@@ -280,8 +294,8 @@ impl<'db> NamingContext<'db> {
                 if let Some(exprs) = exprs {
                     self.resolve_range(exprs);
                 }
-                for (i, &name_node) in self.nodes.indirect(names).iter().enumerate() {
-                    let Node::Name(name) = self.nodes.kind(name_node) else {
+                for (i, &name_node) in self.indirect(names).iter().enumerate() {
+                    let Node::Name(name) = self.kind(name_node) else {
                         self.emit(error!("variable declaration must bind to an identifier")
                             .label(self.node_span(node), "expected an identifier"));
                         continue;
@@ -295,7 +309,7 @@ impl<'db> NamingContext<'db> {
             }
 
             Node::Block(block) => self.resolve_block(block),
-            
+
             // NOTE: labels are already registered in the function they are defined in
             Node::Label(_name, None) => {}
             Node::Label(_name, Some(stmt)) => {
@@ -363,7 +377,7 @@ impl<'db> NamingContext<'db> {
                 if let (Some(bindings), Some(kind)) = (bindings, kind) {
                     if kind.is_define() {
                         let mut get_name = |expr: ExprId| {
-                            if let Node::Name(name) = self.nodes.kind(expr.node) {
+                            if let Node::Name(name) = self.kind(expr.node) {
                                 name
                             } else {
                                 self.emit(
@@ -407,9 +421,9 @@ impl<'db> NamingContext<'db> {
                     self.resolve_stmt(init);
                 }
                 if let Some(cond) = cond {
-                    if let Node::TypeSwitch(name, expr) = self.nodes.kind(cond) {
+                    if let Node::TypeSwitch(name, expr) = self.kind(cond) {
                         self.resolve_expr(expr);
-                        for (index, case) in self.nodes.indirect(cases).iter().enumerate() {
+                        for (index, case) in self.indirect(cases).iter().enumerate() {
                             self.local_scope.enter();
                             if let Some(name) = name.and_then(|n| n.text) {
                                 self.local_scope.insert_local(
@@ -463,7 +477,7 @@ impl<'db> NamingContext<'db> {
 
                 if kind.is_define() {
                     let mut get_name = |expr: ExprId| {
-                        if let Node::Name(name) = self.nodes.kind(expr) {
+                        if let Node::Name(name) = self.kind(expr) {
                             name
                         } else {
                             self.emit(
@@ -499,7 +513,7 @@ impl<'db> NamingContext<'db> {
 
     fn resolve_composite(&mut self, composite: syntax::CompositeRange) {
         for key in composite.keys(self.nodes) {
-            if let Node::Name(Some(name)) = self.nodes.kind(key) {
+            if let Node::Name(Some(name)) = self.kind(key) {
                 // this might be the name of a field, so might not exist in the current scope.
                 if let Some(symbol) = self.find_symbol(name) {
                     self.resolved.insert(key.node, symbol);

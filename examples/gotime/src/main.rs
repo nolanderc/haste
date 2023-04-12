@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use dashmap::DashSet;
@@ -100,20 +101,30 @@ pub struct Storage(
 )]
 pub struct Database {
     storage: haste::DatabaseStorage<Self>,
+    touched_paths: DashSet<NormalPath>,
+    stats: Statistics,
+}
+
+struct Statistics {
     bytes: AtomicUsize,
     lines: AtomicUsize,
     files: AtomicUsize,
-    touched_paths: DashSet<NormalPath>,
+    tokens: AtomicUsize,
+    nodes: AtomicUsize,
 }
 
 impl Database {
     pub fn new() -> Self {
         Self {
             storage: haste::DatabaseStorage::new(),
-            bytes: AtomicUsize::new(0),
-            lines: AtomicUsize::new(0),
-            files: AtomicUsize::new(0),
             touched_paths: DashSet::new(),
+            stats: Statistics {
+                bytes: AtomicUsize::new(0),
+                lines: AtomicUsize::new(0),
+                files: AtomicUsize::new(0),
+                tokens: AtomicUsize::new(0),
+                nodes: AtomicUsize::new(0),
+            },
         }
     }
 }
@@ -138,10 +149,14 @@ pub trait Db:
         self.runtime().set_durability(durability);
     }
 
-    /// Used to cellect metrics about the accessed files.
+    /// Used to collect metrics about the accessed files.
     fn register_file(&self, path: NormalPath, contents: &[u8]) {
-        _ = path;
-        _ = contents;
+        _ = (path, contents)
+    }
+
+    /// Used to collect metrics about the parsed files.
+    fn register_parsed_file(&self, path: NormalPath, tokens: usize, nodes: usize) {
+        _ = (path, tokens, nodes)
     }
 
     /// Get the durability of the given path.
@@ -162,12 +177,15 @@ impl Db for Database {
     fn register_file(&self, path: NormalPath, contents: &[u8]) {
         _ = path;
         let lines = 1 + contents.iter().filter(|&&byte| byte == b'\n').count();
-        self.lines
-            .fetch_add(lines, std::sync::atomic::Ordering::Relaxed);
-        self.bytes
-            .fetch_add(contents.len(), std::sync::atomic::Ordering::Relaxed);
-        self.files
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.lines.fetch_add(lines, Relaxed);
+        self.stats.bytes.fetch_add(contents.len(), Relaxed);
+        self.stats.files.fetch_add(1, Relaxed);
+    }
+
+    fn register_parsed_file(&self, path: NormalPath, tokens: usize, nodes: usize) {
+        _ = path;
+        self.stats.tokens.fetch_add(tokens, Relaxed);
+        self.stats.nodes.fetch_add(nodes, Relaxed);
     }
 
     fn path_durability_untracked(&self, path: NormalPath) -> Durability {
@@ -371,20 +389,21 @@ fn run(db: &mut Database, arguments: Arguments) {
     let cpu = process.elapsed();
     eprintln!("real: {:?} (cpu: {:?})", real, cpu);
 
-    let bytes = std::mem::take(db.bytes.get_mut());
-    let lines = std::mem::take(db.lines.get_mut());
-    let files = std::mem::take(db.files.get_mut());
+    let bytes = std::mem::take(db.stats.bytes.get_mut());
+    let lines = std::mem::take(db.stats.lines.get_mut());
+    let files = std::mem::take(db.stats.files.get_mut());
+    let tokens = std::mem::take(db.stats.tokens.get_mut());
+    let nodes = std::mem::take(db.stats.nodes.get_mut());
 
-    eprintln!(
-        "bytes: {} ({:.1} MB/s)",
-        bytes,
-        bytes as f64 / real.as_secs_f64() / 1e6
-    );
-    eprintln!(
-        "lines: {} ({:.1} K/s)",
-        lines,
-        lines as f64 / real.as_secs_f64() / 1e3
-    );
+    let bytes_rate = bytes as f64 / real.as_secs_f64() / 1e6;
+    let lines_rate = lines as f64 / real.as_secs_f64() / 1e3;
+    let tokens_rate = tokens as f64 / real.as_secs_f64() / 1e6;
+    let nodes_rate = nodes as f64 / real.as_secs_f64() / 1e6;
+
+    eprintln!("bytes: {bytes} ({bytes_rate:.1} MB/s)");
+    eprintln!("lines: {lines} ({lines_rate:.1} K/s)");
+    eprintln!("token: {tokens} ({tokens_rate:.1} M/s)");
+    eprintln!("nodes: {nodes} ({nodes_rate:.1} M/s)");
 
     let mut time_per_file = format!("{:.1?}", real / files.max(1) as u32);
     let unit_start = time_per_file
@@ -433,11 +452,12 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .try_join_all()
         .await?;
 
-    let packages = resolved
+    resolved
         .iter()
         .flatten()
         .map(|&package| compile_package_files::spawn(db, package))
-        .start_all();
+        .try_join_all()
+        .await?;
 
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
 
@@ -445,17 +465,24 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
     for &name in package_scope.keys() {
         let decl = naming::DeclId::new(db, package, name);
         let signature = typing::decl_signature::spawn(db, decl);
-        let typing = typing::type_check_body::spawn(db, decl);
         futures.push(async move {
             let signature = match signature.await? {
                 typing::Signature::Type(typ) | typing::Signature::Value(typ) => typ,
                 typing::Signature::Package(_) => unreachable!("packages are not declarations"),
             };
-            let _typing = typing.await.as_ref()?;
             Ok((name, signature))
         });
     }
     let signatures = futures.try_join_all().await?.into_iter().collect();
+
+    package_scope
+        .keys()
+        .map(|&name| {
+            let decl = naming::DeclId::new(db, package, name);
+            typing::type_check_body::spawn(db, decl)
+        })
+        .try_join_all()
+        .await?;
 
     let package_names = resolved
         .iter()
@@ -470,7 +497,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
-    packages.try_join_all().await?;
+    // packages.try_join_all().await?;
 
     Ok(Arc::new(Package {
         name: package.name,

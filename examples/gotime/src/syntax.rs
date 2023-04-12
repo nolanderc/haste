@@ -333,19 +333,19 @@ impl std::hash::Hash for NodeView {
 }
 
 impl NodeView {
-    fn kinds(&self) -> &[Node] {
+    pub fn kinds(&self) -> &[Node] {
         &self.storage.kinds[self.nodes.range()]
     }
 
-    fn spans(&self) -> &[SpanId] {
+    pub fn spans(&self) -> &[SpanId] {
         &self.storage.spans[self.nodes.range()]
     }
 
-    fn view_indirect(&self) -> &[NodeId] {
+    pub fn view_indirect(&self) -> &[NodeId] {
         &self.storage.indirect[self.indirect.range()]
     }
 
-    fn view_strings(&self) -> &BStr {
+    pub fn view_strings(&self) -> &BStr {
         &self.storage.string_buffer[self.strings.range()]
     }
 

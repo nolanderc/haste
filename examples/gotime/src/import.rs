@@ -23,10 +23,12 @@ pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<V
 
     let go_mod = closest_go_mod(db, ast.source.parent(db).unwrap()).await?;
     for import in ast.imports.iter() {
-        resolved.push(resolve::spawn(db, import.path.text, go_mod).with_context(|error| {
-            let span = ast.span(None, import.path.span);
-            error.label(span, "could not resolve the import")
-        }));
+        resolved.push(
+            resolve::spawn(db, import.path.text, go_mod).with_context(|error| {
+                let span = ast.span(None, import.path.span);
+                error.label(span, "could not resolve the import")
+            }),
+        );
     }
 
     resolved.try_join_all().await
@@ -287,7 +289,7 @@ async fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool>
         return Ok(false);
     }
 
-    let header = fs::read_header(db, path.clone()).await.as_ref()?;
+    let header = fs::read_header(db, path).await.as_ref()?;
     let constraints = match build_constraints(header) {
         Ok(constraints) => constraints,
         Err(offset) => {

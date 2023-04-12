@@ -1,3 +1,5 @@
+#![allow(clippy::single_component_path_imports)]
+
 #[macro_use]
 mod exported {
     macro_rules! error {

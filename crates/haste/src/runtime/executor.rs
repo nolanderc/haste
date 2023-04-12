@@ -648,8 +648,10 @@ impl LocalScheduler {
     }
 
     fn schedule(&self, task: Task) {
-        if let Some(old) = self.reserved_next.replace(Some(task)) {
-            self.schedule_stealable(old);
+        if unsafe { (*self.reserved_next.as_ptr()).is_none() } {
+            self.reserved_next.set(Some(task));
+        } else {
+            self.schedule_stealable(task);
         }
     }
 

@@ -196,7 +196,7 @@ impl<'a> EvalContext<'a> {
                         BinOp::ShiftLeft => {
                             let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
                             let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
-                            if rhs < 0 || rhs > (1 << 10) {
+                            if !(0..=(1 << 10)).contains(&rhs) {
                                 return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this left shift")
                                     .label(self.node_span(pair[1]), format!("this was {rhs}")));
@@ -207,7 +207,7 @@ impl<'a> EvalContext<'a> {
                         BinOp::ShiftRight => {
                             let lhs = self.as_integer(&lhs, || self.join_span(start, end))?;
                             let rhs = self.as_integer(&rhs, || self.node_span(pair[1]))?;
-                            if rhs < 0 || rhs > (1 << 10) {
+                            if !(0..=(1 << 10)).contains(&rhs) {
                                 return Err(error!("invalid shift amount")
                                     .label(self.node_span(pair[0]), "in this right shift")
                                     .label(self.node_span(pair[1]), format!("this was {rhs}")));

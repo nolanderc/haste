@@ -63,7 +63,15 @@ pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Resu
     parser.data.node.indirect.reserve(expected_node_count);
 
     match parser.file() {
-        Ok(file) => Ok(file),
+        Ok(file) => {
+            let nodes = match file.declarations.iter().next() {
+                None => 0,
+                Some(decl) => decl.nodes.storage.kinds.len(),
+            };
+            db.register_parsed_file(path, tokens.len(), nodes);
+
+            Ok(file)
+        },
         Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics)),
     }
 }

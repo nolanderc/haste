@@ -509,7 +509,28 @@ pub async fn package_scope(
     Err(Diagnostic::combine(combined))
 }
 
-pub type MethodSet = crate::HashSet<Text>;
+#[derive(Default, PartialEq, Eq)]
+pub struct MethodSet {
+    /// For each method name, the name of the receiver.
+    receivers: crate::HashMap<Text, Text>,
+}
+
+impl MethodSet {
+    pub fn get(&self, name: Text) -> Option<DeclName> {
+        let receiver = *self.receivers.get(&name)?;
+        Some(DeclName {
+            receiver: Some(receiver),
+            base: name,
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = DeclName> + ExactSizeIterator + '_ {
+        self.receivers.iter().map(|(&name, &receiver)| DeclName {
+            receiver: Some(receiver),
+            base: name,
+        })
+    }
+}
 
 /// For each declaration in a package, its set of methods.
 #[haste::query]
@@ -517,16 +538,75 @@ pub async fn package_methods(
     db: &dyn crate::Db,
     package: FileSet,
 ) -> Result<crate::HashMap<Text, Arc<MethodSet>>> {
+    async fn signature_span(db: &dyn crate::Db, path: DeclPath, index: usize) -> Result<Span> {
+        let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+        let decl = &ast.declarations[path.index];
+        Ok(ast.span(Some(path.index), decl.nodes.spans()[index]))
+    }
+
     let package_scope = package_scope(db, package).await.as_ref()?;
 
     let mut methods = crate::HashMap::default();
 
-    for &name in package_scope.keys() {
-        if let Some(receiver) = name.receiver {
+    for (&name, &path) in package_scope.iter() {
+        if let Some(original_receiver) = name.receiver {
+            let mut visited = HashSet::default();
+            let mut receiver = original_receiver;
+
+            loop {
+                let receiver_name = DeclName {
+                    receiver: None,
+                    base: receiver,
+                };
+
+                let Some(receiver_path) = package_scope.get(&receiver_name) else {
+                    return Err(error!("expected a declared type defined in the same package")
+                        .label(signature_span(db, path, 0).await?, ""));
+                };
+
+                let ast = syntax::parse_file(db, receiver_path.source)
+                    .await
+                    .as_ref()?;
+
+                let decl = &ast.declarations[receiver_path.index];
+                let SingleDecl::TypeAlias(alias) = receiver_path.sub.lookup_in(decl) else {
+                    break
+                };
+
+                let Node::Name(Some(inner_name)) = decl.nodes.kind(alias.inner) else {
+                    return Err(error!("expected a declared type defined in the same package")
+                        .label(signature_span(db, path, 0).await?, ""));
+                };
+
+                receiver = inner_name;
+
+                if !visited.insert(receiver) {
+                    return Err(error!("cycle expected while resolving receiver type")
+                        .label(signature_span(db, path, 0).await?, ""));
+                }
+            }
+
             let set = methods
                 .entry(receiver)
                 .or_insert_with(|| Arc::new(MethodSet::default()));
-            Arc::make_mut(set).insert(name.base);
+
+            if let Some(previous) = Arc::get_mut(set)
+                .unwrap()
+                .receivers
+                .insert(name.base, original_receiver)
+            {
+                let old_path = package_scope[&DeclName {
+                    receiver: Some(previous),
+                    ..name
+                }];
+
+                return Err(error!(
+                    "duplicate method definition of `{}` for `{}`",
+                    name.base, receiver
+                )
+                .label(signature_span(db, old_path, 1).await?, "first definition")
+                .label(signature_span(db, path, 1).await?, "second definition"));
+            }
         }
     }
 

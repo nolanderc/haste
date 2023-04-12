@@ -897,6 +897,8 @@ pub struct TypingInfo {
     locals: IndexMap<naming::Local, InferredType>,
     /// Value of all constants in the declaration.
     constants: IndexMap<naming::Local, ConstValue>,
+
+    redeclarations: IndexMap<naming::Local, naming::Local>,
 }
 
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
@@ -1254,15 +1256,8 @@ async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<Selectio
 
         let decl_data = decl.lookup(db);
 
-        for &method in methods.iter() {
-            let method_decl = DeclId::new(
-                db,
-                decl_data.package,
-                naming::DeclName {
-                    receiver: Some(decl_data.name.base),
-                    base: method,
-                },
-            );
+        for method in methods.iter() {
+            let method_decl = DeclId::new(db, decl_data.package, method);
 
             let decl_type = match decl_signature(db, method_decl).await? {
                 Signature::Value(typ) => typ,
@@ -1275,7 +1270,7 @@ async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<Selectio
 
             let method_func = func.without_receiver();
             let method_type = TypeKind::Function(method_func).insert(db);
-            add_candidate(method, Selection::Method(method_type));
+            add_candidate(method.base, Selection::Method(method_type));
         }
 
         typ = underlying_type_for_decl(db, decl).await?;
@@ -1400,20 +1395,9 @@ async fn declared_method_signature(
     name: Text,
 ) -> Result<Option<FunctionType>> {
     let methods = naming::method_set(db, decl).await?;
-    if !methods.contains(&name) {
-        return Ok(None);
-    }
+    let Some(method) = methods.get(name) else { return Ok(None) };
 
-    let decl_data = decl.lookup(db);
-
-    let method_decl = DeclId::new(
-        db,
-        decl_data.package,
-        naming::DeclName {
-            receiver: Some(decl_data.name.base),
-            base: name,
-        },
-    );
+    let method_decl = DeclId::new(db, decl.package(db), method);
 
     let method_type = match decl_signature(db, method_decl).await? {
         Signature::Value(typ) => typ,

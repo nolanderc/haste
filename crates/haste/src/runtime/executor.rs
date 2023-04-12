@@ -237,7 +237,7 @@ impl Executor {
     }
 
     pub fn start(&self) -> bool {
-        let shared = &*self.shared;
+        let shared: &Shared = &self.shared;
 
         let result = shared.state.compare_exchange(
             State::Shutdown,
@@ -249,9 +249,7 @@ impl Executor {
     }
 
     pub fn stop(&self) -> bool {
-        let shared = &self.shared;
-
-        let result = shared.state.compare_exchange(
+        let result = self.shared.state.compare_exchange(
             State::Running,
             State::Shutdown,
             Ordering::SeqCst,
@@ -261,6 +259,17 @@ impl Executor {
         if matches!(result, Err(State::Shutdown | State::Terminated)) {
             return false;
         }
+
+        self.wait_until_suspended();
+
+        crate::publish_metrics();
+        crate::print_global_metrics();
+
+        true
+    }
+
+    fn wait_until_suspended(&self) {
+        let shared: &Shared = &self.shared;
 
         // notify the workers that we are now in shutdown
         {
@@ -298,11 +307,6 @@ impl Executor {
 
             *suspended_workers -= 1;
         }
-
-        crate::publish_metrics();
-        crate::print_global_metrics();
-
-        true
     }
 
     fn terminate(&mut self) {
@@ -390,6 +394,10 @@ impl LocalScheduler {
                 }
             });
 
+            if local.shared.state.load(Relaxed) == State::Shutdown {
+                local.suspend_shutdown();
+            }
+
             while let Some(task) = local.next_task() {
                 local.poll_task(task);
             }
@@ -453,21 +461,12 @@ impl LocalScheduler {
                     if stalled_count <= max_stalled_count {
                         std::hint::spin_loop();
                     } else {
-                        if Arc::strong_count(&task_state) <= 2 {
-                            panic!("cannot complete");
-                        }
-
                         if !in_deadlock {
                             // check for deadlock
                             let idle = shared.idle_mutex.lock().unwrap();
                             let suspended = shared.suspended_workers.lock().unwrap();
 
                             let not_running = 1 + *idle + *suspended;
-
-                            eprintln!(
-                                "idle: {}  suspended: {}  total: {}",
-                                *idle, *suspended, not_running
-                            );
 
                             if not_running >= shared.workers.len()
                                 && task_state.ready.load(Relaxed) == 0
@@ -613,12 +612,15 @@ impl LocalScheduler {
     }
 
     fn suspend(&self) -> Option<Task> {
-        let shared = &*self.shared;
+        let shared: &Shared = &self.shared;
 
         loop {
             match shared.state.load(Relaxed) {
                 State::Terminated => return None,
-                State::Shutdown => self.suspend_shutdown(),
+                State::Shutdown => {
+                    self.drain();
+                    self.suspend_shutdown();
+                }
                 State::Running => {
                     if let Some(task) = self.suspend_running() {
                         return Some(task);
@@ -632,7 +634,7 @@ impl LocalScheduler {
     fn suspend_running(&self) -> Option<Task> {
         let _guard = crate::enter_span("idle");
 
-        let shared = &*self.shared;
+        let shared: &Shared = &self.shared;
 
         shared.idle_workers_approx.fetch_add(1, Ordering::SeqCst);
         let _guard = CallOnDrop(|| shared.idle_workers_approx.fetch_sub(1, Ordering::SeqCst));
@@ -654,19 +656,17 @@ impl LocalScheduler {
     }
 
     fn suspend_shutdown(&self) {
-        self.drain();
-
         crate::publish_metrics();
 
-        let shared = &*self.shared;
+        let shared: &Shared = &self.shared;
 
         shared
             .suspended_workers_approx
-            .fetch_add(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::Relaxed);
         let _guard = CallOnDrop(|| {
             shared
                 .suspended_workers_approx
-                .fetch_sub(1, Ordering::SeqCst)
+                .fetch_sub(1, Ordering::Relaxed)
         });
 
         let mut suspended = shared.suspended_workers.lock().unwrap();

@@ -64,6 +64,7 @@ impl<'db> TypingContext<'db> {
                 nodes: IndexMap::new(),
                 locals: IndexMap::new(),
                 constants: IndexMap::new(),
+                redeclarations: IndexMap::default(),
             },
             func: None,
         })
@@ -87,7 +88,13 @@ impl<'db> TypingContext<'db> {
     async fn lookup_node(&self, node: NodeId) -> Result<Option<InferredType>> {
         let Some(&symbol) = self.references.get(&node) else { return Ok(None) };
         match symbol {
-            naming::Symbol::Local(local) => Ok(self.types.locals.get(&local).copied()),
+            naming::Symbol::Local(local) => match self.types.locals.get(&local) {
+                Some(typ) => Ok(Some(*typ)),
+                None => {
+                    let Some(actual) = self.types.redeclarations.get(&local) else { return Ok(None) };
+                    Ok(self.types.locals.get(&actual).copied())
+                }
+            },
             naming::Symbol::Global(global) => match super::signature(self.db, global).await? {
                 Signature::Value(typ) => Ok(Some(InferredType::Value(typ))),
                 Signature::Type(typ) => Ok(Some(InferredType::Type(typ))),
@@ -2770,11 +2777,11 @@ impl<'db> TypingContext<'db> {
             .map(Some)
             .chain(std::iter::repeat_with(|| None));
 
-        for ((index, typ), value) in (0..).zip(types).zip(value_iter) {
-            let typ = if constant {
-                typ
-            } else {
-                typ.value_type(self.db).map_err(|error| {
+        let name_nodes = self.nodes.indirect(names);
+
+        for (((index, name), mut typ), value) in (0..).zip(name_nodes).zip(types).zip(value_iter) {
+            if !constant {
+                typ = typ.value_type(self.db).map_err(|error| {
                     error.label(
                         self.node_span(self.nodes.indirect(exprs.unwrap())[index]),
                         "",
@@ -2786,10 +2793,23 @@ impl<'db> TypingContext<'db> {
                 node: stmt.node,
                 index: index as u16,
             };
+            let mut id = local;
+
+            if let Some(naming::Symbol::Local(redecl)) = self.references.get(name) {
+                let old_type = self.types.locals[redecl].value();
+                let old_core = super::underlying_type(self.db, old_type).await?;
+                let new_core = super::underlying_type(self.db, typ).await?;
+                if old_core == new_core {
+                    typ = old_type;
+                    id = *self.types.redeclarations.get(redecl).unwrap_or(redecl);
+                    self.types.redeclarations.insert(local, id);
+                }
+            }
+
             self.types.locals.insert(local, InferredType::Value(typ));
 
             if let Some(value) = value {
-                self.types.constants.insert(local, value);
+                self.types.constants.insert(id, value);
             }
         }
 

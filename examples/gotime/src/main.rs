@@ -469,13 +469,6 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .try_join_all()
         .await?;
 
-    resolved
-        .iter()
-        .flatten()
-        .map(|&package| compile_package_files::spawn(db, package))
-        .try_join_all()
-        .await?;
-
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
 
     let mut futures = Vec::new();
@@ -514,7 +507,12 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
-    // packages.try_join_all().await?;
+    resolved
+        .iter()
+        .flatten()
+        .map(|&package| compile_package_files::spawn(db, package))
+        .try_join_all()
+        .await?;
 
     Ok(Arc::new(Package {
         name: package.name,

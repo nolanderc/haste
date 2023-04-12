@@ -56,7 +56,8 @@ impl<'a> EvalContext<'a> {
                 };
                 match symbol {
                     naming::Symbol::Local(local) => {
-                        if let Some(value) = self.types.constants.get(&local) {
+                        let id = self.types.redeclarations.get(&local).unwrap_or(&local);
+                        if let Some(value) = self.types.constants.get(id) {
                             return Ok(value.clone());
                         }
                         Err(error!("cannot evaluate variable at compile-time")

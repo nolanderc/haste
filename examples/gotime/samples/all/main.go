@@ -13,4 +13,11 @@ import (
 func main() {
     const N = 3
     var index [N]int
+
+    var containers Containers
+    containers.filter()
 }
+
+type Containers []int
+
+func (c Containers) filter() {}

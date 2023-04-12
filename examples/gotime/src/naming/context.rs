@@ -26,6 +26,8 @@ pub struct NamingContext<'db> {
     file_scope: &'db IndexMap<DeclName, FileMember>,
     package_scope: &'db IndexMap<DeclName, DeclPath>,
 
+    parameter_scopes: SmallVec<[ScopeId; 4]>,
+
     diagnostics: Option<Diagnostic>,
     resolved: IndexMap<NodeId, Symbol>,
     labels: HashMap<Text, StmtId>,
@@ -56,6 +58,8 @@ impl<'db> NamingContext<'db> {
             file_scope: file_scope.await.as_ref()?,
             local_scope: LocalScope::with_capacity(nodes.len()),
 
+            parameter_scopes: Default::default(),
+
             diagnostics: None,
             resolved: IndexMap::with_capacity(nodes.len()),
             labels: HashMap::default(),
@@ -85,6 +89,7 @@ impl<'db> NamingContext<'db> {
         body: Option<syntax::FunctionBody>,
     ) {
         self.local_scope.enter();
+        self.parameter_scopes.push(self.local_scope.current_scope());
 
         let parameters = signature.inputs_and_outputs();
         for &node in self.indirect(parameters) {
@@ -131,6 +136,7 @@ impl<'db> NamingContext<'db> {
             self.labels = old_labels;
         }
 
+        self.parameter_scopes.pop();
         self.local_scope.exit();
     }
 
@@ -301,6 +307,18 @@ impl<'db> NamingContext<'db> {
                         continue;
                     };
                     let Some(name) = name else { continue };
+
+                    if let Some((old, scope)) = self.local_scope.get(name) {
+                        if scope == self.local_scope.current_scope()
+                            || Some(&scope) == self.parameter_scopes.last()
+                        {
+                            // redeclare the variable
+                            self.local_scope.insert_local(name, node, i as u16);
+                            self.resolved.insert(name_node, Symbol::Local(old));
+                            continue;
+                        }
+                    }
+
                     self.local_scope.insert_local(name, node, i as u16);
                 }
             }
@@ -394,10 +412,10 @@ impl<'db> NamingContext<'db> {
                         self.local_scope.enter();
 
                         if let Some(value) = value {
-                            self.local_scope.insert_local(value, node, 0)
+                            self.local_scope.insert_local(value, node, 0);
                         }
                         if let Some(success) = success {
-                            self.local_scope.insert_local(success, node, 1)
+                            self.local_scope.insert_local(success, node, 1);
                         }
                         self.resolve_block(block);
 
@@ -493,10 +511,10 @@ impl<'db> NamingContext<'db> {
 
                     self.local_scope.enter();
                     if let Some(name) = index {
-                        self.local_scope.insert_local(name, node, 0)
+                        self.local_scope.insert_local(name, node, 0);
                     }
                     if let Some(name) = value {
-                        self.local_scope.insert_local(name, node, 1)
+                        self.local_scope.insert_local(name, node, 1);
                     }
                     self.resolve_block(block);
                     self.local_scope.exit();
@@ -529,7 +547,7 @@ impl<'db> NamingContext<'db> {
     }
 
     fn find_symbol(&mut self, name: Text) -> Option<Symbol> {
-        if let Some(node) = self.local_scope.get(name) {
+        if let Some(node) = self.local_scope.get_local(name) {
             return Some(Symbol::Local(node));
         }
 
@@ -605,21 +623,31 @@ impl LocalScope {
         }
     }
 
-    fn get(&mut self, name: Text) -> Option<Local> {
+    fn get_local(&mut self, name: Text) -> Option<Local> {
+        let (local, _scope) = self.get(name)?;
+        Some(local)
+    }
+
+    fn get(&mut self, name: Text) -> Option<(Local, ScopeId)> {
         let symbol = self.slots.get_mut(&name)?;
         loop {
             if self.active.contains(&symbol.scope) {
-                return Some(symbol.local);
+                return Some((symbol.local, symbol.scope));
             }
 
             *symbol = *symbol.shadowed.take()?;
         }
     }
 
+    fn current_scope(&self) -> ScopeId {
+        *self.active.last().unwrap()
+    }
+
     /// Register a symbol in the local scope.
     fn insert_local(&mut self, name: Text, node: NodeId, index: u16) {
-        let scope = *self.active.last().unwrap();
-        self.insert(name, Local { node, index }, scope)
+        let scope = self.current_scope();
+        let local = Local { node, index };
+        self.insert(name, local, scope);
     }
 
     fn insert(&mut self, name: Text, local: Local, scope: ScopeId) {

@@ -46,7 +46,7 @@ struct Shared {
     /// Aprroximate number of threads that are currently suspended and waiting for work.
     idle_workers_approx: AtomicU32,
     /// Suspended tasks which are waiting for more work hold this lock.
-    idle_mutex: Mutex<()>,
+    idle_mutex: Mutex<usize>,
     /// Notified when a suspended worker has more work available.
     wake_condition: Condvar,
 
@@ -156,7 +156,7 @@ impl Executor {
             state: SharedState::new(State::Shutdown),
 
             idle_workers_approx: AtomicU32::new(0),
-            idle_mutex: Mutex::new(()),
+            idle_mutex: Mutex::new(0),
             wake_condition: Condvar::new(),
 
             suspended_workers: Mutex::new(0),
@@ -429,16 +429,18 @@ impl LocalScheduler {
             let mut stalled_count: u32 = 0;
             let max_stalled_count: u32 = 100;
 
+            let shared: &Shared = &local.shared;
+            let mut in_deadlock = false;
+
             loop {
-                if task_state.ready.load(Relaxed) != 0 {
+                if task_state.ready.swap(0, Relaxed) != 0 {
                     // the future may have made some progress, try polling it again.
-                    task_state.ready.store(0, Relaxed);
                     if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
                         break output;
                     }
                 }
 
-                if local.shared.state.load(Relaxed) == State::Panicked {
+                if shared.state.load(Relaxed) == State::Panicked {
                     panic!("worker thread panicked");
                 }
 
@@ -448,10 +450,34 @@ impl LocalScheduler {
                 } else {
                     stalled_count = stalled_count.saturating_add(1);
 
-                    if stalled_count > max_stalled_count {
-                        std::thread::yield_now();
-                    } else {
+                    if stalled_count <= max_stalled_count {
                         std::hint::spin_loop();
+                    } else {
+                        if Arc::strong_count(&task_state) <= 2 {
+                            panic!("cannot complete");
+                        }
+
+                        if !in_deadlock {
+                            // check for deadlock
+                            let idle = shared.idle_mutex.lock().unwrap();
+                            let suspended = shared.suspended_workers.lock().unwrap();
+
+                            let not_running = 1 + *idle + *suspended;
+
+                            eprintln!(
+                                "idle: {}  suspended: {}  total: {}",
+                                *idle, *suspended, not_running
+                            );
+
+                            if not_running >= shared.workers.len()
+                                && task_state.ready.load(Relaxed) == 0
+                            {
+                                eprintln!("warn: stuck in deadlock");
+                                in_deadlock = true;
+                            }
+                        }
+
+                        std::thread::yield_now();
                     }
                 }
             }
@@ -608,17 +634,21 @@ impl LocalScheduler {
 
         let shared = &*self.shared;
 
-        shared.idle_workers_approx.fetch_add(1, Relaxed);
-        let _guard = CallOnDrop(|| shared.idle_workers_approx.fetch_sub(1, Relaxed));
+        shared.idle_workers_approx.fetch_add(1, Ordering::SeqCst);
+        let _guard = CallOnDrop(|| shared.idle_workers_approx.fetch_sub(1, Ordering::SeqCst));
 
         let mut guard = shared.idle_mutex.lock().unwrap();
+        *guard += 1;
 
         while shared.state.load(Relaxed) == State::Running {
             if let Some(task) = self.try_next_task() {
+                *guard -= 1;
                 return Some(task);
             }
             guard = shared.wake_condition.wait(guard).unwrap();
         }
+
+        *guard -= 1;
 
         None
     }
@@ -630,8 +660,14 @@ impl LocalScheduler {
 
         let shared = &*self.shared;
 
-        shared.suspended_workers_approx.fetch_add(1, Relaxed);
-        let _guard = CallOnDrop(|| shared.suspended_workers_approx.fetch_sub(1, Relaxed));
+        shared
+            .suspended_workers_approx
+            .fetch_add(1, Ordering::SeqCst);
+        let _guard = CallOnDrop(|| {
+            shared
+                .suspended_workers_approx
+                .fetch_sub(1, Ordering::SeqCst)
+        });
 
         let mut suspended = shared.suspended_workers.lock().unwrap();
 

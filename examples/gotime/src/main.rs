@@ -215,6 +215,14 @@ struct Arguments {
     #[clap(long)]
     metrics: bool,
 
+    /// Don't emit output
+    #[clap(short = 'q', long)]
+    silent: bool,
+
+    /// Loop endlessly
+    #[clap(long)]
+    repeat: bool,
+
     #[clap(flatten)]
     config: CompileConfig,
 }
@@ -245,16 +253,21 @@ fn main() {
     let arguments = <Arguments as clap::Parser>::parse();
     haste::enable_metrics(arguments.metrics);
 
-    let mut db = Database::new();
-
-    if arguments.watch {
-        watch_loop(&mut db, arguments)
+    if arguments.repeat {
+        loop {
+            let mut db = Database::new();
+            run(&mut db, &arguments);
+        }
+    } else if arguments.watch {
+        let mut db = Database::new();
+        watch_loop(&mut db, &arguments)
     } else {
-        run(&mut db, arguments);
+        let mut db = Database::new();
+        run(&mut db, &arguments);
     }
 }
 
-fn watch_loop(db: &mut Database, arguments: Arguments) {
+fn watch_loop(db: &mut Database, arguments: &Arguments) {
     fn maybe_changed(kind: &notify::EventKind) -> bool {
         match kind {
             notify::EventKind::Access(_) => false,
@@ -287,7 +300,7 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
     let cwd = std::env::current_dir().unwrap();
 
     loop {
-        run(db, arguments.clone());
+        run(db, arguments);
 
         haste::scope(db, |scope, db| {
             scope.block_on(async {
@@ -362,13 +375,16 @@ fn watch_loop(db: &mut Database, arguments: Arguments) {
     }
 }
 
-fn run(db: &mut Database, arguments: Arguments) {
+fn run(db: &mut Database, arguments: &Arguments) {
     let start = std::time::Instant::now();
     let process = cpu_time::ProcessTime::now();
 
     haste::scope(db, |scope, db| {
-        eprintln!("running...");
-        let result = scope.block_on(compile(db, arguments.config));
+        if !arguments.silent {
+            eprintln!("running...");
+        }
+
+        let result = scope.block_on(compile(db, arguments.config.clone()));
 
         match result {
             Ok(_output) => {
@@ -384,32 +400,34 @@ fn run(db: &mut Database, arguments: Arguments) {
         }
     });
 
-    let real = start.elapsed();
-    let cpu = process.elapsed();
-    eprintln!("real: {:?} (cpu: {:?})", real, cpu);
+    if !arguments.silent {
+        let real = start.elapsed();
+        let cpu = process.elapsed();
+        eprintln!("real: {:?} (cpu: {:?})", real, cpu);
 
-    let bytes = std::mem::take(db.stats.bytes.get_mut());
-    let lines = std::mem::take(db.stats.lines.get_mut());
-    let files = std::mem::take(db.stats.files.get_mut());
-    let tokens = std::mem::take(db.stats.tokens.get_mut());
-    let nodes = std::mem::take(db.stats.nodes.get_mut());
+        let bytes = std::mem::take(db.stats.bytes.get_mut());
+        let lines = std::mem::take(db.stats.lines.get_mut());
+        let files = std::mem::take(db.stats.files.get_mut());
+        let tokens = std::mem::take(db.stats.tokens.get_mut());
+        let nodes = std::mem::take(db.stats.nodes.get_mut());
 
-    let bytes_rate = bytes as f64 / real.as_secs_f64() / 1e6;
-    let lines_rate = lines as f64 / real.as_secs_f64() / 1e3;
-    let tokens_rate = tokens as f64 / real.as_secs_f64() / 1e6;
-    let nodes_rate = nodes as f64 / real.as_secs_f64() / 1e6;
+        let bytes_rate = bytes as f64 / real.as_secs_f64() / 1e6;
+        let lines_rate = lines as f64 / real.as_secs_f64() / 1e3;
+        let tokens_rate = tokens as f64 / real.as_secs_f64() / 1e6;
+        let nodes_rate = nodes as f64 / real.as_secs_f64() / 1e6;
 
-    eprintln!("bytes: {bytes} ({bytes_rate:.1} MB/s)");
-    eprintln!("lines: {lines} ({lines_rate:.1} K/s)");
-    eprintln!("token: {tokens} ({tokens_rate:.1} M/s)");
-    eprintln!("nodes: {nodes} ({nodes_rate:.1} M/s)");
+        eprintln!("bytes: {bytes} ({bytes_rate:.1} MB/s)");
+        eprintln!("lines: {lines} ({lines_rate:.1} K/s)");
+        eprintln!("token: {tokens} ({tokens_rate:.1} M/s)");
+        eprintln!("nodes: {nodes} ({nodes_rate:.1} M/s)");
 
-    let mut time_per_file = format!("{:.1?}", real / files.max(1) as u32);
-    let unit_start = time_per_file
-        .find(|ch: char| ch != '.' && !ch.is_ascii_digit())
-        .unwrap();
-    time_per_file.insert(unit_start, ' ');
-    eprintln!("files: {} ({}/file)", files, time_per_file);
+        let mut time_per_file = format!("{:.1?}", real / files.max(1) as u32);
+        let unit_start = time_per_file
+            .find(|ch: char| ch != '.' && !ch.is_ascii_digit())
+            .unwrap();
+        time_per_file.insert(unit_start, ' ');
+        eprintln!("files: {} ({}/file)", files, time_per_file);
+    }
 }
 
 /// Compile the program using the given arguments

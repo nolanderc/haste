@@ -181,6 +181,20 @@ where
     }
 }
 
+impl<T> Drop for RawArena<T> {
+    fn drop(&mut self) {
+        if !std::mem::needs_drop::<T>() {
+            return;
+        }
+
+        let len = *self.reserved.get_mut();
+        let start = self.allocation.as_mut_ptr::<T>();
+        for i in 0..len {
+            unsafe { start.add(i).drop_in_place() };
+        }
+    }
+}
+
 const INIT_BUCKET: usize = 32;
 const BUCKETS: usize = 32;
 
@@ -383,6 +397,14 @@ struct OnceCell<T> {
 }
 
 unsafe impl<T> bytemuck::Zeroable for OnceCell<T> {}
+
+impl<T> Drop for OnceCell<T> {
+    fn drop(&mut self) {
+        if std::mem::needs_drop::<T>() && self.state.is_written() {
+            unsafe { self.value.get_mut().assume_init_drop() }
+        }
+    }
+}
 
 impl<T> OnceCell<T> {
     #[allow(unused)]

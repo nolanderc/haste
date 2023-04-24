@@ -10,10 +10,10 @@ pub struct Storage(read, list_dir, metadata, read_header);
 
 /// Invalidates the given path, forcing re-evaluation if it is needed.
 pub fn invalidate_path(db: &mut dyn crate::Db, path: NormalPath) {
-    read::invalidate(db, path);
-    list_dir::invalidate(db, path);
-    metadata::invalidate(db, path);
-    read_header::invalidate(db, path);
+    read::remove(db, path);
+    list_dir::remove(db, path);
+    metadata::remove(db, path);
+    read_header::remove(db, path);
 }
 
 #[haste::query]

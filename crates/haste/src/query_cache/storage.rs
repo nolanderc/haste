@@ -5,7 +5,7 @@ use crossbeam_utils::CachePadded;
 
 use crate::{
     arena::{AppendArena, RawArena},
-    revision::Revision,
+    revision::{InputId, Revision},
     runtime::ExecutionResult,
     Cycle, Dependency, Durability, Id, Query, Runtime,
 };
@@ -213,7 +213,7 @@ impl From<std::ops::Range<u32>> for DependencyRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransitiveDependencies {
     /// The query only depends on inputs from these revisions.
-    pub inputs: Option<RevisionRange>,
+    pub inputs: Option<InputRange>,
 
     /// Durability of the inputs the query depends on.
     pub input_durability: Durability,
@@ -236,7 +236,7 @@ impl TransitiveDependencies {
 
     pub fn combine(self, other: Self) -> Self {
         Self {
-            inputs: RevisionRange::join(self.inputs, other.inputs),
+            inputs: InputRange::join(self.inputs, other.inputs),
             input_durability: std::cmp::min(self.input_durability, other.durability()),
             set_durability: self.set_durability,
         }
@@ -250,40 +250,50 @@ impl TransitiveDependencies {
         self.inputs = other.inputs;
         self.input_durability = other.input_durability;
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct RevisionRange {
-    pub earliest: Revision,
-    pub latest: Revision,
-}
-
-impl std::fmt::Debug for RevisionRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}..={:?}", self.earliest, self.latest)
+    fn get_input_id(&self) -> Option<InputId> {
+        self.inputs.map(|range| {
+            assert_eq!(
+                range.min, range.max,
+                "input queries may only depend on themselves"
+            );
+            range.min
+        })
     }
 }
 
-impl RevisionRange {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InputRange {
+    pub min: InputId,
+    pub max: InputId,
+}
+
+impl std::fmt::Debug for InputRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}..={:?}", self.min, self.max)
+    }
+}
+
+impl InputRange {
     fn join(a: Option<Self>, b: Option<Self>) -> Option<Self> {
         match (a, b) {
             (None, _) => b,
             (_, None) => a,
             (Some(a), Some(b)) => Some(Self {
-                earliest: std::cmp::min(a.earliest, b.earliest),
-                latest: std::cmp::max(a.latest, b.latest),
+                min: std::cmp::min(a.min, b.min),
+                max: std::cmp::max(a.max, b.max),
             }),
         }
     }
 }
 
-impl std::ops::RangeBounds<Revision> for RevisionRange {
-    fn start_bound(&self) -> std::ops::Bound<&Revision> {
-        std::ops::Bound::Included(&self.earliest)
+impl std::ops::RangeBounds<InputId> for InputRange {
+    fn start_bound(&self) -> std::ops::Bound<&InputId> {
+        std::ops::Bound::Included(&self.min)
     }
 
-    fn end_bound(&self) -> std::ops::Bound<&Revision> {
-        std::ops::Bound::Included(&self.latest)
+    fn end_bound(&self) -> std::ops::Bound<&InputId> {
+        std::ops::Bound::Included(&self.max)
     }
 }
 
@@ -341,21 +351,25 @@ impl<Q: Query> QuerySlot<Q> {
     where
         Q: crate::Input,
     {
-        self.cell
-            .set_output(runtime, durability, |current| OutputSlot {
+        self.cell.set_output(
+            runtime,
+            durability,
+            |output| output.transitive.get_input_id(),
+            |current| OutputSlot {
                 output,
                 dependencies: (0..0).into(),
                 transitive: TransitiveDependencies {
-                    inputs: Some(RevisionRange {
-                        earliest: current,
-                        latest: current,
+                    inputs: Some(InputRange {
+                        min: current,
+                        max: current,
                     }),
                     input_durability: Durability::CONSTANT,
                     set_durability: durability,
                 },
                 poll_count: 0,
                 poll_nanos: 0,
-            });
+            },
+        );
     }
 
     pub fn remove_output(&mut self, runtime: &mut Runtime)
@@ -364,7 +378,9 @@ impl<Q: Query> QuerySlot<Q> {
     {
         if let Some(output) = self.get_output_mut() {
             let durability = output.transitive.durability();
-            self.cell.remove_output(runtime, durability);
+            self.cell.remove_output(runtime, durability, |output| {
+                output.transitive.get_input_id()
+            });
         }
     }
 

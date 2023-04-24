@@ -12,15 +12,6 @@ impl std::fmt::Debug for Revision {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InputId(NonZeroU32);
-
-impl std::fmt::Debug for InputId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "InputId({})", self.0)
-    }
-}
-
 impl Revision {
     pub(crate) const fn new(x: u32) -> Option<Revision> {
         match NonZeroU32::new(x) {
@@ -60,11 +51,29 @@ impl AtomicRevision {
         *self.0.get_mut() = to_u32(rev);
     }
 
-    pub(crate) fn get(&mut self) -> Option<Revision> {
-        Self::from_u32(*self.0.get_mut())
-    }
-
     fn from_u32(num: u32) -> Option<Revision> {
         Some(Revision(NonZeroU32::new(num)?))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputId(NonZeroU32);
+
+impl std::fmt::Debug for InputId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InputId({})", self.0)
+    }
+}
+
+impl InputId {
+    pub(crate) const fn new(x: u32) -> Option<Self> {
+        match NonZeroU32::new(x) {
+            None => None,
+            Some(val) => Some(Self(val)),
+        }
+    }
+
+    pub(crate) fn index(self) -> u32 {
+        self.0.get()
     }
 }

@@ -5,7 +5,10 @@ mod range_query;
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 
-use crate::{revision::Revision, Durability, RevisionRange};
+use crate::{
+    revision::{InputId, Revision},
+    Durability, InputRange,
+};
 
 use self::{
     bit_set::{BitSet, RangeBitSet},
@@ -27,21 +30,18 @@ impl ChangeHistory {
         }
     }
 
-    pub fn current(&self) -> Revision {
+    pub fn current_revision(&self) -> Revision {
         let index = self.histories[0].len() as u32;
         Revision::from_index(unsafe { NonZeroU32::new_unchecked(index) })
     }
 
-    /// When an input has been modified, this function is called with the previous revision in
-    /// which was modified in (or `None` if the input is new). Returns a new revision for the
-    /// input.
+    /// When an input has been modified, this function is called with that input's ID and
+    /// durability. This allows queries which depend on the input to detect the change.
+    ///
+    /// Returns the new revision.
     ///
     /// Time complexity: `O(log n)`
-    pub fn push_update(
-        &mut self,
-        last_changed: Option<Revision>,
-        durability: Durability,
-    ) -> Revision {
+    pub fn push_update(&mut self, input: Option<InputId>, durability: Durability) -> Revision {
         let new =
             Revision::new(self.histories[0].len() as u32 + 1).expect("exhausted revision IDs");
 
@@ -50,7 +50,7 @@ impl ChangeHistory {
 
         // any queries with lower durability might be affected by the change
         for history in lower {
-            history.record_change(last_changed, Some(new));
+            history.record_change(input, Some(new));
         }
 
         // no detectable change for queries with higher durability:
@@ -69,7 +69,7 @@ impl ChangeHistory {
     /// small set of inputs (which is the average case).
     pub fn any_changed_since(
         &self,
-        range: RevisionRange,
+        range: InputRange,
         rev: Revision,
         durability: Durability,
     ) -> bool {
@@ -83,7 +83,7 @@ struct History {
     /// The revision in which the last change happened
     last_change: Option<Revision>,
     /// A detailed accounting of all changes that have ever been made.
-    detailed: BitHistory<RevisionSet>,
+    detailed: BitHistory<InputSet>,
 }
 
 impl History {
@@ -91,14 +91,14 @@ impl History {
         self.detailed.len()
     }
 
-    fn record_change(&mut self, change: Option<Revision>, current: Option<Revision>) -> usize {
+    fn record_change(&mut self, change: Option<InputId>, current: Option<Revision>) -> usize {
         if change.is_some() {
             self.last_change = current;
         }
         self.detailed.push(change)
     }
 
-    fn any_changed_since(&self, range: RevisionRange, rev: Revision) -> bool {
+    fn any_changed_since(&self, range: InputRange, rev: Revision) -> bool {
         if self.last_change <= Some(rev) {
             // fast path if there have been no changes at all
             return false;
@@ -116,7 +116,7 @@ impl History {
     }
 }
 
-enum RevisionSet {
+enum InputSet {
     Small(RangeBitSet),
     Tree(BTreeMap<u32, BitSet>),
 }
@@ -132,16 +132,16 @@ const fn segment_index(index: u32) -> u32 {
     index & SEGMENT_MASK
 }
 
-impl RevisionSet {
+impl InputSet {
     fn new() -> Self {
         Self::Small(RangeBitSet::new())
     }
 
-    fn insert(&mut self, revision: Revision) {
-        let index = revision.index();
+    fn insert(&mut self, input: InputId) {
+        let index = input.index();
 
         match self {
-            RevisionSet::Small(small) => {
+            InputSet::Small(small) => {
                 if small.insert(index).is_err() {
                     let mut tree = BTreeMap::new();
 
@@ -161,10 +161,10 @@ impl RevisionSet {
 
                     Self::insert_tree(&mut tree, index);
 
-                    *self = RevisionSet::Tree(tree);
+                    *self = InputSet::Tree(tree);
                 }
             }
-            RevisionSet::Tree(tree) => Self::insert_tree(tree, index),
+            InputSet::Tree(tree) => Self::insert_tree(tree, index),
         }
     }
 
@@ -174,13 +174,13 @@ impl RevisionSet {
             .insert(segment_index(index));
     }
 
-    fn contains_range(&self, range: RevisionRange) -> bool {
-        let min = range.earliest.index();
-        let max = range.latest.index();
+    fn contains_range(&self, range: InputRange) -> bool {
+        let min = range.min.index();
+        let max = range.max.index();
 
         match self {
-            RevisionSet::Small(small) => small.contains_range(min..=max),
-            RevisionSet::Tree(tree) => {
+            InputSet::Small(small) => small.contains_range(min..=max),
+            InputSet::Tree(tree) => {
                 let min_segment = segment(min);
                 let max_segment = segment(max);
 
@@ -218,10 +218,10 @@ impl RevisionSet {
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = Revision> + '_ {
+    fn iter(&self) -> impl Iterator<Item = InputId> + '_ {
         let mut inner = match self {
-            RevisionSet::Small(bits) => Ok(bits.iter()),
-            RevisionSet::Tree(tree) => Err(tree.iter().flat_map(|(segment, bits)| {
+            InputSet::Small(bits) => Ok(bits.iter()),
+            InputSet::Tree(tree) => Err(tree.iter().flat_map(|(segment, bits)| {
                 let segment_start = segment << SEGMENT_SHIFT;
                 bits.iter().map(move |i| segment_start + i)
             })),
@@ -231,22 +231,22 @@ impl RevisionSet {
                 Ok(a) => a.next(),
                 Err(b) => b.next(),
             };
-            next.map(|i| Revision::new(i).unwrap())
+            next.map(|i| InputId::new(i).unwrap())
         })
     }
 }
 
-impl std::fmt::Debug for RevisionSet {
+impl std::fmt::Debug for InputSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }
 }
 
-impl range_query::Set for RevisionSet {
-    type Element = Option<Revision>;
+impl range_query::Set for InputSet {
+    type Element = Option<InputId>;
 
     fn make(element: Self::Element) -> Self {
-        let mut this = RevisionSet::new();
+        let mut this = InputSet::new();
         if let Some(revision) = element {
             this.insert(revision);
         }
@@ -260,8 +260,8 @@ impl range_query::Set for RevisionSet {
     }
 
     fn merge(&mut self, other: &Self) {
-        for revision in other.iter() {
-            self.insert(revision);
+        for input in other.iter() {
+            self.insert(input);
         }
     }
 }

@@ -44,7 +44,7 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
 fn inputs_unchanged(
     runtime: &Runtime,
     last_verified: Revision,
-    inputs: Option<RevisionRange>,
+    inputs: Option<InputRange>,
     durability: Durability,
 ) -> bool {
     match inputs {

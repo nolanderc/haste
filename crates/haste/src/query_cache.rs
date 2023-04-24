@@ -13,7 +13,7 @@ use crate::{
 use self::storage::{ClaimedSlot, OutputSlot, QuerySlot, QueryStorage, WaitFuture};
 
 pub use self::lookup::*;
-pub use self::storage::{ChangeFuture, RevisionRange, TransitiveDependencies};
+pub use self::storage::{ChangeFuture, InputRange, TransitiveDependencies};
 use self::verify::VerifyData;
 
 pub trait QueryCache: DynQueryCache {
@@ -474,11 +474,10 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        let _guard = crate::enter_span(crate::SpanName::new::<Q>("poll"));
-
         loop {
             match this.state.as_mut().project() {
                 TaskStateProj::Verify { future, path } => {
+                    let _guard = crate::enter_span(crate::SpanName::new::<Q>("verify"));
                     match std::task::ready!(Future::poll(future, cx)) {
                         Ok(slot) => {
                             let id = path.resource;
@@ -491,6 +490,7 @@ impl<'a, Q: Query> Future for QueryCacheTask<'a, Q> {
                     }
                 }
                 TaskStateProj::Exec(future) => {
+                    let _guard = crate::enter_span(crate::SpanName::new::<Q>("poll"));
                     break Future::poll(future, cx);
                 }
             }

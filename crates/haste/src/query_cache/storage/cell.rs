@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 
 use crate::{
     integer::NonMaxU32,
-    revision::{AtomicRevision, Revision},
+    revision::{AtomicRevision, InputId, Revision},
     Change, Cycle, Durability, Runtime,
 };
 
@@ -190,17 +190,27 @@ impl<I, O> QueryCell<I, O> {
         (self.state.addr.load(Acquire) & HAS_INPUT) != 0
     }
 
-    pub fn set_output<F>(&mut self, runtime: &mut Runtime, durability: Durability, make_output: F)
-    where
-        F: FnOnce(Revision) -> O,
-    {
+    pub fn set_output(
+        &mut self,
+        runtime: &mut Runtime,
+        durability: Durability,
+        get_input_id: impl FnOnce(&O) -> Option<InputId>,
+        make_output: impl FnOnce(InputId) -> O,
+    ) {
         let state = self.state.addr.get_mut();
+        let has_output = (*state & HAS_OUTPUT) != 0;
+
         let output = self.output.get_mut();
 
-        let last_change = self.state.changed_at.get();
-        let current = runtime.update_input(last_change, durability);
+        let old_id = if has_output {
+            get_input_id(unsafe { output.assume_init_ref() })
+        } else {
+            None
+        };
+        let current = runtime.update_input(old_id, durability);
 
-        let value = make_output(current);
+        let input_id = runtime.generate_input_id();
+        let value = make_output(input_id);
 
         if (*state & HAS_OUTPUT) != 0 {
             unsafe { output.assume_init_drop() }
@@ -213,16 +223,21 @@ impl<I, O> QueryCell<I, O> {
         self.state.changed_at.set(Some(current));
     }
 
-    pub fn remove_output(&mut self, runtime: &mut Runtime, durability: Durability) {
+    pub fn remove_output(
+        &mut self,
+        runtime: &mut Runtime,
+        durability: Durability,
+        get_input_id: impl FnOnce(&O) -> Option<InputId>,
+    ) {
         let state = self.state.addr.get_mut();
         let output = self.output.get_mut();
 
-        let Some(last_change) = self.state.changed_at.get() else { return };
         if (*state & HAS_OUTPUT) == 0 {
             return;
         }
 
-        let current = runtime.update_input(Some(last_change), durability);
+        let input_id = get_input_id(unsafe { output.assume_init_ref() });
+        let current = runtime.update_input(input_id, durability);
 
         unsafe { output.assume_init_drop() }
         *state &= !HAS_OUTPUT;

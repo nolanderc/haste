@@ -7,15 +7,16 @@ use std::{
     cell::Cell,
     future::Future,
     pin::Pin,
+    sync::atomic::{AtomicU32, Ordering::Relaxed},
     task::{Poll, Waker},
     time::Duration,
 };
 
 use crate::{
-    revision::Revision,
+    revision::{InputId, Revision},
     util::{future::UnitFuture, CallOnDrop},
-    ContainerPath, Database, DatabaseFor, Durability, IngredientPath, Query, QueryResult,
-    RevisionRange, TransitiveDependencies,
+    ContainerPath, Database, DatabaseFor, Durability, IngredientPath, InputRange, Query,
+    QueryResult, TransitiveDependencies,
 };
 
 pub use self::cycle::{Cycle, CycleStrategy};
@@ -37,6 +38,9 @@ pub struct Runtime {
 
     /// A detailed history of all changes ever made to the query inputs.
     revisions: ChangeHistory,
+
+    /// ID of the next input (starts at 1).
+    next_input: AtomicU32,
 }
 
 impl Runtime {
@@ -46,6 +50,7 @@ impl Runtime {
             executor: scheduler,
             graph: Default::default(),
             revisions: ChangeHistory::new(),
+            next_input: AtomicU32::new(1),
         }
     }
 
@@ -54,20 +59,20 @@ impl Runtime {
     }
 
     pub fn current_revision(&self) -> Revision {
-        self.revisions.current()
+        self.revisions.current_revision()
     }
 
-    pub fn update_input(
-        &mut self,
-        changed_at: Option<Revision>,
-        durability: Durability,
-    ) -> Revision {
-        self.revisions.push_update(changed_at, durability)
+    pub(crate) fn generate_input_id(&self) -> InputId {
+        InputId::new(self.next_input.fetch_add(1, Relaxed)).unwrap()
+    }
+
+    pub fn update_input(&mut self, input: Option<InputId>, durability: Durability) -> Revision {
+        self.revisions.push_update(input, durability)
     }
 
     pub(crate) fn any_changed_since(
         &self,
-        range: RevisionRange,
+        range: InputRange,
         last_verified: Revision,
         durability: Durability,
     ) -> bool {
@@ -218,6 +223,7 @@ impl<'db, Q: Query> ExecFuture<'db, Q> {
         self.task.as_ref().unwrap().this
     }
 
+    #[allow(dead_code)]
     pub fn database(&self) -> &'db DatabaseFor<Q> {
         self.db
     }
@@ -305,12 +311,9 @@ impl Runtime {
         this: IngredientPath,
     ) -> ExecFuture<'db, Q> {
         let transitive = if Q::IS_INPUT {
-            let current = self.current_revision();
+            let id = self.generate_input_id();
             TransitiveDependencies {
-                inputs: Some(RevisionRange {
-                    earliest: current,
-                    latest: current,
-                }),
+                inputs: Some(InputRange { min: id, max: id }),
                 input_durability: Durability::CONSTANT,
                 set_durability: Durability::DEFAULT,
             }

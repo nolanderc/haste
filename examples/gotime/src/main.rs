@@ -314,8 +314,6 @@ fn watch_loop(db: &mut Database, arguments: &Arguments) {
     let mut watched = HashSet::default();
     let mut changes = HashSet::default();
 
-    let cwd = std::env::current_dir().unwrap();
-
     loop {
         run(db, arguments);
 
@@ -378,13 +376,7 @@ fn watch_loop(db: &mut Database, arguments: &Arguments) {
                     // removes the file before writing a new one it its place.
                     _ = watcher.watch(&changed, notify::RecursiveMode::Recursive);
 
-                    let path = if let Ok(relative) = changed.strip_prefix(&cwd) {
-                        relative
-                    } else {
-                        &changed
-                    };
-
-                    paths.push(NormalPath::new(db, path).await?);
+                    paths.push(NormalPath::new(db, &changed).await?);
                 }
                 crate::Result::<_>::Ok(paths)
             })

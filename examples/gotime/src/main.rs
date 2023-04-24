@@ -188,19 +188,22 @@ impl Db for Database {
     }
 
     fn path_durability_untracked(&self, path: NormalPath) -> Durability {
-        match path.lookup(self) {
-            path::NormalPathData::Relative(path) => {
-                if path.components().any(|c| c.as_os_str() == "vendor") {
-                    return Durability::HIGH;
-                }
+        let absolute = path.absolute(self);
 
-                if path.extension() == Some(OsStr::new("go")) {
-                    Durability::LOW
-                } else {
-                    Durability::MEDIUM
-                }
+        if absolute.components().any(|c| c.as_os_str() == "vendor") {
+            return Durability::HIGH;
+        }
+
+        if let Some(goroot) = crate::env::default::GOROOT {
+            if absolute.starts_with(goroot) {
+                return Durability::HIGH;
             }
-            path::NormalPathData::GoPath(_) | path::NormalPathData::GoRoot(_) => Durability::HIGH,
+        }
+
+        if absolute.extension() == Some(OsStr::new("go")) {
+            Durability::LOW
+        } else {
+            Durability::MEDIUM
         }
     }
 }
@@ -323,9 +326,13 @@ fn watch_loop(db: &mut Database, arguments: &Arguments) {
                         continue;
                     }
 
-                    let path = touched.system_path(db).await.unwrap();
+                    let path = touched.absolute(db);
 
-                    if let Err(error) = watcher.watch(&path, notify::RecursiveMode::NonRecursive) {
+                    if !path.exists() {
+                        continue;
+                    }
+
+                    if let Err(error) = watcher.watch(path, notify::RecursiveMode::NonRecursive) {
                         if let notify::ErrorKind::Io(io) = &error.kind {
                             if let std::io::ErrorKind::NotFound = io.kind() {
                                 continue;

@@ -88,7 +88,7 @@ impl<Q: Query> QueryStorage<Q> {
         OutputSlot {
             output: result.output,
             dependencies: DependencyRange::from(start..end),
-            transitive: Some(result.transitive),
+            transitive: result.transitive,
             poll_count: result.poll_count,
             poll_nanos: result.poll_nanos,
         }
@@ -173,10 +173,7 @@ pub struct OutputSlot<Q: Query> {
 
     /// Details about the transitive dependencies of the query. Used to optimize incremental
     /// re-evaluation of queries.
-    ///
-    /// If `None`, the query has been invalidated and needs to be re-evaluated to find the new
-    /// dependencies.
-    pub transitive: Option<TransitiveDependencies>,
+    pub transitive: TransitiveDependencies,
 
     /// Number of nanoseconds spent polling the query.
     pub poll_nanos: u64,
@@ -247,16 +244,6 @@ impl TransitiveDependencies {
 
     pub fn extend(&mut self, other: Self) {
         *self = self.combine(other);
-    }
-
-    pub(crate) fn add_input(&mut self, revision: Revision) {
-        self.inputs = RevisionRange::join(
-            self.inputs,
-            Some(RevisionRange {
-                earliest: revision,
-                latest: revision,
-            }),
-        );
     }
 
     pub(crate) fn update_inputs(&mut self, other: TransitiveDependencies) {
@@ -358,14 +345,14 @@ impl<Q: Query> QuerySlot<Q> {
             .set_output(runtime, durability, |current| OutputSlot {
                 output,
                 dependencies: (0..0).into(),
-                transitive: Some(TransitiveDependencies {
+                transitive: TransitiveDependencies {
                     inputs: Some(RevisionRange {
                         earliest: current,
                         latest: current,
                     }),
                     input_durability: Durability::CONSTANT,
                     set_durability: durability,
-                }),
+                },
                 poll_count: 0,
                 poll_nanos: 0,
             });
@@ -376,22 +363,8 @@ impl<Q: Query> QuerySlot<Q> {
         Q: crate::Input,
     {
         if let Some(output) = self.get_output_mut() {
-            if let Some(transitive) = output.transitive {
-                self.cell.remove_output(runtime, transitive.durability());
-            }
-        }
-    }
-
-    pub fn invalidate(&mut self, runtime: &mut Runtime)
-    where
-        Q: crate::Input,
-    {
-        if let Some(output) = self.cell.get_output_mut() {
-            if let Some(transitive) = output.transitive.take() {
-                let durability = transitive.durability();
-                let last_change = self.last_changed();
-                runtime.update_input(last_change, durability);
-            }
+            let durability = output.transitive.durability();
+            self.cell.remove_output(runtime, durability);
         }
     }
 
@@ -412,7 +385,7 @@ impl<Q: Query> QuerySlot<Q> {
             self.cell
                 .wait_for_change(revision, self as *const _ as *const (), |data| {
                     let this: &Self = &*data.cast();
-                    this.output_unchecked().transitive.unwrap()
+                    this.output_unchecked().transitive
                 })
         }
     }

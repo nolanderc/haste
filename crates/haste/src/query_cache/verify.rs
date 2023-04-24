@@ -22,9 +22,6 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
     let Some(previous) = data.slot.get_output() else {
         return Ok(Err(data))
     };
-    let Some(transitive) = previous.transitive else {
-        return Ok(Err(data))
-    };
 
     if previous.dependencies.is_empty() {
         // the query does not depend on any side-effects, so is trivially verified.
@@ -33,8 +30,8 @@ pub fn verify_shallow<Q: Query>(data: VerifyData<Q>) -> Result<VerifyResult<Q>, 
 
     let runtime = data.db.runtime();
 
-    let inputs = transitive.inputs;
-    let durability = transitive.durability();
+    let inputs = previous.transitive.inputs;
+    let durability = previous.transitive.durability();
     if inputs_unchanged(runtime, last_verified, inputs, durability) {
         return Ok(Ok(data.slot.backdate()));
     }
@@ -68,9 +65,7 @@ fn verify_deep<'a, Q: Query>(
             None => Err(data),
             Some(new_transitive) => {
                 let previous = data.slot.get_output().unwrap();
-                let transitive = previous.transitive.as_mut().unwrap();
-                transitive.update_inputs(new_transitive);
-
+                previous.transitive.update_inputs(new_transitive);
                 return Ok(data.slot.backdate());
             }
         },

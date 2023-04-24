@@ -10,10 +10,10 @@ pub struct Storage(read, list_dir, metadata, read_header);
 
 /// Invalidates the given path, forcing re-evaluation if it is needed.
 pub fn invalidate_path(db: &mut dyn crate::Db, path: NormalPath) {
-    read::remove(db, path);
-    list_dir::remove(db, path);
-    metadata::remove(db, path);
-    read_header::remove(db, path);
+    read::invalidate(db, path);
+    list_dir::invalidate(db, path);
+    metadata::invalidate(db, path);
+    read_header::invalidate(db, path);
 }
 
 #[haste::query]
@@ -21,7 +21,7 @@ pub fn invalidate_path(db: &mut dyn crate::Db, path: NormalPath) {
 pub async fn read(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[u8]>> {
     db.touch_path(path);
 
-    let system_path = path.system_path(db).await?;
+    let system_path = path.absolute(db);
 
     let bytes = std::fs::read(system_path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => error!("file not found: `{path}`"),
@@ -38,7 +38,7 @@ pub async fn read(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[u8]>> {
 pub async fn list_dir(db: &dyn crate::Db, path: NormalPath) -> Result<Arc<[NormalPath]>> {
     db.touch_path(path);
 
-    let system_path = path.system_path(db).await?;
+    let system_path = path.absolute(db);
 
     let mut sources = Vec::with_capacity(8);
     let dir = std::fs::read_dir(system_path)
@@ -83,7 +83,7 @@ impl Metadata {
 pub async fn metadata(db: &dyn crate::Db, path: NormalPath) -> Result<Metadata> {
     db.touch_path(path);
 
-    let system_path = path.system_path(db).await?;
+    let system_path = path.absolute(db);
 
     let meta = std::fs::metadata(system_path)
         .map_err(|error| error!("could not open `{path}`: {error}"))?;
@@ -113,7 +113,7 @@ pub async fn is_dir(db: &dyn crate::Db, path: NormalPath) -> bool {
 pub async fn read_header(db: &dyn crate::Db, path: NormalPath) -> Result<String> {
     db.touch_path(path);
 
-    let system_path = path.system_path(db).await?;
+    let system_path = path.absolute(db);
 
     let file = std::fs::File::open(system_path)
         .map_err(|error| error!("could not open `{path}`: {error}"))?;

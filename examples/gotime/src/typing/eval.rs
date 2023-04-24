@@ -280,9 +280,9 @@ impl<'a> EvalContext<'a> {
                             _ => None,
                         },
                         Some(Symbol::Global(GlobalSymbol::Decl(decl))) => {
-                            if super::is_unsafe_decl(self.db, *decl, "Sizeof") {
+                            if super::is_unsafe_decl(self.db, *decl, "Sizeof").await? {
                                 Some(ConstFunc::Sizeof)
-                            } else if super::is_unsafe_decl(self.db, *decl, "Offsetof") {
+                            } else if super::is_unsafe_decl(self.db, *decl, "Offsetof").await? {
                                 Some(ConstFunc::Offsetof)
                             } else {
                                 None

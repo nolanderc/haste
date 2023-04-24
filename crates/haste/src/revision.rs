@@ -12,6 +12,15 @@ impl std::fmt::Debug for Revision {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputId(NonZeroU32);
+
+impl std::fmt::Debug for InputId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InputId({})", self.0)
+    }
+}
+
 impl Revision {
     pub(crate) const fn new(x: u32) -> Option<Revision> {
         match NonZeroU32::new(x) {

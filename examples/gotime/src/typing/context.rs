@@ -1961,7 +1961,7 @@ impl<'db> TypingContext<'db> {
             }
 
             _ => {
-                if self.is_arbitrary_type(target_kind) {
+                if self.is_arbitrary_type(target_kind).await? {
                     return Ok(AssignResult::Ok);
                 }
 
@@ -1986,7 +1986,7 @@ impl<'db> TypingContext<'db> {
                         }
                     }
 
-                    if self.is_arbitrary_type(inner.lookup(self.db))
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await?
                         && matches!(source_kind, TypeKind::Pointer(_))
                     {
                         return Ok(AssignResult::Ok);
@@ -1994,7 +1994,7 @@ impl<'db> TypingContext<'db> {
                 }
 
                 if let &TypeKind::Slice(inner) = target_core_kind {
-                    if self.is_arbitrary_type(inner.lookup(self.db))
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await?
                         && matches!(source_kind, TypeKind::Slice(_))
                     {
                         return Ok(AssignResult::Ok);
@@ -2002,7 +2002,7 @@ impl<'db> TypingContext<'db> {
                 }
 
                 if let &TypeKind::Pointer(inner) = source_kind {
-                    if self.is_arbitrary_type(inner.lookup(self.db))
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await?
                         && matches!(target_core_kind, TypeKind::Pointer(_))
                     {
                         return Ok(AssignResult::Ok);
@@ -2010,7 +2010,7 @@ impl<'db> TypingContext<'db> {
                 }
 
                 if let &TypeKind::Slice(inner) = source_kind {
-                    if self.is_arbitrary_type(inner.lookup(self.db))
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await?
                         && matches!(target_core_kind, TypeKind::Slice(_))
                     {
                         return Ok(AssignResult::Ok);
@@ -2056,9 +2056,9 @@ impl<'db> TypingContext<'db> {
         super::satisfies_interface(self.db, source, interface).await
     }
 
-    fn is_arbitrary_type(&self, kind: &TypeKind) -> bool {
-        let TypeKind::Declared(decl) = kind else { return false };
-        super::is_unsafe_decl(self.db, *decl, "ArbitraryType")
+    async fn is_arbitrary_type(&self, kind: &TypeKind) -> Result<bool> {
+        let TypeKind::Declared(decl) = kind else { return Ok(false) };
+        super::is_unsafe_decl(self.db, *decl, "ArbitraryType").await
     }
 
     /// Can the `source` type be represented by the `target` type?
@@ -2162,7 +2162,7 @@ impl<'db> TypingContext<'db> {
                         }
                     }
 
-                    if self.is_arbitrary_type(inner.lookup(self.db)) {
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await? {
                         if let TypeKind::String = target_kind {
                             return Ok(true);
                         }
@@ -2173,7 +2173,7 @@ impl<'db> TypingContext<'db> {
             },
             TypeKind::Pointer(source_inner) => {
                 if let TypeKind::Pointer(target_inner) = target_kind {
-                    if self.is_arbitrary_type(target_inner.lookup(self.db)) {
+                    if self.is_arbitrary_type(target_inner.lookup(self.db)).await? {
                         return Ok(true);
                     }
 
@@ -2183,7 +2183,7 @@ impl<'db> TypingContext<'db> {
                         return Ok(true);
                     }
                 }
-                if self.is_arbitrary_type(source_inner.lookup(self.db)) {
+                if self.is_arbitrary_type(source_inner.lookup(self.db)).await? {
                     if matches!(*target_kind, TypeKind::Uintptr | TypeKind::Pointer(_)) {
                         return Ok(true);
                     }
@@ -2192,7 +2192,7 @@ impl<'db> TypingContext<'db> {
             }
             TypeKind::Uintptr => {
                 if let TypeKind::Pointer(inner) = target_kind {
-                    if self.is_arbitrary_type(inner.lookup(self.db)) {
+                    if self.is_arbitrary_type(inner.lookup(self.db)).await? {
                         return Ok(true);
                     }
                 }

@@ -1,4 +1,8 @@
-use std::{ffi::OsString, path::Path, sync::Arc};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bstr::{BStr, ByteSlice};
 use haste::Durability;
@@ -6,7 +10,7 @@ use haste::Durability;
 use crate::{error, path::NormalPath, Result};
 
 #[haste::storage]
-pub struct Storage(command, env_var, go_var);
+pub struct Storage(command, env_var, go_var, current_dir);
 
 #[haste::query]
 #[input]
@@ -21,9 +25,7 @@ pub async fn command(
 
     if let Some(cwd) = cwd {
         // TODO: don't silently discard this error (even though we don't expect it to ever fail)
-        if let Ok(cwd) = cwd.system_path(db).await {
-            command.current_dir(cwd);
-        }
+        command.current_dir(cwd.absolute(db));
     }
 
     command.stdin(std::process::Stdio::null());
@@ -92,4 +94,12 @@ pub async fn go_var(db: &dyn crate::Db, name: &'static str) -> Result<OsString> 
 pub async fn go_var_path<'db>(db: &'db dyn crate::Db, name: &'static str) -> Result<&'db Path> {
     let text = go_var(db, name).await.as_ref()?;
     Ok(Path::new(text))
+}
+
+#[haste::query]
+#[input]
+pub async fn current_dir(db: &dyn crate::Db, (): ()) -> Result<PathBuf> {
+    _ = db;
+    std::env::current_dir()
+        .map_err(|error| error!("could not get current working directory: {}", error))
 }

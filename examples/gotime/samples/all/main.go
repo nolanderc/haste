@@ -21,3 +21,4 @@ func main() {
 type Containers []int
 
 func (c Containers) filter() {}
+

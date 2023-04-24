@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bstr::{BStr, ByteSlice};
 use smallvec::SmallVec;
@@ -21,7 +17,10 @@ use crate::{
 pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<Vec<FileSet>> {
     let mut resolved = Vec::with_capacity(ast.imports.len());
 
-    let go_mod = closest_go_mod(db, ast.source.parent(db).unwrap()).await?;
+    let parent = ast.source.absolute(db).parent().unwrap();
+    let parent = NormalPath::new(db, parent).await?;
+
+    let go_mod = closest_go_mod(db, parent).await?;
     for import in ast.imports.iter() {
         resolved.push(
             resolve::spawn(db, import.path.text, go_mod).with_context(|error| {
@@ -68,43 +67,46 @@ pub async fn resolve_impl<'db>(
     };
 
     // check the standard library first
-    let std_lib = NormalPathData::GoRoot(Path::new("src").join(name).into());
-    if let Some(files) = try_candidate(db, std_lib).await {
+    let goroot = crate::process::go_var_path(db, "GOROOT").await?;
+    let std_lib = goroot.join("src").join(name);
+    if let Some(files) = try_candidate(db, NormalPathData::new(db, &std_lib).await?).await {
         return Ok(files);
     }
 
     // then vendored dependencies
     let mut vendor_candidate = go_mod;
     while let Some(mod_path) = vendor_candidate.take() {
-        let mod_dir = mod_path.parent(db).unwrap();
+        let mod_dir = mod_path.absolute(db).parent().unwrap();
 
         // maybe it is a submodule?
         if let Some(module_name) = module_name(db, mod_path).await? {
             if let Some(suffix) = name.strip_prefix(module_name.get(db)) {
                 let suffix = suffix.trim_start_matches('/');
-                if let Some(sub_dir) = mod_dir.lookup(db).join(suffix) {
-                    if let Some(files) = try_candidate(db, sub_dir).await {
-                        return Ok(files);
-                    }
+                let sub_dir = mod_dir.join(suffix);
+                let candidate = NormalPathData::new(db, &sub_dir).await?;
+                if let Some(files) = try_candidate(db, candidate).await {
+                    return Ok(files);
                 }
             }
         }
 
-        let vendor_dir = mod_dir.lookup(db).join("vendor").unwrap();
-        let vendor_path = vendor_dir.join(name).unwrap();
-        if let Some(files) = try_candidate(db, vendor_path).await {
+        let vendor_path = mod_dir.join("vendor").join(name);
+        let candidate = NormalPathData::new(db, &vendor_path).await?;
+        if let Some(files) = try_candidate(db, candidate).await {
             return Ok(files);
         }
 
-        if let Some(parent) = mod_dir.parent(db) {
+        if let Some(parent) = mod_dir.parent() {
+            let parent = NormalPath::new(db, parent).await?;
             vendor_candidate = closest_go_mod(db, parent).await?;
         }
     }
 
     // and GOPATH last (if coming from the standard library we don't want to reduce the query's
     // durability by depending on files outside the root directory)
-    let gopath = NormalPathData::GoPath(Path::new("src").join(name).into());
-    if let Some(files) = try_candidate(db, gopath).await {
+    let gopath = crate::process::go_var_path(db, "GOPATH").await?;
+    let lib_path = gopath.join("src").join(name);
+    if let Some(files) = try_candidate(db, NormalPathData::new(db, &lib_path).await?).await {
         return Ok(files);
     }
 
@@ -131,7 +133,10 @@ async fn resolve_import_go_list(
         dir: PathBuf,
     }
 
-    let mod_dir = go_mod.and_then(|path| path.parent(db));
+    let mod_dir = match go_mod.and_then(|path| path.absolute(db).parent()) {
+        Some(path) => Some(NormalPath::new(db, path).await?),
+        None => None,
+    };
     let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_dir).await?;
     let pkg: GoListPackage = serde_json::from_slice(output).unwrap();
 
@@ -142,15 +147,17 @@ async fn resolve_import_go_list(
 #[haste::query]
 #[clone]
 pub async fn closest_go_mod(db: &dyn crate::Db, path: NormalPath) -> Result<Option<NormalPath>> {
-    let mod_path = path.join(db, "go.mod").unwrap();
+    let absolute = path.absolute(db);
 
+    let mod_path = NormalPath::new(db, &absolute.join("go.mod")).await?;
     if fs::is_file(db, mod_path).await {
         return Ok(Some(mod_path));
     }
 
-    let Some(parent) = path.parent(db) else { return Ok(None) };
+    let Some(parent) = absolute.parent() else { return Ok(None) };
 
-    closest_go_mod(db, parent).await
+    let parent_path = NormalPath::new(db, parent).await?;
+    closest_go_mod(db, parent_path).await
 }
 
 #[haste::query]

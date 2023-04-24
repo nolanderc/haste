@@ -443,14 +443,25 @@ pub trait DatabaseExt: Database {
     where
         Q: Input,
         Q::Storage: 'static,
-        Q::Container: QueryCache<Query = Q> + 'db,
+        Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
         Self: WithStorage<Q::Storage>,
     {
         assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
 
-        let (storage, runtime) = self.storage_mut();
+        let (storage, _) = self.storage_mut();
         let cache = storage.container_mut();
-        cache.invalidate(runtime, &input);
+
+        let Some(resource) = cache.lookup(&input) else { return };
+        let path = IngredientPath {
+            container: cache.path(),
+            resource,
+        };
+
+        let runtime = self.runtime();
+        let future = runtime.execute_query::<Q>(self.cast_dyn(), input.clone(), path);
+        let result = pollster::block_on(future);
+
+        self.set::<Q>(input, result.output, result.transitive.durability());
     }
 
     fn insert<'db, T>(&'db self, value: <T::Container as ElementContainer>::Value) -> T

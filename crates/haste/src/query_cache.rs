@@ -39,6 +39,8 @@ pub trait QueryCache: DynQueryCache {
         id: Id,
     ) -> Result<QueryResult<'a, Self::Query>, PendingFuture<'a, Self::Query>>;
 
+    fn lookup(&mut self, input: &<Self::Query as Query>::Input) -> Option<Id>;
+
     fn set(
         &mut self,
         runtime: &mut Runtime,
@@ -49,10 +51,6 @@ pub trait QueryCache: DynQueryCache {
         Self::Query: crate::Input;
 
     fn remove(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
-    where
-        Self::Query: crate::Input;
-
-    fn invalidate(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
     where
         Self::Query: crate::Input;
 }
@@ -124,7 +122,7 @@ where
             Err(Some(output)) => {
                 return LastChangeFuture::Ready(Change {
                     changed_at: slot.last_changed(),
-                    transitive: output.transitive.unwrap(),
+                    transitive: output.transitive,
                 })
             }
             Err(None) => {}
@@ -133,7 +131,7 @@ where
                 Err(output) => {
                     return LastChangeFuture::Ready(Change {
                         changed_at: slot.last_changed(),
-                        transitive: output.transitive.unwrap(),
+                        transitive: output.transitive,
                     })
                 }
             },
@@ -184,6 +182,12 @@ where
         }
     }
 
+    fn lookup(&mut self, input: &<Self::Query as Query>::Input) -> Option<Id> {
+        self.lookup
+            .get_mut(input, &mut self.storage)
+            .map(|(id, _)| id)
+    }
+
     fn set(
         &mut self,
         runtime: &mut Runtime,
@@ -197,8 +201,8 @@ where
         let slot = self.storage.slot_mut(id);
 
         if let Some(previous) = slot.get_output_mut() {
-            let old_durability = previous.transitive.as_ref().map(|t| t.durability());
-            if Some(durability) == old_durability && output == previous.output {
+            let old_durability = previous.transitive.durability();
+            if durability == old_durability && output == previous.output {
                 // no change: the value is still valid
                 slot.set_verified(runtime.current_revision());
                 return;
@@ -214,15 +218,6 @@ where
     {
         if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
             slot.remove_output(runtime);
-        }
-    }
-
-    fn invalidate(&mut self, runtime: &mut Runtime, input: &Q::Input)
-    where
-        Self::Query: crate::Input,
-    {
-        if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
-            slot.invalidate(runtime);
         }
     }
 }
@@ -529,31 +524,27 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let poll_inner = this.inner.as_mut().poll(cx);
         let result = std::task::ready!(poll_inner);
 
-        let mut new = this.storage.create_output(result);
+        let new = this.storage.create_output(result);
         let mut slot = this.slot.take().unwrap();
 
-        if let Some(last_changed) = slot.last_changed() {
-            if let Some(old) = slot.get_output() {
-                if new.output == old.output {
-                    // backdate the result (verify the output, but keep the revision it was last
-                    // changed)
-                    old.dependencies = new.dependencies;
-                    old.transitive = new.transitive;
+        if let Some(old) = slot.get_output() {
+            if new.output == old.output {
+                // backdate the result (verify the output, but keep the revision it was last
+                // changed)
+                old.dependencies = new.dependencies;
 
-                    if Q::IS_INPUT {
-                        old.transitive.as_mut().unwrap().add_input(last_changed);
-                    }
+                let old_inputs = old.transitive.inputs;
+                old.transitive = new.transitive;
 
-                    let slot = slot.backdate();
-                    return Poll::Ready(QueryResult { id, slot });
+                if Q::IS_INPUT {
+                    // inputs only have a single input: themselves. Since the value did not
+                    // change, we reuse the old value.
+                    old.transitive.inputs = old_inputs;
                 }
-            }
-        }
 
-        if Q::IS_INPUT {
-            // all input queries implicitly depend on themselves
-            let current = this.inner.database().runtime().current_revision();
-            new.transitive.as_mut().unwrap().add_input(current);
+                let slot = slot.backdate();
+                return Poll::Ready(QueryResult { id, slot });
+            }
         }
 
         let slot = slot.finish(new);

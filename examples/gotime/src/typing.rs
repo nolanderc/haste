@@ -31,6 +31,7 @@ pub struct Storage(
     resolve_selector,
     method_signature,
     comparable,
+    is_unsafe_decl,
 );
 
 #[haste::intern(Type)]
@@ -1138,23 +1139,26 @@ async fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
     }
 }
 
-fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &str) -> bool {
+#[haste::query]
+#[clone]
+async fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &'static str) -> Result<bool> {
     use crate::import::FileSetData;
     use std::ffi::OsStr;
 
     if decl.name(db).base.get(db) != name || decl.package(db).name.get(db) != "unsafe" {
-        return false;
+        return Ok(false);
     }
 
-    let FileSetData::Directory(dir) = decl.package(db).files.lookup(db) else {return false};
+    let FileSetData::Directory(dir) = decl.package(db).files.lookup(db) else { return Ok(false) };
 
-    let Some(suffix) = dir.lookup(db).as_goroot() else { return false };
+    let goroot = crate::process::go_var_path(db, "GOROOT").await?;
+    let Ok(suffix) = dir.absolute(db).strip_prefix(goroot) else { return Ok(false) };
 
     if suffix != OsStr::new("src/unsafe") {
-        return false;
+        return Ok(false);
     }
 
-    true
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

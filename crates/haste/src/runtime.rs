@@ -305,8 +305,12 @@ impl Runtime {
         this: IngredientPath,
     ) -> ExecFuture<'db, Q> {
         let transitive = if Q::IS_INPUT {
+            let current = self.current_revision();
             TransitiveDependencies {
-                inputs: None,
+                inputs: Some(RevisionRange {
+                    earliest: current,
+                    latest: current,
+                }),
                 input_durability: Durability::CONSTANT,
                 set_durability: Durability::DEFAULT,
             }
@@ -347,6 +351,10 @@ impl Runtime {
     ) {
         ACTIVE.with(|active| {
             let Some(mut task) = active.task.take() else { return };
+            assert!(
+                !task.is_input,
+                "input queries may not have any dependencies"
+            );
             task.dependencies.push(dependency);
             task.transitive.extend(transitive);
             active.task.set(Some(task));
@@ -364,10 +372,7 @@ impl Runtime {
             resource: result.id,
         };
 
-        let transitive = result
-            .slot
-            .transitive
-            .expect("query did not specify transitive dependencies");
+        let transitive = result.slot.transitive;
 
         let dependency = Dependency::new(ingredient);
         self.register_dependency(dependency, transitive);

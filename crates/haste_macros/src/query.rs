@@ -172,6 +172,14 @@ pub fn query_impl(meta: TokenStream, input: TokenStream) -> syn::Result<TokenStr
                 let future = haste::DatabaseExt::execute_inline::<#ident>(#db_ident, (#(#input_idents),*));
                 haste::util::future::map(future, |x| #clone(x))
             }
+
+            #[allow(unused)]
+            #vis fn dependency<'db>(
+                #db_ident: &'db dyn #db_path,
+                #(#input_idents: #input_types),*
+            ) -> impl std::future::Future<Output = haste::Dependency> + 'db {
+                haste::DatabaseExt::query_dependency::<#ident>(#db_ident, (#(#input_idents),*))
+            }
         }
     });
 

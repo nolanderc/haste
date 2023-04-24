@@ -133,7 +133,7 @@ pub fn worker_threads() -> usize {
         }
     }
 
-    num_cpus::get_physical().saturating_sub(1)
+    num_cpus::get().saturating_sub(1)
 }
 
 impl Executor {
@@ -190,6 +190,10 @@ impl Executor {
             threads,
             local: Mutex::new(local),
         }
+    }
+
+    pub fn parallelism(&self) -> usize {
+        self.shared.workers.len()
     }
 
     /// Drive the executor until the future completes.
@@ -684,11 +688,14 @@ impl LocalScheduler {
     }
 
     fn schedule(&self, task: Task) {
-        if unsafe { (*self.reserved_next.as_ptr()).is_none() } {
-            self.reserved_next.set(Some(task));
-        } else {
-            self.schedule_stealable(task);
+        // if unsafe { (*self.reserved_next.as_ptr()).is_none() } {
+        //     self.reserved_next.set(Some(task));
+        // } else {
+        self.queue.push(task);
+        if self.queue.len() > 1 {
+            self.shared.try_wake_suspended();
         }
+        // }
     }
 
     fn schedule_stealable(&self, task: Task) {

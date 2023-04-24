@@ -29,7 +29,7 @@ impl<T> Default for RawArena<T> {
 
 impl<T> RawArena<T> {
     pub fn new() -> Self {
-        Self::with_capacity(u32::MAX as usize)
+        Self::with_capacity(1 << 32)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -45,6 +45,10 @@ impl<T> RawArena<T> {
             0,
             "allocated memory was not aligned"
         );
+
+        if cfg!(target_os = "linux") {
+            unsafe { libc::madvise(ptr.cast_mut().cast(), bytes, libc::MADV_HUGEPAGE) };
+        }
 
         Self {
             allocation,

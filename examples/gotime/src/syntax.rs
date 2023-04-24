@@ -17,7 +17,7 @@ use crate::{
 #[haste::query]
 pub async fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<File> {
     let source = crate::source::source_text(db, path).await?;
-    self::parse::parse(db, &source, path)
+    self::parse::parse(db, &source, path).await
 }
 
 #[haste::query]

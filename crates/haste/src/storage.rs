@@ -32,6 +32,8 @@ pub trait Container<DB: ?Sized>: 'static + Sync {
     }
 
     fn last_change<'a>(&'a self, db: &'a DB, dep: Dependency) -> LastChangeFuture<'a>;
+
+    fn info(&self, id: crate::Id) -> Option<crate::IngredientInfo>;
 }
 
 #[pin_project::pin_project(project = LastChangeProj)]

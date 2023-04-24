@@ -104,6 +104,10 @@ where
         self.raw.fmt_index(path, f)
     }
 
+    fn get_info(&self, path: crate::IngredientPath) -> Option<crate::IngredientInfo> {
+        self.raw.get_info(path)
+    }
+
     fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any> {
         self.raw.get_storage_any(id)
     }

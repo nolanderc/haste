@@ -9,7 +9,7 @@
 
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -18,12 +18,12 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::util::CallOnDrop;
-use haste::Durability;
+use haste::{Database as _, Durability};
 use index_map::IndexMap;
 use naming::DeclName;
 use notify::Watcher;
 use path::NormalPath;
-use util::future::IteratorExt;
+use util::future::{IteratorExt, StreamExt};
 
 use crate::common::Text;
 use crate::diagnostic::error;
@@ -205,7 +205,7 @@ impl Db for Database {
     }
 }
 
-#[derive(clap::Parser, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(clap::Parser, Debug, Hash, PartialEq, Eq)]
 struct Arguments {
     /// Watch files for changes and automatically rebuild the files using incremental compilation.
     #[clap(short, long)]
@@ -222,6 +222,14 @@ struct Arguments {
     /// Loop endlessly
     #[clap(long)]
     repeat: bool,
+
+    /// Emit a dependency graph to the given path
+    #[clap(long = "graph")]
+    graph_path: Option<PathBuf>,
+
+    /// Emit the critical path
+    #[clap(long)]
+    critical_path: bool,
 
     #[clap(flatten)]
     config: CompileConfig,
@@ -241,14 +249,16 @@ fn parse_arc_path(text: &str) -> std::io::Result<Arc<Path>> {
 fn main() {
     let _guard = CallOnDrop(|| eprintln!("done"));
 
-    tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .without_time()
-        .with_target(false)
-        .init();
+    if cfg!(debug_assertions) {
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .without_time()
+            .with_target(false)
+            .init();
+    }
 
     let arguments = <Arguments as clap::Parser>::parse();
     haste::enable_metrics(arguments.metrics);
@@ -259,11 +269,15 @@ fn main() {
             run(&mut db, &arguments);
         }
     } else if arguments.watch {
-        let mut db = Database::new();
+        let mut db = std::mem::ManuallyDrop::new(Database::new());
         watch_loop(&mut db, &arguments)
     } else {
-        let mut db = Database::new();
+        let mut db = {
+            let _guard = haste::enter_span("Database::new()");
+            std::mem::ManuallyDrop::new(Database::new())
+        };
         run(&mut db, &arguments);
+        std::process::exit(0);
     }
 }
 
@@ -381,7 +395,7 @@ fn run(db: &mut Database, arguments: &Arguments) {
 
     haste::scope(db, |scope, db| {
         if !arguments.silent {
-            eprintln!("running...");
+            eprintln!("running {} threads... ", db.runtime().parallelism());
         }
 
         let result = scope.block_on(compile(db, arguments.config.clone()));
@@ -397,6 +411,20 @@ fn run(db: &mut Database, arguments: &Arguments) {
                     .write_all(string.as_bytes())
                     .unwrap();
             }
+        }
+
+        if let Some(path) = arguments.graph_path.as_deref() {
+            let root = scope.block_on(compile::dependency(db, arguments.config.clone()));
+            let graph = DependencyGraph::collect(db, root);
+            if let Err(error) = graph.save(db, path) {
+                eprintln!("error: failed to save dependency graph: {error}");
+            }
+        }
+
+        if arguments.critical_path {
+            let root = scope.block_on(compile::dependency(db, arguments.config.clone()));
+            let graph = DependencyGraph::collect(db, root);
+            graph.critical_path(db);
         }
     });
 
@@ -430,6 +458,171 @@ fn run(db: &mut Database, arguments: &Arguments) {
     }
 }
 
+struct DependencyGraph<'db> {
+    /// List of queries and their dependencies listed. Topological ordering.
+    edges: Vec<(haste::Dependency, &'db [haste::Dependency])>,
+}
+
+impl<'db> DependencyGraph<'db> {
+    fn collect(db: &'db Database, root: haste::Dependency) -> Self {
+        enum Command {
+            Visit,
+            Emit,
+        }
+
+        let mut visited = HashSet::default();
+        let mut edges = Vec::with_capacity(256);
+        let mut stack = Vec::with_capacity(32);
+
+        visited.reserve(256);
+        stack.push((Command::Visit, root));
+
+        while let Some((command, curr)) = stack.pop() {
+            let Some(info) = db.get_info(curr.ingredient()) else { continue };
+
+            match command {
+                Command::Visit => {
+                    if !visited.insert(curr) {
+                        continue;
+                    }
+
+                    stack.push((Command::Emit, curr));
+                    for &dep in info.dependencies {
+                        stack.push((Command::Visit, dep));
+                    }
+                }
+                Command::Emit => {
+                    edges.push((curr, info.dependencies));
+                }
+            }
+        }
+
+        Self { edges }
+    }
+
+    fn critical_path(&self, db: &Database) {
+        #[derive(Clone, Copy)]
+        struct CriticalNode {
+            poll_nanos: u64,
+            next: Option<haste::Dependency>,
+        }
+
+        // for each node, its critical path
+        let mut max_time = HashMap::<haste::Dependency, CriticalNode>::default();
+
+        for &(node, dependencies) in self.edges.iter() {
+            let mut next = None;
+            let mut child_nanos = 0;
+
+            for &dep in dependencies {
+                let child = max_time[&dep];
+                if child.poll_nanos > child_nanos {
+                    child_nanos = child.poll_nanos;
+                    next = Some(dep);
+                }
+            }
+
+            let info = db.get_info(node.ingredient()).unwrap();
+            let critical = CriticalNode {
+                poll_nanos: child_nanos.saturating_add(info.poll_nanos),
+                next,
+            };
+
+            max_time.insert(node, critical);
+        }
+
+        let mut total_nanos = 0u64;
+        let mut path = Vec::with_capacity(32);
+        let mut curr = self.edges.last().unwrap().0;
+
+        loop {
+            let info = db.get_info(curr.ingredient()).unwrap();
+            total_nanos = total_nanos.saturating_add(info.poll_nanos);
+            path.push((curr, info));
+
+            let critical = max_time[&curr];
+            let Some(next) = critical.next else { break };
+            curr = next;
+        }
+
+        eprintln!(
+            "critcal path: {:?}",
+            std::time::Duration::from_nanos(total_nanos)
+        );
+
+        for (node, info) in path.iter() {
+            eprintln!(
+                "{:>10} ({}): {}",
+                format!("{:6.3?}", std::time::Duration::from_nanos(info.poll_nanos)),
+                info.poll_count,
+                crate::util::display_fn(|f| db.fmt_index(node.ingredient(), f))
+            );
+        }
+    }
+
+    fn save(&self, db: &Database, path: &Path) -> std::io::Result<()> {
+        let mut indices = HashMap::default();
+        for (index, &(node, _)) in self.edges.iter().enumerate() {
+            indices.insert(node, index);
+        }
+
+        let mut name_buffer = String::with_capacity(self.edges.len() * 32);
+        let mut node_ranges = Vec::with_capacity(self.edges.len());
+        for &(node, _) in self.edges.iter() {
+            use std::fmt::Write;
+            let start = name_buffer.len();
+            write!(
+                name_buffer,
+                "{}",
+                haste::util::fmt::from_fn(|f| { db.fmt_index(node.ingredient(), f) })
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let end = name_buffer.len();
+            node_ranges.push(start..end);
+        }
+
+        let mut node_data = Vec::with_capacity(self.edges.len());
+        for range in node_ranges {
+            node_data.push(Node {
+                name: &name_buffer[range],
+            });
+        }
+
+        let mut edge_data = Vec::with_capacity(self.edges.len());
+        for &(_, dependencies) in self.edges.iter() {
+            edge_data.push(dependencies.iter().map(|dep| indices[dep]).collect());
+        }
+
+        #[derive(serde::Serialize)]
+        struct Graph<'a> {
+            nodes: Vec<Node<'a>>,
+            edges: Vec<Vec<usize>>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Node<'a> {
+            name: &'a str,
+        }
+
+        let file = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        let writer = std::io::BufWriter::new(file);
+
+        serde_json::to_writer(
+            writer,
+            &Graph {
+                nodes: node_data,
+                edges: edge_data,
+            },
+        )?;
+
+        Ok(())
+    }
+}
+
 /// Compile the program using the given arguments
 #[haste::query]
 #[clone]
@@ -457,8 +650,22 @@ struct Package {
     signatures: IndexMap<DeclName, typing::Type>,
 }
 
+async fn prefetch_imports(
+    db: &dyn crate::Db,
+    source: NormalPath,
+    imports: impl Iterator<Item = Text>,
+) {
+    let Ok(go_mod) = import::closest_go_mod(db, source).await else { return };
+    for import in imports {
+        if let Ok(package) = import::resolve(db, import, go_mod).await {
+            compile_package_files::prefetch(db, package);
+        }
+    }
+}
+
 #[haste::query]
 #[clone]
+#[lookup(haste::query_cache::TrackedStrategy)]
 async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Result<Arc<Package>> {
     let asts = files.lookup(db).parse(db).await?;
     let package = naming::PackageId::from_files(db, files).await?;
@@ -468,6 +675,12 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         .map(|ast| import::resolve_imports(db, ast))
         .try_join_all()
         .await?;
+
+    let packages = resolved
+        .iter()
+        .flatten()
+        .map(|&package| compile_package_files::spawn(db, package))
+        .start_all();
 
     let package_scope = naming::package_scope(db, files).await.as_ref()?;
 
@@ -507,12 +720,7 @@ async fn compile_package_files(db: &dyn crate::Db, files: import::FileSet) -> Re
         import_names.push(package_names.by_ref().take(ast.imports.len()).collect());
     }
 
-    resolved
-        .iter()
-        .flatten()
-        .map(|&package| compile_package_files::spawn(db, package))
-        .try_join_all()
-        .await?;
+    _ = packages.try_join_all().await?;
 
     Ok(Arc::new(Package {
         name: package.name,

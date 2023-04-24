@@ -39,6 +39,14 @@ where
         // Interned values are constant, so can never change
         LastChangeFuture::Ready(Change::NONE)
     }
+
+    fn info(&self, _id: crate::Id) -> Option<crate::IngredientInfo> {
+        Some(crate::IngredientInfo {
+            dependencies: &[],
+            poll_count: 0,
+            poll_nanos: 0,
+        })
+    }
 }
 
 impl<T> crate::ElementContainer for ArenaInterner<T>
@@ -136,7 +144,7 @@ union StringRange {
 struct ByteRange {
     start: u32,
     length: u32,
-    padding: [u8; 3],
+    padding: [u8; 7],
     inline_len: u8,
 }
 
@@ -160,7 +168,7 @@ impl StringRange {
             heap: ByteRange {
                 start,
                 length,
-                padding: [0; 3],
+                padding: [0; 7],
                 inline_len: InlineString::HEAP,
             },
         }
@@ -234,6 +242,14 @@ impl<DB: ?Sized> crate::Container<DB> for StringInterner {
     fn last_change(&self, _db: &DB, _dep: crate::Dependency) -> LastChangeFuture {
         // Interned values are constant, so can never change
         LastChangeFuture::Ready(Change::NONE)
+    }
+
+    fn info(&self, _id: crate::Id) -> Option<crate::IngredientInfo> {
+        Some(crate::IngredientInfo {
+            dependencies: &[],
+            poll_count: 0,
+            poll_nanos: 0,
+        })
     }
 }
 

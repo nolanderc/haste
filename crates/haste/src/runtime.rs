@@ -49,6 +49,10 @@ impl Runtime {
         }
     }
 
+    pub fn parallelism(&self) -> usize {
+        self.executor.parallelism()
+    }
+
     pub fn current_revision(&self) -> Revision {
         self.revisions.current()
     }
@@ -76,6 +80,8 @@ pub struct ExecutionResult<O> {
     pub output: O,
     pub dependencies: Vec<Dependency>,
     pub transitive: TransitiveDependencies,
+    pub poll_count: u32,
+    pub poll_nanos: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -189,10 +195,10 @@ pub(crate) struct ExecFuture<'db, Q: Query> {
     /// The query is currently blocking this query.
     blocks: Option<IngredientPath>,
 
+    /// Number of times the query has been polled.
+    poll_count: u32,
     /// Amount of time spent polling the query.
-    duration: std::time::Duration,
-    /// When the task was first polled.
-    start: Option<std::time::Instant>,
+    poll_nanos: u64,
 }
 
 #[pin_project::pin_project(project = ExecFutureInnerProj)]
@@ -243,10 +249,7 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
 
             let restore_guard = CallOnDrop(|| *this.task = active.task.replace(old_task.take()));
 
-            let start = std::time::Instant::now();
-            if this.start.is_none() {
-                *this.start = Some(start);
-            }
+            let start = cpu_time::ThreadTime::now();
 
             // poll the query for completion
             let poll_inner = crate::fmt::scope(this.db.as_dyn(), || match this.inner.project() {
@@ -254,7 +257,9 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
                 ExecFutureInnerProj::Recover(recover) => recover.poll(cx),
             });
 
-            *this.duration += start.elapsed();
+            let nanos = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+            *this.poll_count = this.poll_count.saturating_add(1);
+            *this.poll_nanos = this.poll_nanos.saturating_add(nanos);
 
             // restore the previous task
             drop(restore_guard);
@@ -281,16 +286,12 @@ impl<'db, Q: Query> Future for ExecFuture<'db, Q> {
             let output = std::task::ready!(poll_inner);
             let data = this.task.take().unwrap();
 
-            let metrics = QueryMetrics {
-                poll_duration: *this.duration,
-                total_duration: this.start.unwrap().elapsed(),
-            };
-            this.db.register_metrics(data.this, metrics);
-
             Poll::Ready(ExecutionResult {
                 output,
                 dependencies: data.dependencies,
                 transitive: data.transitive,
+                poll_nanos: *this.poll_nanos,
+                poll_count: *this.poll_count,
             })
         })
     }
@@ -319,8 +320,8 @@ impl Runtime {
             inner: ExecFutureInner::Eval(Q::execute(db, input)),
             task: Some(TaskData::new::<Q>(this, transitive)),
             blocks: None,
-            duration: std::time::Duration::ZERO,
-            start: None,
+            poll_count: 0,
+            poll_nanos: 0,
         }
     }
 
@@ -357,7 +358,7 @@ impl Runtime {
         &self,
         container: ContainerPath,
         result: &QueryResult<Q>,
-    ) {
+    ) -> Dependency {
         let ingredient = IngredientPath {
             container,
             resource: result.id,
@@ -368,7 +369,9 @@ impl Runtime {
             .transitive
             .expect("query did not specify transitive dependencies");
 
-        self.register_dependency(Dependency::new(ingredient), transitive)
+        let dependency = Dependency::new(ingredient);
+        self.register_dependency(dependency, transitive);
+        dependency
     }
 
     pub(crate) fn current_query(&self) -> Option<QueryInfo> {
@@ -387,12 +390,6 @@ impl Runtime {
         }
 
         let _guard = crate::enter_span("would_block_on");
-
-        tracing::trace!(
-            child = %crate::util::fmt::ingredient(db, child),
-            ?parent,
-            "would block on",
-        );
         self.graph.insert(parent, child, waker, db);
     }
 
@@ -400,8 +397,6 @@ impl Runtime {
         if self.executor.stopped() {
             return;
         }
-
-        tracing::trace!(?parent, "unblocked");
         self.graph.remove(parent);
     }
 

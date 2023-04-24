@@ -141,6 +141,18 @@ where
 
         LastChangeFuture::Pending(slot.wait_for_change(current))
     }
+
+    fn info(&self, id: crate::Id) -> Option<crate::IngredientInfo> {
+        let slot = self.storage.try_get_slot(id)?;
+        let revision = self.storage.current_revision();
+        let output = unsafe { slot.output(revision)? };
+        let dependencies = unsafe { self.storage.dependencies(output.dependencies) };
+        Some(crate::IngredientInfo {
+            dependencies,
+            poll_count: output.poll_count,
+            poll_nanos: output.poll_nanos,
+        })
+    }
 }
 
 impl<Q: Query, Lookup> QueryCache for QueryCacheImpl<Q, Lookup>
@@ -515,7 +527,6 @@ impl<'a, Q: Query> Future for ExecTaskFuture<'a, Q> {
         let id = path.resource;
 
         let poll_inner = this.inner.as_mut().poll(cx);
-
         let result = std::task::ready!(poll_inner);
 
         let mut new = this.storage.create_output(result);

@@ -5,3 +5,4 @@ perf.data
 flamegraph.svg
 examples/gotime/samples/**/vendor
 .rgignore
+graph.json

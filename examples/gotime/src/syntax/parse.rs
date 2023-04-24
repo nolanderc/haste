@@ -40,7 +40,7 @@ pub fn parse_package_name(
     }
 }
 
-pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
+pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -62,7 +62,7 @@ pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Resu
     parser.data.node.spans.reserve(expected_node_count);
     parser.data.node.indirect.reserve(expected_node_count);
 
-    match parser.file() {
+    match parser.file().await {
         Ok(file) => {
             let nodes = match file.declarations.iter().next() {
                 None => 0,
@@ -71,7 +71,7 @@ pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Resu
             db.register_parsed_file(path, tokens.len(), nodes);
 
             Ok(file)
-        },
+        }
         Err(ErrorToken) => Err(Diagnostic::combine(parser.diagnostics)),
     }
 }
@@ -583,9 +583,15 @@ impl<'a> Parser<'a> {
         Ok(range)
     }
 
-    fn file(&mut self) -> Result<File> {
+    async fn file(&mut self) -> Result<File> {
         let package = self.package()?;
         let imports = self.imports()?;
+
+        crate::prefetch_imports(
+            self.db,
+            self.path,
+            imports.iter().map(|import| import.path.text),
+        ).await;
 
         let declarations = self.declarations()?;
         self.expect_eof()?;

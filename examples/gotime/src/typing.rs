@@ -34,7 +34,7 @@ pub struct Storage(
 );
 
 #[haste::intern(Type)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Untyped(ConstantKind),
 
@@ -565,6 +565,12 @@ impl std::fmt::Display for BuiltinFunction {
 }
 
 pub type TypeList = SmallVec<[Type; 4]>;
+
+impl std::fmt::Debug for TypeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 impl std::fmt::Display for TypeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

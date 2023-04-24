@@ -7,7 +7,7 @@ opt-level = 1
 opt-level = 1
 
 [profile.release]
-debug = true
+strip = true
 
 # Always build proc-macros and build scripts with optimizations:
 [profile.dev.build-override]

@@ -1,6 +1,7 @@
 mod cell;
 
 use bytemuck::Zeroable;
+use crossbeam_utils::CachePadded;
 
 use crate::{
     arena::{AppendArena, RawArena},
@@ -88,6 +89,8 @@ impl<Q: Query> QueryStorage<Q> {
             output: result.output,
             dependencies: DependencyRange::from(start..end),
             transitive: Some(result.transitive),
+            poll_count: result.poll_count,
+            poll_nanos: result.poll_nanos,
         }
     }
 
@@ -158,7 +161,7 @@ impl<Q: Query> QueryStorage<Q> {
 
 pub struct QuerySlot<Q: Query> {
     /// The result from executing the query.
-    cell: QueryCell<Q::Input, OutputSlot<Q>>,
+    cell: CachePadded<QueryCell<Q::Input, OutputSlot<Q>>>,
 }
 
 unsafe impl<Q: Query> Sync for QuerySlot<Q> {}
@@ -174,6 +177,11 @@ pub struct OutputSlot<Q: Query> {
     /// If `None`, the query has been invalidated and needs to be re-evaluated to find the new
     /// dependencies.
     pub transitive: Option<TransitiveDependencies>,
+
+    /// Number of nanoseconds spent polling the query.
+    pub poll_nanos: u64,
+    /// Number of times the query was polled.
+    pub poll_count: u32,
 
     /// The output from a query.
     pub output: Q::Output,
@@ -303,6 +311,10 @@ impl<Q: Query> QuerySlot<Q> {
         self.cell.input_assume_init()
     }
 
+    pub unsafe fn output(&self, revision: Revision) -> Option<&OutputSlot<Q>> {
+        unsafe { self.cell.try_get_output(revision) }
+    }
+
     pub unsafe fn output_unchecked(&self) -> &OutputSlot<Q> {
         self.cell.output_assume_init()
     }
@@ -354,6 +366,8 @@ impl<Q: Query> QuerySlot<Q> {
                     input_durability: Durability::CONSTANT,
                     set_durability: durability,
                 }),
+                poll_count: 0,
+                poll_nanos: 0,
             });
     }
 

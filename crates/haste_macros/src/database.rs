@@ -73,6 +73,10 @@ pub fn database_impl(meta: TokenStream, input: TokenStream) -> syn::Result<Token
                     self.storage.get_path(self, dep.container()).last_change(self, dep)
                 }
 
+                fn get_info(&self, path: haste::IngredientPath) -> Option<haste::IngredientInfo> {
+                    self.storage.get_path(self, path.container).info(path.resource)
+                }
+
                 /// Format an ingredient
                 fn fmt_index(
                     &self,

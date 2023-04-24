@@ -33,7 +33,6 @@ use futures_lite::FutureExt;
 pub use haste_macros::*;
 pub use query_cache::*;
 pub use revision::Revision;
-use runtime::QueryMetrics;
 pub use runtime::{Cycle, CycleStrategy, Dependency, Runtime};
 pub use storage::*;
 
@@ -87,18 +86,14 @@ pub trait Database: Sync {
     /// Given an ingredient, return the revision in which its value was last changed.
     fn last_change(&self, dep: Dependency) -> LastChangeFuture;
 
+    /// Get runtime information about of a query.
+    fn get_info(&self, path: IngredientPath) -> Option<IngredientInfo>;
+
     /// Format an ingredient
     fn fmt_index(&self, path: IngredientPath, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
     /// Get a type-erased pointer to a storage of the given type.
     fn get_storage_any(&self, id: std::any::TypeId) -> Option<&dyn std::any::Any>;
-
-    /// Called when a query finishes executing. Allows the database to instrument how long
-    /// different queries take to execute.
-    fn register_metrics(&self, path: IngredientPath, metrics: QueryMetrics) {
-        _ = path;
-        _ = metrics;
-    }
 }
 
 impl dyn Database {
@@ -106,6 +101,12 @@ impl dyn Database {
         self.get_storage_any(std::any::TypeId::of::<S>())?
             .downcast_ref()
     }
+}
+
+pub struct IngredientInfo<'db> {
+    pub dependencies: &'db [Dependency],
+    pub poll_count: u32,
+    pub poll_nanos: u64,
 }
 
 pub trait StaticDatabase: Database + Sized {
@@ -247,6 +248,14 @@ where
     DB: WithStorage<Q::Storage>,
 = impl Future<Output = &'db <Q as Query>::Output> + 'db;
 
+type DependencyFuture<'db, DB: ?Sized, Q: Query>
+where
+    Q: Query,
+    Q::Storage: 'db,
+    Q::Container: QueryCache<Query = Q> + Container<DB> + 'db,
+    DB: WithStorage<Q::Storage>,
+= impl Future<Output = crate::Dependency> + 'db;
+
 /// Extends databases with generic methods for working with [`Ingredient`]s.
 ///
 /// These cannot be included directly in [`Database`] as these methods are not object safe.
@@ -295,11 +304,11 @@ pub trait DatabaseExt: Database {
             EvalResult::Cached(cached) => {
                 guard.rename("spawn cached");
                 SpawnResult::Cached(cached)
-            },
+            }
             EvalResult::Pending(pending) => {
                 guard.rename("spawn pending");
                 SpawnResult::Pending(pending)
-            },
+            }
             EvalResult::Eval(eval) => {
                 guard.rename("spawn eval");
                 // spawn the query, but postpone checking it for completion until the returned
@@ -350,6 +359,53 @@ pub trait DatabaseExt: Database {
             // the query must be evaluated, so spawn it in the runtime for concurrent processing
             EvalResult::Eval(eval) => runtime.spawn_query(eval),
         }
+    }
+
+    /// Returns a dependency representing the given query.
+    fn query_dependency<'db, Q>(&'db self, input: Q::Input) -> DependencyFuture<'db, Self, Q>
+    where
+        Q: Query,
+        Q::Storage: 'db,
+        Q::Container: QueryCache<Query = Q> + Container<Self> + 'db,
+        Self: WithStorage<Q::Storage>,
+    {
+        let (storage, runtime, db) = self.storage_with_db();
+        let cache = storage.container();
+
+        enum SpawnResult<Cached, Pending> {
+            Cached(Cached),
+            Pending(Pending),
+            Spawned(Id),
+        }
+
+        let mut spawn = match cache.get_or_evaluate(db, input) {
+            EvalResult::Cached(cached) => SpawnResult::Cached(cached),
+            EvalResult::Pending(pending) => SpawnResult::Pending(pending),
+            EvalResult::Eval(eval) => {
+                // spawn the query, but postpone checking it for completion until the returned
+                // future is polled. That way the spawned task has a chance of completing first.
+                let id = runtime::QueryTask::path(&eval).resource;
+                runtime.spawn_query(eval);
+                SpawnResult::Spawned(id)
+            }
+        };
+
+        std::future::poll_fn(move |cx| {
+            let result = loop {
+                match &mut spawn {
+                    SpawnResult::Cached(cached) => break *cached,
+                    SpawnResult::Pending(pending) => break std::task::ready!(pending.poll(cx)),
+                    SpawnResult::Spawned(id) => match cache.get(db, *id) {
+                        Ok(output) => break output,
+                        Err(pending) => spawn = SpawnResult::Pending(pending),
+                    },
+                }
+            };
+
+            let dependency = runtime.register_query_dependency(cache.path(), &result);
+
+            std::task::Poll::Ready(dependency)
+        })
     }
 
     /// Set the value of an input

@@ -449,11 +449,7 @@ impl<'db> TypingContext<'db> {
             AssignResult::Incompatible => {
                 let span = self.node_span(source_expr);
                 Err(error!("type mismatch")
-                    .label(span, format!("expected `{target}`, but found `{source}`"))
-                    .label(
-                        span,
-                        format!("expected `{target:?}`, but found `{source:?}`"),
-                    ))
+                    .label(span, format!("expected `{target}`, but found `{source}`")))
             }
             AssignResult::Interface(error) => {
                 let span = self.node_span(source_expr);

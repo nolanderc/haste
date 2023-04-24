@@ -49,7 +49,7 @@ impl<T, Hasher> ShardMap<T, Hasher> {
         let mut shards = Vec::with_capacity(shard_count);
 
         for _ in 0..shard_count {
-            shards.push(CachePadded::new(Shard::new(RawTable::with_capacity(64))));
+            shards.push(CachePadded::new(Shard::new(RawTable::with_capacity(1024))));
         }
 
         assert!(shards.len().is_power_of_two());

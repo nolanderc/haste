@@ -1,10 +1,7 @@
 package main
 
-import (
-    "fmt"
-    "rsc.io/quote"
-)
+import "fmt"
 
 func main() {
-    fmt.Printf(quote.Hello())
+    fmt.Printf("Hello, world!")
 }

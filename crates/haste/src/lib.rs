@@ -274,9 +274,11 @@ pub trait DatabaseExt: Database {
 
         let future = cache.get_or_evaluate(db, input);
 
+        let group = runtime.current_group();
+
         crate::util::future::poll_fn_pin(future, move |future, cx| {
             let result = std::task::ready!(future.poll(cx));
-            runtime.register_query_dependency(path, &result);
+            runtime.register_query_dependency(path, &result, group);
             std::task::Poll::Ready(&result.slot.output)
         })
     }
@@ -319,6 +321,8 @@ pub trait DatabaseExt: Database {
             }
         };
 
+        let group = runtime.current_group();
+
         std::future::poll_fn(move |cx| {
             let result = loop {
                 match &mut spawn {
@@ -331,7 +335,7 @@ pub trait DatabaseExt: Database {
                 }
             };
 
-            runtime.register_query_dependency(cache.path(), &result);
+            runtime.register_query_dependency(cache.path(), &result, group);
 
             std::task::Poll::Ready(&result.slot.output)
         })
@@ -390,6 +394,8 @@ pub trait DatabaseExt: Database {
             }
         };
 
+        let group = runtime.current_group();
+
         std::future::poll_fn(move |cx| {
             let result = loop {
                 match &mut spawn {
@@ -402,7 +408,7 @@ pub trait DatabaseExt: Database {
                 }
             };
 
-            let dependency = runtime.register_query_dependency(cache.path(), &result);
+            let dependency = runtime.register_query_dependency(cache.path(), &result, group);
 
             std::task::Poll::Ready(dependency)
         })
@@ -515,7 +521,7 @@ pub trait DatabaseExt: Database {
                 Dependency {
                     container: container.path(),
                     resource: id,
-                    extra: 0,
+                    group_index: runtime.current_group(),
                 },
                 TransitiveDependencies::CONSTANT,
             );

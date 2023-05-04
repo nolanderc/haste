@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::{
+    integer::NonMaxU16,
     revision::{InputId, Revision},
     util::{future::UnitFuture, CallOnDrop},
     ContainerPath, Database, DatabaseFor, Durability, IngredientPath, InputRange, Query,
@@ -93,8 +94,23 @@ pub struct ExecutionResult<O> {
 pub struct Dependency {
     pub(crate) container: ContainerPath,
     pub(crate) resource: crate::Id,
-    /// Extra information carried by the dependency (such as the active field)
-    pub(crate) extra: u16,
+    pub(crate) group_index: Option<GroupIndex>,
+}
+
+/// The group index is the length of a query's dependency list when the query was spawned.
+/// Dependencies with the same group index were spawned in parallel. As a special case,
+/// dependencies with group index equal to `u16::MAX` there were too many dependencies to
+/// accurately keep track of the groups, and this should be ignored.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GroupIndex {
+    raw: NonMaxU16,
+}
+
+impl GroupIndex {
+    pub fn new(index: usize) -> Option<GroupIndex> {
+        let raw = NonMaxU16::new(u16::try_from(index).ok()?)?;
+        Some(Self { raw })
+    }
 }
 
 const _: () = assert!(
@@ -104,20 +120,22 @@ const _: () = assert!(
 
 impl std::fmt::Debug for Dependency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}.{}",
-            self.container.index, self.resource.raw, self.extra
-        )
+        write!(f, "{}:{}", self.container.index, self.resource.raw)?;
+
+        if let Some(group) = self.group_index {
+            write!(f, "@{}", group.raw)?;
+        }
+
+        Ok(())
     }
 }
 
 impl Dependency {
-    pub(crate) fn new(ingredient: IngredientPath) -> Self {
+    pub(crate) fn new(ingredient: IngredientPath, group_index: Option<GroupIndex>) -> Self {
         Self {
             container: ingredient.container,
             resource: ingredient.resource,
-            extra: 0,
+            group_index,
         }
     }
 
@@ -346,6 +364,15 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn current_group(&self) -> Option<GroupIndex> {
+        ACTIVE.with(|active| {
+            let task = active.task.take()?;
+            let index = task.dependencies.len();
+            active.task.set(Some(task));
+            GroupIndex::new(index)
+        })
+    }
+
     /// Register a dependency under the currently running query
     pub(crate) fn register_dependency(
         &self,
@@ -369,6 +396,7 @@ impl Runtime {
         &self,
         container: ContainerPath,
         result: &QueryResult<Q>,
+        group_index: Option<GroupIndex>,
     ) -> Dependency {
         let ingredient = IngredientPath {
             container,
@@ -377,7 +405,7 @@ impl Runtime {
 
         let transitive = result.slot.transitive;
 
-        let dependency = Dependency::new(ingredient);
+        let dependency = Dependency::new(ingredient, group_index);
         self.register_dependency(dependency, transitive);
         dependency
     }

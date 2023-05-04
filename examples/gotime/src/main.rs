@@ -234,6 +234,9 @@ struct Arguments {
     #[clap(long)]
     critical_path: bool,
 
+    #[clap(long)]
+    script: Option<PathBuf>,
+
     #[clap(flatten)]
     config: CompileConfig,
 }
@@ -266,7 +269,10 @@ fn main() {
     let arguments = <Arguments as clap::Parser>::parse();
     haste::enable_metrics(arguments.metrics);
 
-    if arguments.repeat {
+    if let Some(path) = &arguments.script {
+        let mut db = std::mem::ManuallyDrop::new(Database::new());
+        run_script(&mut db, &arguments, path)
+    } else if arguments.repeat {
         loop {
             let mut db = Database::new();
             run(&mut db, &arguments);
@@ -275,10 +281,7 @@ fn main() {
         let mut db = std::mem::ManuallyDrop::new(Database::new());
         watch_loop(&mut db, &arguments)
     } else {
-        let mut db = {
-            let _guard = haste::enter_span("Database::new()");
-            std::mem::ManuallyDrop::new(Database::new())
-        };
+        let mut db = std::mem::ManuallyDrop::new(Database::new());
         run(&mut db, &arguments);
         std::process::exit(0);
     }
@@ -388,15 +391,119 @@ fn watch_loop(db: &mut Database, arguments: &Arguments) {
     }
 }
 
+fn run_script(db: &mut Database, arguments: &Arguments, path: &Path) {
+    #[derive(serde::Deserialize)]
+    struct Script {
+        steps: Vec<Step>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Step {
+        Run,
+        Replace { path: PathBuf, with: PathBuf },
+        Append { path: PathBuf, text: String },
+    }
+
+    #[derive(serde::Serialize)]
+    struct Results {
+        seconds: Vec<f64>,
+        errors: Vec<bool>,
+    }
+
+    fn read_file(path: &Path) -> Vec<u8> {
+        match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("could not open file `{}`: {}", path.display(), error),
+        }
+    }
+
+    fn make_normal(db: &mut Database, path: &Path) -> NormalPath {
+        haste::scope(db, |scope, db| {
+            let buffer: PathBuf;
+            let path = if let Ok(rest) = path.strip_prefix("$GOROOT") {
+                buffer = scope
+                    .block_on(process::go_var_path(db, "GOROOT"))
+                    .unwrap()
+                    .join(rest);
+                &buffer
+            } else {
+                path
+            };
+
+            match scope.block_on(NormalPath::new(db, path)) {
+                Ok(normal) => normal,
+                Err(_) => panic!("could not normalize path `{}`", path.display()),
+            }
+        })
+    }
+
+    let script_text = read_file(path);
+    let script: Script = serde_json::from_slice(&script_text).expect("could not parse script");
+
+    let mut results = Results {
+        seconds: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    let dir = path.parent().unwrap();
+
+    for step in script.steps {
+        match step {
+            Step::Run => haste::scope(db, |scope, db| {
+                let process = cpu_time::ProcessTime::now();
+                let start = std::time::Instant::now();
+
+                let result = scope.block_on(compile(db, arguments.config.clone()));
+                let duration = start.elapsed();
+                results.seconds.push(duration.as_secs_f64());
+                results.errors.push(result.is_err());
+
+                if let Err(diagnostic) = result {
+                    let mut string = String::with_capacity(4096);
+                    scope.block_on(diagnostic.write(db, &mut string)).unwrap();
+                    BufWriter::new(std::io::stderr().lock())
+                        .write_all(string.as_bytes())
+                        .unwrap();
+                }
+                eprintln!("real: {duration:?} (cpu: {:?})", process.elapsed());
+            }),
+            Step::Replace { path, with } => {
+                let path = make_normal(db, &path);
+                let new_text = read_file(&dir.join(with));
+                let durability = db.path_durability_untracked(path);
+                fs::read::set(db, path, Ok(new_text.into()), durability);
+            }
+            Step::Append { path, text } => {
+                let path = make_normal(db, &path);
+                let old_text = haste::scope(db, |scope, db| {
+                    scope.block_on(fs::read(db, path)).clone().unwrap()
+                });
+                let mut new_text = Vec::with_capacity(old_text.len() + text.len());
+                new_text.extend_from_slice(&old_text);
+                new_text.extend_from_slice(text.as_bytes());
+                let durability = db.path_durability_untracked(path);
+                fs::read::set(db, path, Ok(new_text.into()), durability);
+            }
+        }
+    }
+
+    let mut result_path = dir.join("results");
+    std::fs::create_dir_all(&result_path).expect("could not create results directory");
+    result_path.push(path.file_name().unwrap());
+    std::fs::write(&result_path, serde_json::to_vec_pretty(&results).unwrap())
+        .expect("could not write results");
+}
+
 fn run(db: &mut Database, arguments: &Arguments) {
-    let start = std::time::Instant::now();
     let process = cpu_time::ProcessTime::now();
+    let start = std::time::Instant::now();
+
+    if !arguments.silent {
+        eprintln!("running {} threads... ", db.runtime().parallelism());
+    }
 
     haste::scope(db, |scope, db| {
-        if !arguments.silent {
-            eprintln!("running {} threads... ", db.runtime().parallelism());
-        }
-
         let result = scope.block_on(compile(db, arguments.config.clone()));
 
         match result {

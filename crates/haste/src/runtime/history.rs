@@ -23,7 +23,7 @@ impl ChangeHistory {
     pub fn new() -> Self {
         Self {
             histories: std::array::from_fn(|_| {
-                let mut history = History::default();
+                let mut history = History::new();
                 history.record_change(None, None);
                 history
             }),
@@ -78,15 +78,29 @@ impl ChangeHistory {
     }
 }
 
-#[derive(Default)]
 struct History {
     /// The revision in which the last change happened
     last_change: Option<Revision>,
     /// A detailed accounting of all changes that have ever been made.
     detailed: BitHistory<InputSet>,
+    /// Disables the revision history, only using the last change to durability.
+    disabled: bool,
 }
 
 impl History {
+    fn new() -> Self {
+        let disabled = matches!(
+            std::env::var("HASTE_HISTORY").as_deref(),
+            Ok("off" | "disabled" | "0")
+        );
+
+        Self {
+            last_change: None,
+            detailed: BitHistory::default(),
+            disabled,
+        }
+    }
+
     fn len(&self) -> usize {
         self.detailed.len()
     }
@@ -95,6 +109,7 @@ impl History {
         if change.is_some() {
             self.last_change = current;
         }
+
         self.detailed.push(change)
     }
 
@@ -104,8 +119,11 @@ impl History {
             return false;
         }
 
-        // more detailed check if there has been an update:
+        if self.disabled {
+            return true;
+        }
 
+        // more detailed check if there has been an update:
         let index = rev.index() as usize;
 
         let mut has_changed = false;

@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use futures_lite::FutureExt;
 
 use crate::{revision::Revision, Dependency};
@@ -79,7 +81,7 @@ struct CheckDeepFuture<'a> {
 
     transitive: TransitiveDependencies,
 
-    pending: Option<(Dependency, ChangeFuture<'a>)>,
+    pending: VecDeque<LastChangeFuture<'a>>,
 }
 
 impl<'a> CheckDeepFuture<'a> {
@@ -89,7 +91,7 @@ impl<'a> CheckDeepFuture<'a> {
             last_verified,
             dependencies: dependencies.iter(),
             transitive: TransitiveDependencies::CONSTANT,
-            pending: None,
+            pending: VecDeque::with_capacity(dependencies.len()),
         }
     }
 }
@@ -103,17 +105,28 @@ impl Future for CheckDeepFuture<'_> {
         loop {
             let change;
 
-            if let Some((_dep, ref mut future)) = self.pending {
+            if let Some(future) = self.pending.front_mut() {
                 change = std::task::ready!(future.poll(cx));
-                self.pending = None;
-            } else if let Some(&dependency) = self.dependencies.next() {
-                match db.last_change(dependency) {
-                    LastChangeFuture::Ready(ready) => change = ready,
-                    LastChangeFuture::Pending(pending) => {
-                        self.pending = Some((dependency, pending));
-                        continue;
+                self.pending.pop_front();
+            } else if let Some(&first) = self.dependencies.next() {
+                let mut dependency = first;
+
+                loop {
+                    self.pending.push_back(db.last_change(dependency));
+
+                    if let Some(&next) = self.dependencies.as_slice().first() {
+                        if next.group_index.is_some() && next.group_index == first.group_index {
+                            // dependencies are in the same group, so can be processed in parallel.
+                            dependency = next;
+                            self.dependencies.next();
+                            continue;
+                        }
                     }
+
+                    break;
                 }
+
+                continue;
             } else {
                 return Poll::Ready(Some(self.transitive));
             };

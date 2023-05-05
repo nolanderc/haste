@@ -1,0 +1,13 @@
+[package]
+name = "haste"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytemuck = "1.13.1"
+fxhash = "0.2.1"
+hashbrown = { version = "0.13.2", features = ["raw"] }
+region = "3.0.0"
+stacker = "0.1.15"

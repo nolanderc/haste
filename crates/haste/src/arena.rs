@@ -45,7 +45,7 @@ impl RawArena {
 
     pub fn grow(&self, min_size: usize) {
         let current = self.committed.load(Relaxed);
-        if min_size < current {
+        if min_size <= current {
             return;
         }
 
@@ -71,6 +71,11 @@ impl RawArena {
     pub fn as_ptr(&self) -> *const u8 {
         self.allocation.as_ptr()
     }
+
+    pub fn allocated(&self, len: usize) -> bool {
+        let current = self.committed.load(Relaxed);
+        len <= current
+    }
 }
 
 fn page_ceil(size: usize) -> usize {
@@ -94,6 +99,11 @@ impl<T> Arena<T> {
         }
     }
 
+    pub fn in_bounds(&self, index: usize) -> bool {
+        let required_len = index + 1;
+        self.raw.allocated(required_len * std::mem::size_of::<T>())
+    }
+
     pub fn ensure_in_bounds(&self, index: usize)
     where
         T: bytemuck::Zeroable,
@@ -112,5 +122,13 @@ impl<T> Arena<T> {
 
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         unsafe { &*self.raw.as_ptr().cast::<T>().add(index) }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if self.in_bounds(index) {
+            unsafe { Some(self.get_unchecked(index)) }
+        } else {
+            None
+        }
     }
 }

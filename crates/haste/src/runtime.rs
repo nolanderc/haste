@@ -1,3 +1,5 @@
+mod cycle;
+
 use std::{
     cell::RefCell,
     num::NonZeroU32,
@@ -9,8 +11,12 @@ use std::{
 
 use crate::{cache::SlotState, Database, ElementDb, Query, QueryPath};
 
+use self::cycle::CycleGraph;
+
 pub struct Runtime {
     stack_ids: StackIdAllocator,
+
+    cycles: CycleGraph,
 
     tasks: Mutex<Option<Vec<Task>>>,
     task_condition: Condvar,
@@ -35,6 +41,7 @@ impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
             stack_ids: StackIdAllocator::new(),
+            cycles: CycleGraph::default(),
             tasks: Default::default(),
             task_condition: Default::default(),
         }
@@ -67,15 +74,17 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn end_query(&self) -> ExecutionInfo {
+    pub(crate) fn end_query<R>(&self, with_info: impl FnOnce(ExecutionInfo) -> R) -> R {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
             let stack = active.as_mut().expect("no active stack");
 
             let Some(query) = stack.queries.pop() else { panic!("no active query") };
-            let dependencies = stack.dependencies.split_off(query.dependency_count);
 
-            ExecutionInfo { dependencies }
+            let dependencies_start = stack.dependencies.len() - query.dependency_count;
+            let dependencies = &stack.dependencies[dependencies_start..];
+
+            with_info(ExecutionInfo { dependencies })
         })
     }
 
@@ -93,8 +102,8 @@ impl Runtime {
     pub(crate) unsafe fn execute<Q: Query>(
         &self,
         db: &ElementDb<Q>,
-        slot: &crate::cache::Slot<Q>,
         path: QueryPath,
+        slot: &crate::cache::Slot<Q>,
     ) {
         self.begin_query(path);
 
@@ -106,9 +115,8 @@ impl Runtime {
             || Q::execute(db, input),
         );
 
-        let execution = self.end_query();
+        let result = self.end_query(|info| slot.write_output(output, info));
 
-        let result = slot.write_output(output, execution);
         if result.has_blocking {
             db.runtime().wake_blocked();
         }
@@ -122,7 +130,7 @@ impl Runtime {
         path: QueryPath,
         stack: StackId,
     ) {
-        let func = move || self.execute(db, slot, path);
+        let func = move || self.execute(db, path, slot);
         let func: Box<dyn FnOnce()> = Box::new(func);
         let func: Box<dyn FnOnce() + 'static> = std::mem::transmute(func);
 
@@ -135,12 +143,18 @@ impl Runtime {
         self.task_condition.notify_one();
     }
 
-    pub(crate) fn block_until_ready(&self, claimant: StackId, state: &SlotState) {
+    pub(crate) fn block_until_ready(&self, path: QueryPath, claimant: StackId, state: &SlotState) {
         let current = self.current_stack();
 
-        // TODO: check for dependency cycles across stacks
-        if current == claimant {
-            panic!("dependency cycle");
+        let mut blocker = cycle::Block {
+            blocked_on: claimant,
+            stack: ACTIVE.with(|active| active.borrow_mut().take()).unwrap(),
+        };
+
+        blocker.stack.dependencies.push(path);
+
+        if let Some(cycle) = self.cycles.insert(blocker) {
+            panic!("dependency cycle: {cycle:?}");
         }
 
         let mut task_guard = self.tasks.lock().unwrap();
@@ -158,6 +172,15 @@ impl Runtime {
 
             task_guard = self.task_condition.wait(task_guard).unwrap();
         }
+
+        let mut stack = self
+            .cycles
+            .remove(current)
+            .expect("query stack did not exist");
+
+        stack.dependencies.pop();
+
+        ACTIVE.with(|active| active.borrow_mut().replace(stack));
     }
 
     pub(crate) fn wake_blocked(&self) {
@@ -244,8 +267,8 @@ impl StackIdAllocator {
     }
 }
 
-pub struct ExecutionInfo {
-    pub dependencies: Vec<QueryPath>,
+pub struct ExecutionInfo<'a> {
+    pub dependencies: &'a [QueryPath],
 }
 
 struct Task {

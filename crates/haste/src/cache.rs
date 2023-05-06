@@ -1,17 +1,12 @@
 mod lookup;
 mod state;
 
-use std::{
-    cell::UnsafeCell,
-    hash::Hash,
-    mem::MaybeUninit,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
-};
+use std::{cell::UnsafeCell, hash::Hash, mem::MaybeUninit};
 
 use crate::{
     arena::Arena,
     runtime::{ExecutionInfo, StackId},
-    Container, Database, ElementDb, ElementId, Query, QueryPath, Runtime,
+    Container, Database, ElementDb, ElementId, Query, QueryHandle, QueryPath, Runtime,
 };
 
 use self::{lookup::HashLookup, state::FinishResult};
@@ -19,7 +14,7 @@ use self::{lookup::HashLookup, state::FinishResult};
 pub use self::state::SlotState;
 
 pub struct QueryCache<Q: Query> {
-    arena: SlotArena<Q>,
+    slots: Arena<Slot<Q>>,
     lookup: HashLookup,
     element: ElementId,
 }
@@ -29,12 +24,7 @@ impl<Q: Query> Container for QueryCache<Q> {
         Self {
             element,
             lookup: HashLookup::default(),
-            arena: SlotArena {
-                slots: Arena::with_capacity(1 << 32),
-                ids: IdAllocator {
-                    next: AtomicU64::new(0),
-                },
-            },
+            slots: Arena::with_capacity(1 << 32),
         }
     }
 
@@ -50,8 +40,8 @@ impl<Q: Query> QueryCache<Q> {
     {
         let stack = || db.runtime().current_stack();
 
-        let lookup = self.lookup.get_or_allocate(input, &self.arena, stack);
-        let slot = unsafe { self.arena.slots.get_unchecked(lookup.id.index()) };
+        let lookup = self.lookup.get_or_allocate(input, &self.slots, stack);
+        let slot = unsafe { self.slots.get_unchecked(lookup.id.index()) };
 
         let claim = if lookup.claim.is_some() {
             ClaimResult::Claimed
@@ -62,24 +52,28 @@ impl<Q: Query> QueryCache<Q> {
         match claim {
             ClaimResult::Ready => {}
             ClaimResult::Claimed => unsafe {
-                db.runtime().execute::<Q>(db, slot, self.path(lookup.id))
+                let path = self.path(lookup.id);
+                db.runtime().execute::<Q>(db, path, slot)
             },
             ClaimResult::Pending(claimant) => {
-                db.runtime().block_until_ready(claimant, slot.state())
+                let path = self.path(lookup.id);
+                db.runtime().block_until_ready(path, claimant, slot.state())
             }
         }
 
         unsafe { slot.output_unchecked() }
     }
 
-    pub(crate) fn spawn<'a>(&'a self, db: &ElementDb<Q>, input: Q::Input) -> &'a Slot<Q>
+    pub(crate) fn spawn<'a>(&'a self, db: &'a ElementDb<Q>, input: Q::Input) -> QueryHandle<'a, Q>
     where
         Q::Input: Eq + Hash,
     {
-        let stack = || db.runtime().allocate_stack();
+        let runtime = db.runtime();
 
-        let lookup = self.lookup.get_or_allocate(input, &self.arena, stack);
-        let slot = unsafe { self.arena.slots.get_unchecked(lookup.id.index()) };
+        let stack = || runtime.allocate_stack();
+
+        let lookup = self.lookup.get_or_allocate(input, &self.slots, stack);
+        let slot = unsafe { self.slots.get_unchecked(lookup.id.index()) };
 
         let claim = if let Some(stack) = lookup.claim {
             Some(stack)
@@ -91,12 +85,17 @@ impl<Q: Query> QueryCache<Q> {
             }
         };
 
+        let path = self.path(lookup.id);
+
         if let Some(stack) = claim {
-            let path = self.path(lookup.id);
-            unsafe { db.runtime().spawn::<Q>(db, slot, path, stack) }
+            unsafe { runtime.spawn::<Q>(db, slot, path, stack) }
         }
 
-        slot
+        QueryHandle {
+            path,
+            slot,
+            runtime,
+        }
     }
 
     fn path(&self, slot: SlotId) -> QueryPath {
@@ -104,17 +103,6 @@ impl<Q: Query> QueryCache<Q> {
             element: self.element,
             slot,
         }
-    }
-}
-
-struct SlotArena<Q: Query> {
-    slots: Arena<Slot<Q>>,
-    ids: IdAllocator,
-}
-
-impl<Q: Query> SlotArena<Q> {
-    unsafe fn get_input_unchecked(&self, id: SlotId) -> &Q::Input {
-        self.slots.get_unchecked(id.index()).input_unchecked()
     }
 }
 
@@ -164,11 +152,13 @@ impl<Q: Query> Slot<Q> {
         self.state().claim(stack, false)
     }
 
-    pub(crate) fn wait_output(&self, runtime: &Runtime) -> &Q::Output {
+    pub(crate) fn wait_output(&self, path: QueryPath, runtime: &Runtime) -> &Q::Output {
         match self.claim_blocking(runtime.current_stack()) {
             ClaimResult::Ready => {}
             ClaimResult::Claimed => unreachable!(),
-            ClaimResult::Pending(claimant) => runtime.block_until_ready(claimant, self.state()),
+            ClaimResult::Pending(claimant) => {
+                runtime.block_until_ready(path, claimant, self.state())
+            }
         }
         unsafe { self.output_unchecked() }
     }
@@ -188,30 +178,7 @@ enum ClaimResult {
 pub struct SlotId(u32);
 
 impl SlotId {
-    fn new(index: usize) -> Self {
-        Self(index.try_into().expect("exhausted query slot IDs"))
-    }
-
     fn index(&self) -> usize {
         self.0 as usize
-    }
-}
-
-struct IdAllocator {
-    next: AtomicU64,
-}
-
-impl IdAllocator {
-    fn allocate(&self, count: u64) -> std::ops::Range<usize> {
-        let start = self.next.fetch_add(count, Relaxed);
-        let end = start + count;
-
-        let max = 1 << 32;
-        if end > max {
-            self.next.store(max + 1, Relaxed);
-            panic!("exhausted query slot IDs")
-        }
-
-        start as usize..end as usize
     }
 }

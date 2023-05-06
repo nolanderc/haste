@@ -1,6 +1,8 @@
 mod arena;
 mod cache;
+mod interner;
 mod runtime;
+mod shard;
 
 use std::borrow::Borrow;
 
@@ -182,11 +184,7 @@ pub trait DatabaseExt: Database {
     {
         let storage = self.storage();
         let container = storage.container();
-        let slot = container.borrow().spawn(self.cast_database(), input);
-        QueryHandle {
-            slot,
-            runtime: self.runtime(),
-        }
+        container.borrow().spawn(self.cast_database(), input)
     }
 
     #[inline]
@@ -201,6 +199,7 @@ pub trait DatabaseExt: Database {
 impl<DB> DatabaseExt for DB where DB: Database {}
 
 pub struct QueryHandle<'a, Q: Query> {
+    path: QueryPath,
     slot: &'a cache::Slot<Q>,
     runtime: &'a Runtime,
 }
@@ -209,6 +208,7 @@ impl<Q: Query> Copy for QueryHandle<'_, Q> {}
 impl<Q: Query> Clone for QueryHandle<'_, Q> {
     fn clone(&self) -> Self {
         Self {
+            path: self.path,
             slot: self.slot,
             runtime: self.runtime,
         }
@@ -217,7 +217,7 @@ impl<Q: Query> Clone for QueryHandle<'_, Q> {
 
 impl<'a, Q: Query> QueryHandle<'a, Q> {
     pub fn join(self) -> &'a Q::Output {
-        self.slot.wait_output(self.runtime)
+        self.slot.wait_output(self.path, self.runtime)
     }
 }
 

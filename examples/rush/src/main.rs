@@ -30,13 +30,15 @@ impl haste::WithStorage<Storage> for Database {
 }
 
 fn main() {
-    let db = Database::default();
+    let mut db = Database::default();
 
     let start = std::time::Instant::now();
     let count = 100000;
-    for i in (0..=count).rev() {
-        db.query::<Fib>(i as _);
-    }
+    db.scope(|db| {
+        for i in (0..=count).rev() {
+            db.query::<Fib>(i as _);
+        }
+    });
     let duration = start.elapsed();
     eprintln!("real: {:?} (avg: {:?})", duration, duration / count as u32);
 }
@@ -82,7 +84,8 @@ impl haste::Query for Fib {
             return input;
         }
 
-        db.query::<Fib>(input - 1)
-            .wrapping_add(*db.query::<Fib>(input - 2))
+        let a = *db.query::<Fib>(input - 1);
+        let b = *db.query::<Fib>(input - 2);
+        a.wrapping_add(b)
     }
 }

@@ -1,85 +1,57 @@
-use std::{hash::Hash, sync::Mutex};
+use std::hash::Hash;
 
-use hashbrown::raw::RawTable;
+use crate::{
+    arena::Arena,
+    runtime::StackId,
+    shard::{self, ShardLookup},
+    Query,
+};
 
-use crate::{runtime::StackId, Query};
+use super::{Slot, SlotId};
 
-use super::{SlotArena, SlotId};
-
+#[derive(Default)]
 pub struct HashLookup {
-    shards: Vec<Mutex<Shard>>,
-}
-
-struct Shard {
-    entries: RawTable<SlotId>,
-    reserved: std::ops::Range<usize>,
-}
-
-impl Default for HashLookup {
-    fn default() -> Self {
-        let thread_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let shard_count = (4 * thread_count).next_power_of_two();
-
-        let mut shards = Vec::new();
-        shards.resize_with(shard_count, || Mutex::new(Shard::new()));
-
-        Self { shards }
-    }
-}
-
-impl Shard {
-    fn new() -> Self {
-        Self {
-            entries: RawTable::new(),
-            reserved: 0..0,
-        }
-    }
+    shards: ShardLookup,
 }
 
 impl HashLookup {
     pub(super) fn get_or_allocate<Q: Query>(
         &self,
         input: Q::Input,
-        arena: &SlotArena<Q>,
+        slots: &Arena<Slot<Q>>,
         stack: impl FnOnce() -> StackId,
     ) -> LookupResult
     where
         Q::Input: Hash + Eq,
     {
-        let hash = fxhash::hash64(&input);
-        let shards = &self.shards;
-        let index = shard_index(hash, shards.len());
-        let mut shard = shards[index].lock().unwrap();
-
-        if let Some(&id) = shard.entries.get(hash, |&id| unsafe {
-            arena.get_input_unchecked(id) == &input
-        }) {
-            return LookupResult { id, claim: None };
+        #[inline(always)]
+        unsafe fn get_input<Q: Query>(slots: &Arena<Slot<Q>>, index: u32) -> &Q::Input {
+            slots.get_unchecked(index as usize).input_unchecked()
         }
 
-        let id = if let Some(index) = shard.reserved.next() {
-            SlotId::new(index)
-        } else {
-            shard.reserved = arena.ids.allocate(1024);
-            SlotId::new(shard.reserved.next().unwrap())
-        };
+        let result = self.shards.get_or_insert(
+            fxhash::hash64(&input),
+            |index| unsafe { get_input(slots, index) == &input },
+            |index| unsafe { fxhash::hash64(get_input(slots, index)) },
+        );
 
-        let stack = stack();
+        match result {
+            shard::LookupResult::Cached(existing) => LookupResult {
+                id: SlotId(existing),
+                claim: None,
+            },
+            shard::LookupResult::Insert(index, guard) => {
+                let stack = stack();
+                let slot = slots.get_or_allocate(index as usize);
+                unsafe { slot.init_claim(input, stack) }
 
-        unsafe {
-            let slot = arena.slots.get_or_allocate(id.index());
-            slot.init_claim(input, stack)
-        }
+                drop(guard);
 
-        shard.entries.insert(hash, id, |&id| unsafe {
-            fxhash::hash64(arena.get_input_unchecked(id))
-        });
-
-        LookupResult {
-            id,
-            claim: Some(stack),
+                LookupResult {
+                    id: SlotId(index),
+                    claim: Some(stack),
+                }
+            }
         }
     }
 }
@@ -87,11 +59,4 @@ impl HashLookup {
 pub(super) struct LookupResult {
     pub id: SlotId,
     pub claim: Option<StackId>,
-}
-
-fn shard_index(hash: u64, shard_count: usize) -> usize {
-    let shard_bits = shard_count.trailing_zeros();
-    // hashbrown uses the top 7 bits
-    let top_bits = hash >> (64 - 7 - shard_bits);
-    (top_bits as usize) & (shard_count - 1)
 }

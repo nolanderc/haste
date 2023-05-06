@@ -75,14 +75,14 @@ impl ShardLookup {
         hash: u64,
         eq: impl Fn(u32) -> bool,
         hasher: impl Fn(u32) -> u64,
-    ) -> LookupResult {
+    ) -> ShardResult {
         let shards = &self.shards;
 
         let shard = &shards[shard_index(hash, shards.len())];
         let mut shard = shard.lock().unwrap();
 
         if let Some(&old) = shard.entries.get(hash, |index| eq(*index)) {
-            return LookupResult::Cached(old);
+            return ShardResult::Cached(old);
         }
 
         let index = if let Some(index) = shard.reserved.next() {
@@ -94,11 +94,11 @@ impl ShardLookup {
 
         shard.entries.insert(hash, index, |index| hasher(*index));
 
-        LookupResult::Insert(index, WriteGuard(shard))
+        ShardResult::Insert(index, WriteGuard(shard))
     }
 }
 
-pub enum LookupResult<'a> {
+pub enum ShardResult<'a> {
     Cached(u32),
     Insert(u32, WriteGuard<'a>),
 }

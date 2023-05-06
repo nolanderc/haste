@@ -25,7 +25,7 @@ fn main() {
 }
 
 #[haste::storage]
-struct Storage(fib);
+struct Storage(fib, Text);
 
 #[haste::query]
 fn fib(db: &dyn Db, n: u64) -> u64 {
@@ -37,3 +37,7 @@ fn fib(db: &dyn Db, n: u64) -> u64 {
     let b = fib(db, n - 2);
     a.wrapping_add(b)
 }
+
+#[haste::intern(Text)]
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TextData(String);

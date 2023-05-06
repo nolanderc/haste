@@ -1,17 +1,17 @@
-mod arena;
+pub mod arena;
 mod cache;
 mod interner;
 mod runtime;
-mod shard;
+pub mod shard;
 
-pub use haste_macros::*;
-
+use cache::SlotId;
 use std::borrow::Borrow;
 
 pub use cache::QueryCache;
-use cache::SlotId;
-
+pub use interner::{InternId, Interner, ValueInterner};
 pub use runtime::Runtime;
+
+pub use haste_macros::*;
 
 pub trait Database {
     fn runtime(&self) -> &Runtime;
@@ -124,7 +124,7 @@ impl<DB> StorageRouter<DB> {
 
 type Route<DB> = fn(&DB) -> &dyn Container;
 
-pub trait Container: 'static {
+pub trait Container {
     fn new(element: ElementId) -> Self
     where
         Self: Sized;
@@ -162,6 +162,13 @@ pub struct QueryPath {
     pub(crate) slot: SlotId,
 }
 
+pub trait Intern: Element {
+    type Value;
+
+    fn from_id(id: InternId) -> Self;
+    fn id(self) -> InternId;
+}
+
 pub trait DatabaseExt: Database {
     #[inline]
     fn query<Q: Query>(&self, input: Q::Input) -> &Q::Output
@@ -187,6 +194,29 @@ pub trait DatabaseExt: Database {
         let storage = self.storage();
         let container = storage.container();
         container.borrow().spawn(self.cast_database(), input)
+    }
+
+    fn intern<T: Intern>(&self, value: T::Value) -> T
+    where
+        Self: WithStorage<T::Storage>,
+        T::Container: Interner<T::Value>,
+    {
+        let storage = self.storage();
+        let container = storage.container();
+        let id = container.insert(value);
+        T::from_id(id)
+    }
+
+    fn lookup<T: Intern>(&self, interned: T) -> &T::Value
+    where
+        Self: WithStorage<T::Storage>,
+        T::Container: Interner<T::Value>,
+    {
+        let storage = self.storage();
+        let container = storage.container();
+        container
+            .lookup(interned.id())
+            .expect("interned value not found")
     }
 
     #[inline]

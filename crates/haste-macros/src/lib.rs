@@ -1,8 +1,9 @@
 extern crate proc_macro;
 
+mod database;
+mod intern;
 mod query;
 mod storage;
-mod database;
 
 use std::cell::Cell;
 
@@ -10,8 +11,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 
 #[proc_macro_attribute]
-pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
-    handle_attribute(attr, item, query::query)
+pub fn database(attr: TokenStream, item: TokenStream) -> TokenStream {
+    handle_attribute(attr, item, database::database)
 }
 
 #[proc_macro_attribute]
@@ -20,8 +21,13 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn database(attr: TokenStream, item: TokenStream) -> TokenStream {
-    handle_attribute(attr, item, database::database)
+pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
+    handle_attribute(attr, item, query::query)
+}
+
+#[proc_macro_attribute]
+pub fn intern(attr: TokenStream, item: TokenStream) -> TokenStream {
+    handle_attribute(attr, item, intern::intern)
 }
 
 fn handle_attribute(

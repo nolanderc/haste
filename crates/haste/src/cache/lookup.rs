@@ -3,7 +3,7 @@ use std::hash::Hash;
 use crate::{
     arena::Arena,
     runtime::StackId,
-    shard::{self, ShardLookup},
+    shard::{ShardLookup, ShardResult},
     Query,
 };
 
@@ -36,11 +36,11 @@ impl HashLookup {
         );
 
         match result {
-            shard::LookupResult::Cached(existing) => LookupResult {
+            ShardResult::Cached(existing) => LookupResult {
                 id: SlotId(existing),
                 claim: None,
             },
-            shard::LookupResult::Insert(index, guard) => {
+            ShardResult::Insert(index, guard) => {
                 let stack = stack();
                 let slot = slots.get_or_allocate(index as usize);
                 unsafe { slot.init_claim(input, stack) }

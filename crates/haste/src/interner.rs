@@ -9,21 +9,22 @@ use std::{
     },
 };
 
-use crate::{arena::Arena, shard::ShardLookup};
+use crate::{arena::Arena, shard::ShardLookup, Container, ElementId};
 
-pub trait Interner<T: ?Sized> {
-    fn insert(&self, value: T) -> InternId
-    where
-        T: Sized;
+pub trait Interner<T>: Container {
+    fn insert(&self, value: T) -> InternId;
 
     fn lookup(&self, id: InternId) -> Option<&T>;
 }
 
-pub trait RefInterner<T: ?Sized>: Interner<T> {
-    fn insert_ref(&self, value: &T) -> InternId;
-}
-
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InternId(NonZeroU32);
+
+impl std::fmt::Debug for InternId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.index())
+    }
+}
 
 impl InternId {
     fn new(index: u32) -> Option<Self> {
@@ -38,14 +39,23 @@ impl InternId {
 pub struct ValueInterner<T> {
     lookup: ShardLookup,
     arena: Arena<ValueCell<T>>,
+    element: ElementId,
 }
 
-impl<T> Default for ValueInterner<T> {
-    fn default() -> Self {
+impl<T> Container for ValueInterner<T> {
+    fn new(element: ElementId) -> Self
+    where
+        Self: Sized,
+    {
         Self {
             lookup: ShardLookup::default(),
             arena: Arena::with_capacity(1 << 32),
+            element,
         }
+    }
+
+    fn element(&self) -> crate::ElementId {
+        self.element
     }
 }
 
@@ -67,8 +77,8 @@ where
         );
 
         let index = match result {
-            crate::shard::LookupResult::Cached(index) => index,
-            crate::shard::LookupResult::Insert(index, guard) => {
+            crate::shard::ShardResult::Cached(index) => index,
+            crate::shard::ShardResult::Insert(index, guard) => {
                 unsafe { arena.get_or_allocate(index as usize).init(value) };
                 drop(guard);
                 index

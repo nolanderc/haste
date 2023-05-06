@@ -58,16 +58,18 @@ where
             arena.get_unchecked(index as usize).get_unchecked()
         }
 
+        let arena = &self.arena;
+
         let result = self.lookup.get_or_insert(
             fxhash::hash64(&value),
-            |index| unsafe { get_value(&self.arena, index) == &value },
-            |index| unsafe { fxhash::hash64(get_value(&self.arena, index)) },
+            |index| unsafe { get_value(arena, index) == &value },
+            |index| unsafe { fxhash::hash64(get_value(arena, index)) },
         );
 
         let index = match result {
             crate::shard::LookupResult::Cached(index) => index,
             crate::shard::LookupResult::Insert(index, guard) => {
-                unsafe { self.arena.get_or_allocate(index as usize).init(value) };
+                unsafe { arena.get_or_allocate(index as usize).init(value) };
                 drop(guard);
                 index
             }

@@ -4,6 +4,8 @@ mod interner;
 mod runtime;
 mod shard;
 
+pub use haste_macros::*;
+
 use std::borrow::Borrow;
 
 pub use cache::QueryCache;
@@ -130,12 +132,12 @@ pub trait Container: 'static {
     fn element(&self) -> ElementId;
 }
 
-pub trait WithContainer<C: Container>: Storage {
-    fn container(&self) -> &C;
+pub trait WithElement<E: Element + ?Sized>: Storage {
+    fn container(&self) -> &E::Container;
 }
 
 pub trait Element: 'static {
-    type Storage: WithContainer<Self::Container>;
+    type Storage: WithElement<Self>;
     type Container: Container;
 }
 
@@ -196,7 +198,7 @@ pub trait DatabaseExt: Database {
     }
 }
 
-impl<DB> DatabaseExt for DB where DB: Database {}
+impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
 
 pub struct QueryHandle<'a, Q: Query> {
     path: QueryPath,

@@ -8,20 +8,26 @@ use std::{
     sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
-use crate::{arena::Arena, Container, Database, ElementDb, Query};
+use crate::{
+    arena::Arena,
+    runtime::{ExecutionInfo, StackId},
+    Container, Database, ElementDb, ElementId, Query, QueryPath, Runtime,
+};
 
-use self::{lookup::HashLookup, state::SlotState};
+use self::{lookup::HashLookup, state::FinishResult};
+
+pub use self::state::SlotState;
 
 pub struct QueryCache<Q: Query> {
-    lookup: HashLookup,
     arena: SlotArena<Q>,
+    lookup: HashLookup,
+    element: ElementId,
 }
 
-impl<Q: Query> Container for QueryCache<Q> {}
-
-impl<Q: Query> Default for QueryCache<Q> {
-    fn default() -> Self {
+impl<Q: Query> Container for QueryCache<Q> {
+    fn new(element: ElementId) -> Self {
         Self {
+            element,
             lookup: HashLookup::default(),
             arena: SlotArena {
                 slots: Arena::with_capacity(1 << 32),
@@ -31,31 +37,72 @@ impl<Q: Query> Default for QueryCache<Q> {
             },
         }
     }
+
+    fn element(&self) -> ElementId {
+        self.element
+    }
 }
 
 impl<Q: Query> QueryCache<Q> {
-    pub fn get_or_execute<'a>(&'a self, db: &ElementDb<Q>, input: Q::Input) -> &'a Q::Output
+    pub(crate) fn get_or_execute<'a>(&'a self, db: &ElementDb<Q>, input: Q::Input) -> &'a Q::Output
     where
         Q::Input: Eq + Hash,
     {
-        let lookup = self.lookup.get_or_allocate(input, &self.arena);
+        let stack = || db.runtime().current_stack();
+
+        let lookup = self.lookup.get_or_allocate(input, &self.arena, stack);
         let slot = unsafe { self.arena.slots.get_unchecked(lookup.id.index()) };
 
-        if lookup.claimed {
-            // fast path if this is the first time encountering this query
-            let input = unsafe { slot.input_unchecked() };
-            let output = db.runtime().execute::<Q>(db, input.clone());
-            return unsafe { slot.write_output(output) };
+        let claim = if lookup.claim.is_some() {
+            ClaimResult::Claimed
+        } else {
+            slot.claim_blocking(stack())
+        };
+
+        match claim {
+            ClaimResult::Ready => {}
+            ClaimResult::Claimed => unsafe {
+                db.runtime().execute::<Q>(db, slot, self.path(lookup.id))
+            },
+            ClaimResult::Pending(claimant) => {
+                db.runtime().block_until_ready(claimant, slot.state())
+            }
         }
 
-        match slot.claim() {
-            ClaimResult::Claimed => {
-                let input = unsafe { slot.input_unchecked() };
-                let output = db.runtime().execute::<Q>(db, input.clone());
-                return unsafe { slot.write_output(output) };
+        unsafe { slot.output_unchecked() }
+    }
+
+    pub(crate) fn spawn<'a>(&'a self, db: &ElementDb<Q>, input: Q::Input) -> &'a Slot<Q>
+    where
+        Q::Input: Eq + Hash,
+    {
+        let stack = || db.runtime().allocate_stack();
+
+        let lookup = self.lookup.get_or_allocate(input, &self.arena, stack);
+        let slot = unsafe { self.arena.slots.get_unchecked(lookup.id.index()) };
+
+        let claim = if let Some(stack) = lookup.claim {
+            Some(stack)
+        } else {
+            let stack = stack();
+            match slot.claim_non_blocking(stack) {
+                ClaimResult::Ready | ClaimResult::Pending(_) => None,
+                ClaimResult::Claimed => Some(stack),
             }
-            ClaimResult::Ready => return unsafe { slot.output_unchecked() },
-            ClaimResult::Pending => panic!("dependency cycle"),
+        };
+
+        if let Some(stack) = claim {
+            let path = self.path(lookup.id);
+            unsafe { db.runtime().spawn::<Q>(db, slot, path, stack) }
+        }
+
+        slot
+    }
+
+    fn path(&self, slot: SlotId) -> QueryPath {
+        QueryPath {
+            element: self.element,
+            slot,
         }
     }
 }
@@ -71,7 +118,7 @@ impl<Q: Query> SlotArena<Q> {
     }
 }
 
-pub struct Slot<Q: Query> {
+pub(crate) struct Slot<Q: Query> {
     input: UnsafeCell<MaybeUninit<Q::Input>>,
     output: UnsafeCell<MaybeUninit<Q::Output>>,
     state: UnsafeCell<SlotState>,
@@ -80,52 +127,65 @@ pub struct Slot<Q: Query> {
 unsafe impl<Q: Query> bytemuck::Zeroable for Slot<Q> {}
 
 impl<Q: Query> Slot<Q> {
-    unsafe fn input_unchecked(&self) -> &Q::Input {
+    pub(crate) unsafe fn input_unchecked(&self) -> &Q::Input {
         (*self.input.get()).assume_init_ref()
     }
 
-    unsafe fn output_unchecked(&self) -> &Q::Output {
+    pub(crate) unsafe fn output_unchecked(&self) -> &Q::Output {
         (*self.output.get()).assume_init_ref()
     }
 
     /// Initialize the slot, claiming it simultaneously.
     /// Caller ensures that they have exclusive access to the slot and that it has never been
     /// initialized previously.
-    unsafe fn init_claim(&self, input: Q::Input) {
+    unsafe fn init_claim(&self, input: Q::Input, current: StackId) {
         self.input.get().write(MaybeUninit::new(input));
-        (*self.state.get()).init_claim()
+        (*self.state.get()).init_claim(current)
     }
 
-    unsafe fn write_output(&self, output: Q::Output) -> &Q::Output {
-        let ptr = self.output.get();
-        ptr.write(MaybeUninit::new(output));
-
-        self.state().finish();
-
-        (*ptr).assume_init_ref()
+    pub(crate) unsafe fn write_output(
+        &self,
+        output: Q::Output,
+        info: ExecutionInfo,
+    ) -> FinishResult {
+        self.output.get().write(MaybeUninit::new(output));
+        self.state().finish()
     }
 
-    fn state(&self) -> &SlotState {
+    pub(crate) fn state(&self) -> &SlotState {
         unsafe { &*self.state.get() }
     }
 
-    fn claim(&self) -> ClaimResult {
-        self.state().claim()
+    fn claim_blocking(&self, stack: StackId) -> ClaimResult {
+        self.state().claim(stack, true)
+    }
+
+    fn claim_non_blocking(&self, stack: StackId) -> ClaimResult {
+        self.state().claim(stack, false)
+    }
+
+    pub(crate) fn wait_output(&self, runtime: &Runtime) -> &Q::Output {
+        match self.claim_blocking(runtime.current_stack()) {
+            ClaimResult::Ready => {}
+            ClaimResult::Claimed => unreachable!(),
+            ClaimResult::Pending(claimant) => runtime.block_until_ready(claimant, self.state()),
+        }
+        unsafe { self.output_unchecked() }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ClaimResult {
-    /// Caller has exclusive access to the query and should execute it.
-    Claimed,
     /// The output from the query is already available.
     Ready,
+    /// Caller has exclusive access to the query and should execute it.
+    Claimed,
     /// Another thread is currently executing the query
-    Pending,
+    Pending(StackId),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SlotId(u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotId(u32);
 
 impl SlotId {
     fn new(index: usize) -> Self {

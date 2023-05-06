@@ -1,20 +1,27 @@
 use haste::DatabaseExt;
 
 #[derive(Default)]
-pub struct Database {
-    runtime: haste::Runtime,
-    storage: Storage,
+struct Database {
+    storage: haste::DatabaseStorage<Self>,
+}
+
+impl haste::StaticDatabase for Database {
+    type StorageList = (Storage,);
 }
 
 impl haste::Database for Database {
     fn runtime(&self) -> &haste::Runtime {
-        &self.runtime
+        self.storage.runtime()
+    }
+
+    fn runtime_mut(&mut self) -> &mut haste::Runtime {
+        self.storage.runtime_mut()
     }
 }
 
 impl haste::WithStorage<Storage> for Database {
     fn storage(&self) -> &Storage {
-        &self.storage
+        &self.storage.storages().0
     }
 
     fn cast_database(&self) -> &<Storage as haste::Storage>::Database {
@@ -31,16 +38,26 @@ fn main() {
         db.query::<Fib>(i as _);
     }
     let duration = start.elapsed();
-    eprintln!("real: {:?} ({:?})", duration, duration / count as u32);
+    eprintln!("real: {:?} (avg: {:?})", duration, duration / count as u32);
 }
 
-#[derive(Default)]
 struct Storage {
     fib: <Fib as haste::Element>::Container,
 }
 
 impl haste::Storage for Storage {
     type Database = Database;
+
+    fn new<DB>(router: &mut haste::StorageRouter<DB>) -> Self
+    where
+        DB: haste::WithStorage<Self>,
+    {
+        Self {
+            fib: <<Fib as haste::Element>::Container as haste::Container>::new(
+                router.push(|db| &db.storage().fib),
+            ),
+        }
+    }
 }
 
 impl haste::WithContainer<<Fib as haste::Element>::Container> for Storage {

@@ -2,7 +2,7 @@ use std::{hash::Hash, sync::Mutex};
 
 use hashbrown::raw::RawTable;
 
-use crate::Query;
+use crate::{runtime::StackId, Query};
 
 use super::{SlotArena, SlotId};
 
@@ -43,6 +43,7 @@ impl HashLookup {
         &self,
         input: Q::Input,
         arena: &SlotArena<Q>,
+        stack: impl FnOnce() -> StackId,
     ) -> LookupResult
     where
         Q::Input: Hash + Eq,
@@ -55,7 +56,7 @@ impl HashLookup {
         if let Some(&id) = shard.entries.get(hash, |&id| unsafe {
             arena.get_input_unchecked(id) == &input
         }) {
-            return LookupResult { id, claimed: false };
+            return LookupResult { id, claim: None };
         }
 
         let id = if let Some(index) = shard.reserved.next() {
@@ -65,22 +66,27 @@ impl HashLookup {
             SlotId::new(shard.reserved.next().unwrap())
         };
 
+        let stack = stack();
+
         unsafe {
             let slot = arena.slots.get_or_allocate(id.index());
-            slot.init_claim(input)
+            slot.init_claim(input, stack)
         }
 
         shard.entries.insert(hash, id, |&id| unsafe {
             fxhash::hash64(arena.get_input_unchecked(id))
         });
 
-        LookupResult { id, claimed: true }
+        LookupResult {
+            id,
+            claim: Some(stack),
+        }
     }
 }
 
 pub(super) struct LookupResult {
     pub id: SlotId,
-    pub claimed: bool,
+    pub claim: Option<StackId>,
 }
 
 fn shard_index(hash: u64, shard_count: usize) -> usize {

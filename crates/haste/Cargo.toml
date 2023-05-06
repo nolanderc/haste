@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = "1.13.1"
+dashmap = "5.4.0"
 fxhash = "0.2.1"
 hashbrown = { version = "0.13.2", features = ["raw"] }
 region = "3.0.0"

@@ -5,7 +5,7 @@ use std::{cell::UnsafeCell, hash::Hash, mem::MaybeUninit};
 
 use crate::{
     arena::Arena,
-    runtime::{ExecutionInfo, StackId},
+    runtime::{Dependency, ExecutionInfo, StackId},
     Container, Database, ElementDb, ElementId, Query, QueryHandle, QueryPath, Runtime,
 };
 
@@ -38,7 +38,9 @@ impl<Q: Query> QueryCache<Q> {
     where
         Q::Input: Eq + Hash,
     {
-        let stack = || db.runtime().current_stack();
+        let runtime = db.runtime();
+
+        let stack = || runtime.current_stack();
 
         let lookup = self.lookup.get_or_allocate(input, &self.slots, stack);
         let slot = unsafe { self.slots.get_unchecked(lookup.id.index()) };
@@ -49,19 +51,23 @@ impl<Q: Query> QueryCache<Q> {
             slot.claim_blocking(stack())
         };
 
+        let path = self.path(lookup.id);
+
         match claim {
             ClaimResult::Ready => {}
-            ClaimResult::Claimed => unsafe {
-                let path = self.path(lookup.id);
-                db.runtime().execute::<Q>(db, path, slot)
-            },
+            ClaimResult::Claimed => unsafe { runtime.execute::<Q>(db, path, slot) },
             ClaimResult::Pending(claimant) => {
-                let path = self.path(lookup.id);
-                db.runtime().block_until_ready(path, claimant, slot.state())
+                runtime.block_until_ready(path, claimant, slot.state())
             }
         }
 
-        unsafe { slot.output_unchecked() }
+        runtime.register_dependency(Dependency {
+            element: path.element,
+            slot: path.slot,
+            spawn_group: runtime.current_spawn_group(),
+        });
+
+        unsafe { &slot.output_unchecked().value }
     }
 
     pub(crate) fn spawn<'a>(&'a self, db: &'a ElementDb<Q>, input: Q::Input) -> QueryHandle<'a, Q>
@@ -92,7 +98,11 @@ impl<Q: Query> QueryCache<Q> {
         }
 
         QueryHandle {
-            path,
+            dependency: Dependency {
+                element: path.element,
+                slot: path.slot,
+                spawn_group: runtime.current_spawn_group(),
+            },
             slot,
             runtime,
         }
@@ -108,7 +118,7 @@ impl<Q: Query> QueryCache<Q> {
 
 pub(crate) struct Slot<Q: Query> {
     input: UnsafeCell<MaybeUninit<Q::Input>>,
-    output: UnsafeCell<MaybeUninit<Q::Output>>,
+    output: UnsafeCell<MaybeUninit<OutputSlot<Q>>>,
     state: UnsafeCell<SlotState>,
 }
 
@@ -119,7 +129,7 @@ impl<Q: Query> Slot<Q> {
         (*self.input.get()).assume_init_ref()
     }
 
-    pub(crate) unsafe fn output_unchecked(&self) -> &Q::Output {
+    pub(crate) unsafe fn output_unchecked(&self) -> &OutputSlot<Q> {
         (*self.output.get()).assume_init_ref()
     }
 
@@ -133,10 +143,13 @@ impl<Q: Query> Slot<Q> {
 
     pub(crate) unsafe fn write_output(
         &self,
-        output: Q::Output,
+        value: Q::Output,
         info: ExecutionInfo,
     ) -> FinishResult {
-        self.output.get().write(MaybeUninit::new(output));
+        self.output.get().write(MaybeUninit::new(OutputSlot {
+            value,
+            dependencies: info.dependencies.into(),
+        }));
         self.state().finish()
     }
 
@@ -152,16 +165,24 @@ impl<Q: Query> Slot<Q> {
         self.state().claim(stack, false)
     }
 
-    pub(crate) fn wait_output(&self, path: QueryPath, runtime: &Runtime) -> &Q::Output {
+    pub(crate) fn wait_output(&self, dependency: Dependency, runtime: &Runtime) -> &Q::Output {
         match self.claim_blocking(runtime.current_stack()) {
             ClaimResult::Ready => {}
             ClaimResult::Claimed => unreachable!(),
             ClaimResult::Pending(claimant) => {
-                runtime.block_until_ready(path, claimant, self.state())
+                runtime.block_until_ready(dependency.query(), claimant, self.state())
             }
         }
-        unsafe { self.output_unchecked() }
+
+        runtime.register_dependency(dependency);
+        unsafe { &self.output_unchecked().value }
     }
+}
+
+pub(crate) struct OutputSlot<Q: Query> {
+    pub(crate) value: Q::Output,
+    #[allow(dead_code)]
+    pub(crate) dependencies: Box<[Dependency]>,
 }
 
 #[derive(Debug, Clone, Copy)]

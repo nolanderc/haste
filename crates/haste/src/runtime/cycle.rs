@@ -32,7 +32,7 @@ impl CycleGraph {
         loop {
             let next = self.blocks.get(&curr.stack.id)?;
 
-            let first_query = *curr.stack.dependencies.last().unwrap();
+            let first_query = curr.stack.dependencies.last().unwrap().query();
             let position = next
                 .stack
                 .queries

@@ -47,8 +47,9 @@ impl SlotState {
         });
     }
 
-    pub fn is_ready(&self) -> bool {
-        let state = decode(self.bits.load(Acquire));
+    #[inline(always)]
+    pub fn is_ready(&self, order: Ordering) -> bool {
+        let state = decode(self.bits.load(order));
         // TODO: compare against the current revision
         state.last_verified != 0
     }

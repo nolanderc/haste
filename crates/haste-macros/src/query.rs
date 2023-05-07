@@ -4,7 +4,10 @@ use syn::{parse::Parse, punctuated::Punctuated, spanned::Spanned, Result, Token}
 
 pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     if !attr.is_empty() {
-        return Err(syn::Error::new_spanned(attr, "unexpected arguments"));
+        let ident = syn::parse2::<syn::Ident>(attr)?;
+        if ident != "input" {
+            return Err(syn::Error::new_spanned(ident, "expected token `input`"));
+        }
     }
 
     let query_fn = syn::parse2::<QueryFunction>(item)?;

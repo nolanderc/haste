@@ -3,13 +3,15 @@ mod cache;
 mod interner;
 mod runtime;
 pub mod shard;
+mod durability;
 
 use cache::SlotId;
 use std::borrow::Borrow;
 
 pub use cache::QueryCache;
 pub use interner::{InternId, Interner, ValueInterner};
-pub use runtime::Runtime;
+pub use runtime::{Dependency, Runtime};
+pub use durability::Durability;
 
 pub use haste_macros::*;
 
@@ -221,17 +223,14 @@ pub trait DatabaseExt: Database {
 
     #[inline]
     fn scope<R>(&mut self, block: impl FnOnce(&Self) -> R) -> R {
-        self.runtime_mut().enter();
-        let result = block(self);
-        self.runtime_mut().exit();
-        result
+        scope(self, block)
     }
 }
 
 impl<DB> DatabaseExt for DB where DB: Database + ?Sized {}
 
 pub struct QueryHandle<'a, Q: Query> {
-    path: QueryPath,
+    dependency: Dependency,
     slot: &'a cache::Slot<Q>,
     runtime: &'a Runtime,
 }
@@ -240,7 +239,7 @@ impl<Q: Query> Copy for QueryHandle<'_, Q> {}
 impl<Q: Query> Clone for QueryHandle<'_, Q> {
     fn clone(&self) -> Self {
         Self {
-            path: self.path,
+            dependency: self.dependency,
             slot: self.slot,
             runtime: self.runtime,
         }
@@ -249,16 +248,23 @@ impl<Q: Query> Clone for QueryHandle<'_, Q> {
 
 impl<'a, Q: Query> QueryHandle<'a, Q> {
     pub fn join(self) -> &'a Q::Output {
-        self.slot.wait_output(self.path, self.runtime)
+        self.slot.wait_output(self.dependency, self.runtime)
     }
 }
 
-pub fn scope<DB, R>(db: &mut DB, block: impl FnOnce(&DB) -> R) -> R
+pub fn scope<DB, F, R>(db: &mut DB, block: F) -> R
 where
-    DB: Database,
+    DB: Database + ?Sized,
+    F: FnOnce(&DB) -> R,
 {
-    db.runtime_mut().enter();
-    let result = block(db);
-    db.runtime_mut().exit();
-    result
+    use std::panic::AssertUnwindSafe;
+
+    unsafe { db.runtime_mut().enter() };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| block(db)));
+    unsafe { db.runtime_mut().exit() };
+
+    match result {
+        Ok(output) => output,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }

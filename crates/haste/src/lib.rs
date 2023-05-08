@@ -182,6 +182,7 @@ pub type ElementDb<T> = <<T as Element>::Storage as Storage>::Database;
 pub trait Query: Element {
     type Arguments: Clone + Eq + 'static;
     type Output: Clone + Eq + 'static;
+    type View<'a>;
 
     /// Amount of stack space required by the query.
     const REQUIRED_STACK: usize = 512 * 1024;
@@ -190,6 +191,8 @@ pub trait Query: Element {
     const IS_INPUT: bool = false;
 
     fn execute(db: &ElementDb<Self>, args: Self::Arguments) -> Self::Output;
+
+    fn view(output: &Self::Output) -> Self::View<'_>;
 }
 
 pub trait Input: Query {}
@@ -320,8 +323,9 @@ impl<Q: Query> Clone for QueryHandle<'_, Q> {
 }
 
 impl<'a, Q: Query> QueryHandle<'a, Q> {
-    pub fn join(self) -> &'a Q::Output {
-        self.slot.wait_output(self.dependency, self.runtime)
+    pub fn join(self) -> Q::View<'a> {
+        let output = self.slot.wait_output(self.dependency, self.runtime);
+        Q::view(output)
     }
 }
 

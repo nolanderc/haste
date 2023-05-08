@@ -7,7 +7,7 @@ use crate::{
     arena::Arena,
     revision::Revision,
     runtime::{Dependency, ExecutionInfo, StackId},
-    Container, Database, Durability, ElementDb, ElementId, Input, Query, QueryHandle, ElementPath,
+    Container, Database, Durability, ElementDb, ElementId, ElementPath, Input, Query, QueryHandle,
     Runtime, WithStorage,
 };
 
@@ -223,6 +223,12 @@ pub(crate) struct Slot<Q: Query> {
 }
 
 unsafe impl<Q: Query> bytemuck::Zeroable for Slot<Q> {}
+unsafe impl<Q: Query> Sync for Slot<Q>
+where
+    Q::Arguments: Sync,
+    Q::Output: Sync,
+{
+}
 
 impl<Q: Query> Slot<Q> {
     pub(crate) unsafe fn arguments_unchecked(&self) -> &Q::Arguments {
@@ -296,6 +302,11 @@ impl<Q: Query> Slot<Q> {
 
         runtime.register_dependency(dependency);
         unsafe { &self.output_unchecked().value }
+    }
+
+    /// Removes the claim on the slot. This will not wake any blocked threads.
+    pub(crate) fn release_claim(&self) {
+        self.state().release_claim()
     }
 }
 

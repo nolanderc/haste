@@ -1,5 +1,2 @@
 [workspace]
 members = ["crates/*", "examples/*"]
-
-[profile.release]
-debug = true

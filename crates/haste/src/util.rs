@@ -1,6 +1,7 @@
 use std::mem::MaybeUninit;
 
 /// Type erased pointer to a fat pointer
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct DynPointer {
     addr: [MaybeUninit<usize>; 2],

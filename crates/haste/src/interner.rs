@@ -104,6 +104,8 @@ struct ValueCell<T> {
 }
 
 unsafe impl<T> bytemuck::Zeroable for ValueCell<T> {}
+unsafe impl<T: Send> Send for ValueCell<T> {}
+unsafe impl<T: Sync> Sync for ValueCell<T> {}
 
 impl<T> ValueCell<T> {
     unsafe fn init(&self, value: T) {

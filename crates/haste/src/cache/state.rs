@@ -142,6 +142,16 @@ impl SlotState {
     pub(crate) fn is_initialized(&self, order: Ordering) -> bool {
         self.bits.load(order) != 0
     }
+
+    pub(crate) fn release_claim(&self) {
+        self.bits.fetch_and(
+            encode(Parts {
+                stack: None,
+                last_verified_and_flags: u32::MAX,
+            }),
+            Release,
+        );
+    }
 }
 
 pub struct FinishResult {

@@ -13,7 +13,11 @@ pub trait DebugWith<DB: ?Sized> {
 
 pub trait DisplayWith<DB: ?Sized> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
-    fn display<'a>(&'a self, db: &'a DB) -> DisplayAdapter<'a, Self, DB> {
+
+    fn display<'a>(&'a self, db: &'a DB) -> DisplayAdapter<'a, Self, DB>
+    where
+        Self: Sized,
+    {
         DisplayAdapter { value: self, db }
     }
 }

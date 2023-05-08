@@ -23,7 +23,7 @@ use crate::{
     durability::Durability,
     revision::Revision,
     util::DynPointer,
-    Database, ElementDb, ElementId, ElementPath, Query,
+    Database, Element, ElementDb, ElementId, ElementPath, Query,
 };
 
 use self::{cycle::CycleGraph, history::History};
@@ -41,6 +41,9 @@ pub struct Runtime {
     tasks: DashMap<ElementPath, Task>,
     workers: ArcSwap<WorkerState>,
 }
+
+unsafe impl Send for Runtime {}
+unsafe impl Sync for Runtime {}
 
 impl Runtime {
     pub(crate) fn new() -> Self {
@@ -62,15 +65,9 @@ impl Runtime {
 
     #[inline]
     pub(crate) unsafe fn exit(&mut self) {
-        assert!(self.thread_scope.take().is_some(), "scope was not entered");
-
-        // drop all pending tasks
-        self.drain_tasks();
-    }
-
-    fn drain_tasks(&mut self) {
         self.tasks.clear();
         std::mem::take(&mut self.workers);
+        assert!(self.thread_scope.take().is_some(), "scope was not entered");
     }
 
     #[inline]
@@ -150,7 +147,10 @@ impl Runtime {
             if let Some(active) = active.borrow_mut().as_mut() {
                 let Some(query) = active.queries.last_mut() else { return };
 
-                assert!(!query.is_input, "queries may not invoke other queries");
+                assert!(
+                    !query.is_input,
+                    "input queries may not invoke other queries"
+                );
 
                 query.dependency_count += 1;
                 active.dependencies.push(dependency);
@@ -260,8 +260,8 @@ impl Runtime {
         let task = Task {
             state,
             execute: |runtime, state| {
-                let db = unsafe { &*state.db.unerase::<ElementDb<Q>>() };
-                let slot = unsafe { &*state.slot.cast::<crate::cache::Slot<Q>>() };
+                let db = unsafe { state.database::<Q>() };
+                let slot = unsafe { state.slot::<Q>() };
 
                 ACTIVE.with(|active| {
                     let old = active.borrow_mut().replace(ActiveStack::new(state.stack));
@@ -270,6 +270,7 @@ impl Runtime {
                     runtime.free_stack(state.stack);
                 })
             },
+            drop: |state| unsafe { state.slot::<Q>().release_claim() },
         };
 
         self.spawn_task(path, task);
@@ -571,15 +572,23 @@ pub struct ExecutionInfo<'a> {
 struct Task {
     state: TaskState,
     execute: ExecuteFn,
+    drop: DropFn,
 }
 
 impl Task {
     fn run(self, runtime: &Runtime) {
-        (self.execute)(runtime, self.state)
+        (self.execute)(runtime, &self.state)
     }
 }
 
-type ExecuteFn = fn(&Runtime, TaskState);
+impl Drop for Task {
+    fn drop(&mut self) {
+        (self.drop)(&self.state)
+    }
+}
+
+type ExecuteFn = fn(&Runtime, &TaskState);
+type DropFn = fn(&TaskState);
 
 struct TaskState {
     /// Type-erased database
@@ -592,6 +601,16 @@ struct TaskState {
     last_verified: Option<Revision>,
     /// Stack which should be used when executing the query.
     stack: StackId,
+}
+
+impl TaskState {
+    unsafe fn database<E: Element>(&self) -> &ElementDb<E> {
+        &*self.db.unerase()
+    }
+
+    unsafe fn slot<Q: Query>(&self) -> &crate::cache::Slot<Q> {
+        &*self.slot.cast()
+    }
 }
 
 #[derive(Default)]

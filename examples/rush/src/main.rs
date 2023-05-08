@@ -21,7 +21,15 @@ fn main() {
         assert_eq!(format!("{:?}", text.debug(db)), "\"hello\"");
 
         let n = 2000;
-        binom(db, n, n / 2);
+        let threads = 8;
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..threads {
+                    binom(db, n, n / 2);
+                }
+            });
+        });
     });
     let duration = start.elapsed();
     let count = COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -36,7 +44,7 @@ fn main() {
 #[haste::storage]
 struct Storage(fib, binom, Text);
 
-#[haste::query]
+#[haste::query(clone)]
 fn fib(db: &dyn Db, n: u64) -> u64 {
     COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -51,7 +59,7 @@ fn fib(db: &dyn Db, n: u64) -> u64 {
 
 static COUNT: AtomicU32 = AtomicU32::new(0);
 
-#[haste::query]
+#[haste::query(clone)]
 fn binom(db: &dyn Db, n: u64, k: u64) -> u64 {
     COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -59,9 +67,9 @@ fn binom(db: &dyn Db, n: u64, k: u64) -> u64 {
         return 1;
     }
 
-    let a = binom(db, n - 1, k);
-    let b = binom(db, n - 1, k - 1);
-    a.wrapping_add(b)
+    let a = binom::spawn(db, n - 1, k);
+    let b = binom::spawn(db, n - 1, k - 1);
+    a.join().wrapping_add(b.join())
 }
 
 #[haste::intern(Text)]

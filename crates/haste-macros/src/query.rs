@@ -1,20 +1,15 @@
 use proc_macro2::{TokenStream, TokenTree};
-use quote::{quote, ToTokens};
+use quote::{quote, quote_spanned, ToTokens};
 use syn::{parse::Parse, punctuated::Punctuated, spanned::Spanned, Result, Token};
 
 pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
-    let mut is_input = false;
+    let flags = crate::util::parse_flags(attr, &["input", "clone"])?;
 
-    if !attr.is_empty() {
-        let ident = syn::parse2::<syn::Ident>(attr)?;
-        if ident != "input" {
-            return Err(syn::Error::new_spanned(ident, "expected token `input`"));
-        }
-        is_input = true;
-    }
+    let input_flag = flags.get_flag("input");
+    let clone_flag = flags.get_flag("clone");
 
-    let query_fn = syn::parse2::<QueryFunction>(item)?;
-    let signature = &query_fn.signature;
+    let mut query_fn = syn::parse2::<QueryFunction>(item)?;
+    let signature = &mut query_fn.signature;
     let parameters = &signature.params;
 
     if parameters.is_empty() {
@@ -24,7 +19,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         ));
     }
 
-    let db = &query_fn.signature.params[0];
+    let db = &signature.params[0];
     let db_ident = &db.ident;
     let db_type = match &db.typ {
         syn::Type::Reference(reference) => &*reference.elem,
@@ -43,15 +38,33 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         argument_types.push(&param.typ);
     }
 
-    let vis = &query_fn.signature.vis;
-    let ident = &query_fn.signature.ident;
+    let vis = &signature.vis;
+    let ident = &signature.ident;
 
     let mut tokens = TokenStream::new();
 
-    let return_type = &query_fn.signature.return_type;
     let attrs = &query_fn.attrs;
     let block = query_fn.block;
 
+    let output_type = &signature.output_type;
+
+    let view_type = if clone_flag.is_some() {
+        quote! { #output_type }
+    } else {
+        quote_spanned! { output_type.span()=> &'a #output_type }
+    };
+
+    let view_body = if let Some(ident) = clone_flag {
+        quote_spanned! { ident.span()=>
+            std::clone::Clone::clone(output)
+        }
+    } else {
+        quote! {
+            output
+        }
+    };
+
+    let is_input = input_flag.is_some();
     tokens.extend(quote! {
         #[allow(non_camel_case_types)]
         #vis enum #ident {}
@@ -68,7 +81,10 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
         impl haste::Query for #ident {
             type Arguments = (#(#argument_types),*);
-            type Output = #return_type;
+            type Output = #output_type;
+            type View<'a> = #view_type;
+
+            const IS_INPUT: bool = #is_input;
 
             #[inline]
             fn execute(
@@ -77,12 +93,10 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             ) -> Self::Output {
                 #ident::#ident(#db_ident, #(#argument_idents),*)
             }
-        }
 
-        #signature {
-            let output = haste::DatabaseExt::query::<#ident>(#db_ident, (#(#argument_idents),*));
-            let output = Clone::clone(output);
-            output
+            fn view(output: &Self::Output) -> Self::View<'_> {
+                #view_body
+            }
         }
 
         impl #ident {
@@ -95,13 +109,15 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         }
     });
 
-    if is_input {
+    if input_flag.is_some() {
         tokens.extend(quote! {
+            impl haste::Input for #ident {}
+
             impl #ident {
                 pub fn set(
                     #db_ident: &mut #db_type,
-                    #(#argument_idents: #argument_types),*
-                    __output: #return_type,
+                    #(#argument_idents: #argument_types),*,
+                    __output: #output_type,
                     __durability: haste::Durability,
                 ) {
                     haste::DatabaseExt::set::<#ident>(
@@ -114,13 +130,26 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
                 pub fn invalidate<'db>(
                     #db_ident: &mut #db_type,
-                    #(#argument_idents: #argument_types),*,
+                    #(#argument_idents: #argument_types),*
                 ) {
                     haste::DatabaseExt::invalidate::<#ident>(#db_ident, (#(#argument_idents),*))
                 }
             }
         });
     }
+
+    signature.output_type = syn::parse2(if clone_flag.is_some() {
+        quote! { #output_type }
+    } else {
+        quote_spanned! { output_type.span()=> &#output_type }
+    })?;
+
+    tokens.extend(quote! {
+        #signature {
+            let output = haste::DatabaseExt::query::<#ident>(#db_ident, (#(#argument_idents),*));
+            <#ident as haste::Query>::view(output)
+        }
+    });
 
     Ok(tokens)
 }
@@ -155,7 +184,7 @@ impl Parse for QueryFunction {
                 ident,
                 paren_token,
                 params,
-                return_type,
+                output_type: return_type,
             },
             block,
         })
@@ -167,7 +196,7 @@ struct QuerySignature {
     ident: syn::Ident,
     paren_token: syn::token::Paren,
     params: Punctuated<QueryParameter, Token![,]>,
-    return_type: syn::Type,
+    output_type: syn::Type,
 }
 
 impl ToTokens for QuerySignature {
@@ -177,7 +206,7 @@ impl ToTokens for QuerySignature {
             ident,
             paren_token: _,
             params,
-            return_type,
+            output_type: return_type,
         } = self;
 
         tokens.extend(quote! {

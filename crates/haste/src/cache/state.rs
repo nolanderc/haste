@@ -138,6 +138,10 @@ impl SlotState {
     pub(super) fn last_verified(&mut self) -> Option<Revision> {
         decode(*self.bits.get_mut()).last_verified()
     }
+
+    pub(crate) fn is_initialized(&self, order: Ordering) -> bool {
+        self.bits.load(order) != 0
+    }
 }
 
 pub struct FinishResult {

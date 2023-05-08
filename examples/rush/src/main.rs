@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicU32;
 
-use haste::DatabaseExt as _;
+use haste::{DatabaseExt as _, DebugWith};
 
 #[haste::database(Storage)]
 #[derive(Default)]
@@ -17,6 +17,9 @@ fn main() {
 
     let start = std::time::Instant::now();
     db.scope(|db| {
+        let text = Text::insert(db, TextData("hello".into()));
+        assert_eq!(format!("{:?}", text.debug(db)), "\"hello\"");
+
         let n = 2000;
         binom(db, n, n / 2);
     });
@@ -62,5 +65,17 @@ fn binom(db: &dyn Db, n: u64, k: u64) -> u64 {
 }
 
 #[haste::intern(Text)]
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 struct TextData(String);
+
+impl std::fmt::Debug for TextData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(haste::DebugWith)]
+struct Foo {
+    a: u32,
+    b: Text,
+}

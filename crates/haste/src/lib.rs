@@ -1,24 +1,28 @@
 pub mod arena;
 mod cache;
 mod durability;
+pub mod fmt;
 mod interner;
 mod revision;
 mod runtime;
 pub mod shard;
+mod util;
 
-use cache::SlotId;
 use std::borrow::{Borrow, BorrowMut};
 
-pub use cache::QueryCache;
+pub use cache::{QueryCache, SlotId};
 pub use durability::Durability;
 pub use interner::{InternId, Interner, ValueInterner};
-pub use runtime::{Dependency, Runtime};
+pub use runtime::{Dependency, LastChange, Runtime};
+pub use fmt::*;
 
 pub use haste_macros::*;
 
 pub trait Database {
     fn runtime(&self) -> &Runtime;
     fn runtime_mut(&mut self) -> &mut Runtime;
+    fn last_change(&self, element: ElementPath) -> Option<LastChange>;
+    fn storage_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any>;
 }
 
 pub trait StaticDatabase: Database + Sized {
@@ -27,17 +31,30 @@ pub trait StaticDatabase: Database + Sized {
 
 pub trait StorageList<DB> {
     fn new(router: &mut StorageRouter<DB>) -> Self;
+    fn storage_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any>;
 }
 
 macro_rules! storage_list_tuple_impl {
     ($($T:ident)*) => {
-        #[allow(unused_variables, clippy::unused_unit)]
+        #[allow(unused_variables, non_snake_case, clippy::unused_unit)]
         impl<DB, $($T: Storage),*> StorageList<DB> for ($($T,)*)
         where
             $(DB: WithStorage<$T>),*
         {
             fn new(router: &mut StorageRouter<DB>) -> Self {
                 ( $($T::new(router),)* )
+            }
+
+            fn storage_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+                let ($($T,)*) = self;
+
+                $(
+                    if std::any::TypeId::of::<$T>() == type_id {
+                        return Some($T)
+                    }
+                )*
+
+                None
             }
         }
     }
@@ -95,8 +112,13 @@ impl<DB: StaticDatabase> DatabaseStorage<DB> {
         (&mut self.storages, &mut self.runtime)
     }
 
-    pub fn container<'a>(&self, db: &'a DB, element: ElementId) -> &'a dyn Container {
+    pub fn container<'a>(&self, db: &'a DB, element: ElementId) -> &'a dyn Container<DB> {
         self.routes[usize::from(element.0)](db)
+    }
+
+    pub fn last_change(&self, db: &DB, query: ElementPath) -> Option<LastChange> {
+        self.container(db, query.element)
+            .last_change(db, query.slot)
     }
 }
 
@@ -130,14 +152,16 @@ impl<DB> StorageRouter<DB> {
     }
 }
 
-type Route<DB> = fn(&DB) -> &dyn Container;
+type Route<DB> = fn(&DB) -> &dyn Container<DB>;
 
-pub trait Container {
+pub trait Container<DB: ?Sized> {
     fn new(element: ElementId) -> Self
     where
         Self: Sized;
 
     fn element(&self) -> ElementId;
+
+    fn last_change(&self, db: &DB, slot: SlotId) -> Option<LastChange>;
 }
 
 pub trait WithElement<E: Element + ?Sized>: Storage {
@@ -147,7 +171,7 @@ pub trait WithElement<E: Element + ?Sized>: Storage {
 
 pub trait Element: 'static {
     type Storage: WithElement<Self>;
-    type Container: Container;
+    type Container;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,8 +180,8 @@ pub struct ElementId(u16);
 pub type ElementDb<T> = <<T as Element>::Storage as Storage>::Database;
 
 pub trait Query: Element {
-    type Arguments: Clone + Eq;
-    type Output: Clone + Eq;
+    type Arguments: Clone + Eq + 'static;
+    type Output: Clone + Eq + 'static;
 
     /// Amount of stack space required by the query.
     const REQUIRED_STACK: usize = 512 * 1024;
@@ -171,13 +195,13 @@ pub trait Query: Element {
 pub trait Input: Query {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct QueryPath {
+pub struct ElementPath {
     pub(crate) element: ElementId,
     pub(crate) slot: SlotId,
 }
 
 pub trait Intern: Element {
-    type Value;
+    type Value: 'static;
 
     fn from_id(id: InternId) -> Self;
     fn id(self) -> InternId;
@@ -235,7 +259,9 @@ pub trait DatabaseExt: Database {
         let (output, info) = self.scope(|db| {
             let storage = db.storage();
             let container = storage.container();
-            container.borrow().execute_input(db.cast_database(), args.clone())
+            container
+                .borrow()
+                .execute_input(db.cast_database(), args.clone())
         });
 
         let (storage, runtime) = self.storage_mut();

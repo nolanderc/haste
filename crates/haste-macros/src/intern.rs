@@ -74,6 +74,13 @@ pub fn intern(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                 std::write!(f, "Text({:?})", self.0)
             }
         }
+
+        impl haste::fmt::DebugWith<haste::ElementDb<Self>> for #id_ident {
+            fn fmt(&self, db: &haste::ElementDb<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                use haste::macro_helper::DebugFallback as _;
+                std::fmt::Debug::fmt(&haste::fmt::macro_helper::HasteDebug::<#data_ident, haste::ElementDb<Self>>::haste_debug(self.lookup(db), db), f)
+            }
+        }
     });
 
     tokens.extend(item);

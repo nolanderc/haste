@@ -1,14 +1,14 @@
 mod lookup;
 mod state;
 
-use std::{cell::UnsafeCell, hash::Hash, mem::MaybeUninit};
+use std::{cell::UnsafeCell, hash::Hash, mem::MaybeUninit, sync::atomic::Ordering::Acquire};
 
 use crate::{
     arena::Arena,
     revision::Revision,
     runtime::{Dependency, ExecutionInfo, StackId},
-    Container, Database, Durability, ElementDb, ElementId, Input, Query, QueryHandle, QueryPath,
-    Runtime,
+    Container, Database, Durability, ElementDb, ElementId, Input, Query, QueryHandle, ElementPath,
+    Runtime, WithStorage,
 };
 
 use self::lookup::HashLookup;
@@ -21,7 +21,10 @@ pub struct QueryCache<Q: Query> {
     element: ElementId,
 }
 
-impl<Q: Query> Container for QueryCache<Q> {
+impl<DB: ?Sized, Q: Query> Container<DB> for QueryCache<Q>
+where
+    DB: WithStorage<Q::Storage>,
+{
     fn new(element: ElementId) -> Self {
         Self {
             element,
@@ -32,6 +35,21 @@ impl<Q: Query> Container for QueryCache<Q> {
 
     fn element(&self) -> ElementId {
         self.element
+    }
+
+    fn last_change(&self, db: &DB, id: SlotId) -> Option<crate::LastChange> {
+        let slot = self.slots.get(id.index())?;
+        if !slot.state().is_initialized(Acquire) {
+            return None;
+        }
+        unsafe { self.force(db.cast_database(), db.runtime(), slot, id, false) };
+
+        let output = unsafe { slot.output_unchecked() };
+
+        Some(crate::LastChange {
+            revision: output.revision,
+            durability: output.durability,
+        })
     }
 }
 
@@ -51,32 +69,42 @@ impl<Q: Query> QueryCache<Q> {
             .get_or_allocate(args, &self.slots, || Some(runtime.current_stack()));
 
         let slot = unsafe { self.slots.get_unchecked(lookup.id.index()) };
+        unsafe { self.force(db, runtime, slot, lookup.id, lookup.claim.is_some()) };
 
-        let claim = if lookup.claim.is_some() {
+        runtime.register_dependency(Dependency {
+            element: self.element,
+            slot: lookup.id,
+            spawn_group: runtime.current_spawn_group(),
+        });
+
+        unsafe { &slot.output_unchecked().value }
+    }
+
+    unsafe fn force(
+        &self,
+        db: &ElementDb<Q>,
+        runtime: &Runtime,
+        slot: &Slot<Q>,
+        id: SlotId,
+        claimed: bool,
+    ) {
+        let claim = if claimed {
             ClaimResult::Claimed(None)
         } else {
             slot.claim_blocking(runtime.current_stack(), runtime.current_revision())
         };
 
-        let path = self.path(lookup.id);
+        let path = self.path(id);
 
         match claim {
             ClaimResult::Ready => {}
-            ClaimResult::Claimed(last_verified) => unsafe {
-                runtime.execute::<Q>(db, path, slot, last_verified)
-            },
+            ClaimResult::Claimed(last_verified) => {
+                runtime.execute::<Q>(db, slot, path, last_verified)
+            }
             ClaimResult::Pending(claimant) => {
                 runtime.block_until_ready(path, claimant, slot.state())
             }
         }
-
-        runtime.register_dependency(Dependency {
-            element: path.element,
-            slot: path.slot,
-            spawn_group: runtime.current_spawn_group(),
-        });
-
-        unsafe { &slot.output_unchecked().value }
     }
 
     pub(crate) fn spawn<'a>(
@@ -108,7 +136,7 @@ impl<Q: Query> QueryCache<Q> {
         let path = self.path(lookup.id);
 
         if let Some((stack, last_verified)) = claim {
-            unsafe { runtime.spawn::<Q>(db, path, slot, last_verified, stack) }
+            unsafe { runtime.spawn::<Q>(db, slot, path, last_verified, stack) }
         }
 
         QueryHandle {
@@ -180,8 +208,8 @@ impl<Q: Query> QueryCache<Q> {
         });
     }
 
-    fn path(&self, slot: SlotId) -> QueryPath {
-        QueryPath {
+    fn path(&self, slot: SlotId) -> ElementPath {
+        ElementPath {
             element: self.element,
             slot,
         }
@@ -235,7 +263,13 @@ impl<Q: Query> Slot<Q> {
         self.state().finish(revision)
     }
 
-    pub(crate) unsafe fn backdate(&self, revision: Revision) -> FinishResult {
+    pub(crate) unsafe fn backdate(
+        &self,
+        revision: Revision,
+        durability: Durability,
+    ) -> FinishResult {
+        let output = (*self.output.get()).assume_init_mut();
+        output.durability = durability;
         self.state().finish(revision)
     }
 

@@ -36,6 +36,17 @@ pub fn database(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             fn runtime_mut(&mut self) -> &mut haste::Runtime {
                 self.storage.runtime_mut()
             }
+
+            fn last_change(&self, query: haste::ElementPath) -> Option<haste::LastChange> {
+                self.storage.last_change(self, query)
+            }
+
+            fn storage_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+                <<Self as haste::StaticDatabase>::StorageList as haste::StorageList<Self>>::storage_any(
+                    &self.storage.storages(), 
+                    type_id,
+                )
+            }
         }
 
         #(

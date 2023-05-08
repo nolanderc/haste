@@ -19,10 +19,11 @@ use dashmap::DashMap;
 use smallvec::SmallVec;
 
 use crate::{
-    cache::{FinishResult, SlotId, SlotState},
+    cache::{SlotId, SlotState},
     durability::Durability,
     revision::Revision,
-    ElementDb, ElementId, Query, QueryPath,
+    util::DynPointer,
+    Database, ElementDb, ElementId, ElementPath, Query,
 };
 
 use self::{cycle::CycleGraph, history::History};
@@ -37,7 +38,7 @@ pub struct Runtime {
     history: History,
 
     thread_scope: Option<Arc<ThreadScope>>,
-    tasks: DashMap<QueryPath, Task>,
+    tasks: DashMap<ElementPath, Task>,
     workers: ArcSwap<WorkerState>,
 }
 
@@ -101,7 +102,7 @@ impl Runtime {
 
     pub(crate) fn begin_query(
         &self,
-        path: QueryPath,
+        path: ElementPath,
         durability: Durability,
         is_input: bool,
     ) -> StackId {
@@ -171,12 +172,12 @@ impl Runtime {
     pub(crate) unsafe fn execute<Q: Query>(
         &self,
         db: &ElementDb<Q>,
-        path: QueryPath,
         slot: &crate::cache::Slot<Q>,
+        path: ElementPath,
         last_verified: Option<Revision>,
     ) {
-        let result = if let Some(result) = self.verify(slot, last_verified) {
-            result
+        let result = if let Some(durability) = self.is_valid(db, slot, last_verified) {
+            slot.backdate(self.current_revision(), durability)
         } else {
             self.execute_with_info(db, path, slot, |output, info| {
                 slot.write_output(output, info, self.current_revision())
@@ -189,28 +190,40 @@ impl Runtime {
     }
 
     #[inline]
-    fn verify<Q: Query>(
+    fn is_valid<Q: Query>(
         &self,
+        db: &ElementDb<Q>,
         slot: &crate::cache::Slot<Q>,
         last_verified: Option<Revision>,
-    ) -> Option<FinishResult> {
-        let _last_verified = last_verified?;
+    ) -> Option<Durability> {
+        let last_verified = last_verified?;
+
         let output = unsafe { slot.output_unchecked() };
 
-        if self
-            .history
-            .maybe_changed_since(output.revision, output.durability)
-        {
-            return None;
+        let revision = output.revision;
+        let durability = output.durability;
+        if !self.history.maybe_changed_since(revision, durability) {
+            // the query cannot possibly have changed
+            return Some(durability);
         }
 
-        unsafe { Some(slot.backdate(self.current_revision())) }
+        let mut new_durability = Durability::Constant;
+
+        for dependency in output.dependencies.iter() {
+            let change = db.last_change(dependency.query())?;
+            if change.revision > last_verified {
+                return None;
+            }
+            new_durability = std::cmp::min(new_durability, change.durability);
+        }
+
+        Some(new_durability)
     }
 
     pub(crate) unsafe fn execute_with_info<Q: Query, R>(
         &self,
         db: &ElementDb<Q>,
-        path: QueryPath,
+        path: ElementPath,
         slot: &crate::cache::Slot<Q>,
         callback: impl FnOnce(Q::Output, ExecutionInfo) -> R,
     ) -> R {
@@ -231,40 +244,49 @@ impl Runtime {
     pub(crate) unsafe fn spawn<'a, Q: Query>(
         &'a self,
         db: &'a ElementDb<Q>,
-        path: QueryPath,
         slot: &'a crate::cache::Slot<Q>,
+        path: ElementPath,
         last_verified: Option<Revision>,
         stack: StackId,
     ) {
-        let func = move || {
-            ACTIVE.with(|active| {
-                let old = active.borrow_mut().replace(ActiveStack::new(stack));
-                self.execute(db, path, slot, last_verified);
-                *active.borrow_mut() = old;
-                self.free_stack(stack);
-            })
+        let state = TaskState {
+            db: DynPointer::erase(db as *const _),
+            slot: slot as *const _ as *const (),
+            path,
+            last_verified,
+            stack,
         };
 
-        // Extend the lifetime of the task so that it can be stored in the runtime.
-        // SAFETY: We ensure that we are inside a thread scope when enqueuing the task.
-        let func: Box<TaskFn> = Box::new(func);
-        let func: Box<TaskFn<'static>> = std::mem::transmute(func);
+        let task = Task {
+            state,
+            execute: |runtime, state| {
+                let db = unsafe { &*state.db.unerase::<ElementDb<Q>>() };
+                let slot = unsafe { &*state.slot.cast::<crate::cache::Slot<Q>>() };
 
-        self.spawn_task(path, Task { func });
+                ACTIVE.with(|active| {
+                    let old = active.borrow_mut().replace(ActiveStack::new(state.stack));
+                    runtime.execute(db, slot, state.path, state.last_verified);
+                    *active.borrow_mut() = old;
+                    runtime.free_stack(state.stack);
+                })
+            },
+        };
+
+        self.spawn_task(path, task);
     }
 
-    fn spawn_task(&self, query: QueryPath, task: Task) {
+    fn spawn_task(&self, query: ElementPath, task: Task) {
         self.with_local(|local| local.worker.push(query))
             .expect("spawned query outside thread scope");
         self.tasks.insert(query, task);
         self.wake_one();
     }
 
-    fn next_query(&self) -> Option<QueryPath> {
+    fn next_query(&self) -> Option<ElementPath> {
         self.with_local(|local| local.worker.pop().or_else(|| self.try_steal_task(local)))?
     }
 
-    fn try_steal_task(&self, local: &LocalQueue) -> Option<QueryPath> {
+    fn try_steal_task(&self, local: &LocalQueue) -> Option<ElementPath> {
         let workers = self.workers.load();
         let stealers = workers.stealers.as_slice();
 
@@ -316,10 +338,15 @@ impl Runtime {
         local.as_ref()
     }
 
-    pub(crate) fn block_until_ready(&self, path: QueryPath, claimant: StackId, state: &SlotState) {
+    pub(crate) fn block_until_ready(
+        &self,
+        path: ElementPath,
+        claimant: StackId,
+        state: &SlotState,
+    ) {
         // if the query has been spawned in the runtime, try executing it immediately
         if let Some((_, task)) = self.tasks.remove(&path) {
-            task.run();
+            task.run(self);
             if state.is_ready(self.current_revision(), Acquire) {
                 return;
             }
@@ -353,7 +380,7 @@ impl Runtime {
             while !state.is_ready(self.current_revision(), Relaxed) {
                 if let Some(query) = next_query.take().or_else(|| self.next_query()) {
                     if let Some((_, task)) = self.tasks.remove(&query) {
-                        task.run();
+                        task.run(self);
                     }
                     continue;
                 }
@@ -415,7 +442,7 @@ thread_local! {
 
 struct LocalQueue {
     thread_scope: Weak<ThreadScope>,
-    worker: Worker<QueryPath>,
+    worker: Worker<ElementPath>,
 }
 
 thread_local! {
@@ -451,8 +478,8 @@ const _: () = assert!(
 );
 
 impl Dependency {
-    pub(crate) fn query(self) -> QueryPath {
-        QueryPath {
+    pub(crate) fn query(self) -> ElementPath {
+        ElementPath {
             element: self.element,
             slot: self.slot,
         }
@@ -484,8 +511,13 @@ impl SpawnGroup {
     }
 }
 
+pub struct LastChange {
+    pub(crate) revision: Revision,
+    pub(crate) durability: Durability,
+}
+
 struct QueryData {
-    path: QueryPath,
+    path: ElementPath,
     /// Number of dependencies registered for this query. Corresponds to the last dependencies in
     /// the active stack.
     dependency_count: usize,
@@ -536,25 +568,39 @@ pub struct ExecutionInfo<'a> {
     pub dependencies: &'a [Dependency],
 }
 
-type TaskFn<'a> = dyn FnOnce() + 'a;
-
 struct Task {
-    func: Box<TaskFn<'static>>,
+    state: TaskState,
+    execute: ExecuteFn,
 }
 
 impl Task {
-    fn run(self) {
-        (self.func)()
+    fn run(self, runtime: &Runtime) {
+        (self.execute)(runtime, self.state)
     }
+}
+
+type ExecuteFn = fn(&Runtime, TaskState);
+
+struct TaskState {
+    /// Type-erased database
+    db: DynPointer,
+    /// Type-erased pointer to the query's [`crate::cache::Slot`]
+    slot: *const (),
+    /// Path to the query.
+    path: ElementPath,
+    /// Revision when the query was last verified.
+    last_verified: Option<Revision>,
+    /// Stack which should be used when executing the query.
+    stack: StackId,
 }
 
 #[derive(Default)]
 struct WorkerState {
-    stealers: SmallVec<[Stealer<QueryPath>; 32]>,
+    stealers: SmallVec<[Stealer<ElementPath>; 32]>,
 }
 
 impl WorkerState {
-    pub fn add(&self, stealer: Stealer<QueryPath>) -> Self {
+    pub fn add(&self, stealer: Stealer<ElementPath>) -> Self {
         let mut stealers = SmallVec::with_capacity(self.stealers.len());
         stealers.extend(self.stealers.iter().cloned());
         stealers.push(stealer);

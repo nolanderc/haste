@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 
-use crate::QueryPath;
+use crate::ElementPath;
 
 use super::{ActiveStack, StackId};
 
@@ -81,7 +81,7 @@ impl CycleGraph {
 }
 
 pub struct Cycle {
-    participants: Vec<QueryPath>,
+    participants: Vec<ElementPath>,
 }
 
 impl std::fmt::Debug for Cycle {

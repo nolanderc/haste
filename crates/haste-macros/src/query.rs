@@ -26,6 +26,15 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
     let db = &query_fn.signature.params[0];
     let db_ident = &db.ident;
+    let db_type = match &db.typ {
+        syn::Type::Reference(reference) => &*reference.elem,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &db.typ,
+                "expected a reference to a database",
+            ))
+        }
+    };
 
     let mut argument_idents = Vec::with_capacity(parameters.len() - 1);
     let mut argument_types = Vec::with_capacity(parameters.len() - 1);
@@ -78,7 +87,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
         impl #ident {
             pub fn spawn<'db>(
-                #db_ident: &'db haste::ElementDb<Self>,
+                #db_ident: &'db #db_type,
                 #(#argument_idents: #argument_types),*
             ) -> haste::QueryHandle<'db, Self> {
                 haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#argument_idents),*))
@@ -89,12 +98,12 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     if is_input {
         tokens.extend(quote! {
             impl #ident {
-                pub fn set<'db>(
-                    #db_ident: &'db haste::ElementDb<Self>,
+                pub fn set(
+                    #db_ident: &mut #db_type,
                     #(#argument_idents: #argument_types),*
                     __output: #return_type,
                     __durability: haste::Durability,
-                ) -> haste::QueryHandle<'db, Self> {
+                ) {
                     haste::DatabaseExt::set::<#ident>(
                         #db_ident,
                         (#(#argument_idents),*),
@@ -104,9 +113,9 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                 }
 
                 pub fn invalidate<'db>(
-                    #db_ident: &'db haste::ElementDb<Self>,
-                    #(#argument_idents: #argument_types),*
-                ) -> haste::QueryHandle<'db, Self> {
+                    #db_ident: &mut #db_type,
+                    #(#argument_idents: #argument_types),*,
+                ) {
                     haste::DatabaseExt::invalidate::<#ident>(#db_ident, (#(#argument_idents),*))
                 }
             }

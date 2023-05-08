@@ -44,7 +44,7 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             {
                 Self {
                     #(
-                        #members: <<#types as haste::Element>::Container as haste::Container>::new(
+                        #members: <<#types as haste::Element>::Container as haste::Container<DB>>::new(
                             router.push(|db| &db.storage().#members),
                         ),
                     )*

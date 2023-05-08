@@ -11,7 +11,7 @@ use std::{
 
 use crate::{arena::Arena, shard::ShardLookup, Container, ElementId};
 
-pub trait Interner<T>: Container {
+pub trait Interner<T> {
     fn insert(&self, value: T) -> InternId;
 
     fn lookup(&self, id: InternId) -> Option<&T>;
@@ -42,7 +42,7 @@ pub struct ValueInterner<T> {
     element: ElementId,
 }
 
-impl<T> Container for ValueInterner<T> {
+impl<DB: ?Sized, T> Container<DB> for ValueInterner<T> {
     fn new(element: ElementId) -> Self
     where
         Self: Sized,
@@ -56,6 +56,10 @@ impl<T> Container for ValueInterner<T> {
 
     fn element(&self) -> crate::ElementId {
         self.element
+    }
+
+    fn last_change(&self, _db: &DB, _slot: crate::SlotId) -> Option<crate::LastChange> {
+        None
     }
 }
 

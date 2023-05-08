@@ -1,3 +1,5 @@
+mod impls;
+
 pub trait DebugWith<DB: ?Sized> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 

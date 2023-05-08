@@ -3,11 +3,14 @@ use quote::{quote, ToTokens};
 use syn::{parse::Parse, punctuated::Punctuated, spanned::Spanned, Result, Token};
 
 pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
+    let mut is_input = false;
+
     if !attr.is_empty() {
         let ident = syn::parse2::<syn::Ident>(attr)?;
         if ident != "input" {
             return Err(syn::Error::new_spanned(ident, "expected token `input`"));
         }
+        is_input = true;
     }
 
     let query_fn = syn::parse2::<QueryFunction>(item)?;
@@ -24,11 +27,11 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let db = &query_fn.signature.params[0];
     let db_ident = &db.ident;
 
-    let mut input_idents = Vec::with_capacity(parameters.len() - 1);
-    let mut input_types = Vec::with_capacity(parameters.len() - 1);
+    let mut argument_idents = Vec::with_capacity(parameters.len() - 1);
+    let mut argument_types = Vec::with_capacity(parameters.len() - 1);
     for param in parameters.iter().skip(1) {
-        input_idents.push(&param.ident);
-        input_types.push(&param.typ);
+        argument_idents.push(&param.ident);
+        argument_types.push(&param.typ);
     }
 
     let vis = &query_fn.signature.vis;
@@ -55,20 +58,20 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         }
 
         impl haste::Query for #ident {
-            type Input = (#(#input_types),*);
+            type Arguments = (#(#argument_types),*);
             type Output = #return_type;
 
             #[inline]
             fn execute(
                 #db_ident: &haste::ElementDb<Self>,
-                (#(#input_idents),*): Self::Input
+                (#(#argument_idents),*): Self::Arguments
             ) -> Self::Output {
-                #ident::#ident(#db_ident, #(#input_idents),*)
+                #ident::#ident(#db_ident, #(#argument_idents),*)
             }
         }
 
         #signature {
-            let output = haste::DatabaseExt::query::<#ident>(#db_ident, (#(#input_idents),*));
+            let output = haste::DatabaseExt::query::<#ident>(#db_ident, (#(#argument_idents),*));
             let output = Clone::clone(output);
             output
         }
@@ -76,12 +79,39 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         impl #ident {
             pub fn spawn<'db>(
                 #db_ident: &'db haste::ElementDb<Self>,
-                #(#input_idents: #input_types),*
+                #(#argument_idents: #argument_types),*
             ) -> haste::QueryHandle<'db, Self> {
-                haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#input_idents),*))
+                haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#argument_idents),*))
             }
         }
     });
+
+    if is_input {
+        tokens.extend(quote! {
+            impl #ident {
+                pub fn set<'db>(
+                    #db_ident: &'db haste::ElementDb<Self>,
+                    #(#argument_idents: #argument_types),*
+                    __output: #return_type,
+                    __durability: haste::Durability,
+                ) -> haste::QueryHandle<'db, Self> {
+                    haste::DatabaseExt::set::<#ident>(
+                        #db_ident,
+                        (#(#argument_idents),*),
+                        __output,
+                        __durability,
+                    )
+                }
+
+                pub fn invalidate<'db>(
+                    #db_ident: &'db haste::ElementDb<Self>,
+                    #(#argument_idents: #argument_types),*
+                ) -> haste::QueryHandle<'db, Self> {
+                    haste::DatabaseExt::invalidate::<#ident>(#db_ident, (#(#argument_idents),*))
+                }
+            }
+        });
+    }
 
     Ok(tokens)
 }

@@ -44,6 +44,11 @@ pub fn database(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                     &self.storage.storages().#indices
                 }
 
+                fn storage_mut(&mut self) -> (&mut #storages, &mut haste::Runtime) {
+                    let (list, runtime) = self.storage.storages_mut();
+                    (&mut list.#indices, runtime)
+                }
+
                 fn cast_database(&self) -> &<#storages as haste::Storage>::Database {
                     self
                 }

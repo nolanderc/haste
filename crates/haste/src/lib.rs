@@ -1,17 +1,18 @@
 pub mod arena;
 mod cache;
+mod durability;
 mod interner;
+mod revision;
 mod runtime;
 pub mod shard;
-mod durability;
 
 use cache::SlotId;
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 
 pub use cache::QueryCache;
+pub use durability::Durability;
 pub use interner::{InternId, Interner, ValueInterner};
 pub use runtime::{Dependency, Runtime};
-pub use durability::Durability;
 
 pub use haste_macros::*;
 
@@ -90,6 +91,10 @@ impl<DB: StaticDatabase> DatabaseStorage<DB> {
         &self.storages
     }
 
+    pub fn storages_mut(&mut self) -> (&mut DB::StorageList, &mut Runtime) {
+        (&mut self.storages, &mut self.runtime)
+    }
+
     pub fn container<'a>(&self, db: &'a DB, element: ElementId) -> &'a dyn Container {
         self.routes[usize::from(element.0)](db)
     }
@@ -105,6 +110,7 @@ pub trait Storage: Sized + 'static {
 
 pub trait WithStorage<S: Storage>: Database {
     fn storage(&self) -> &S;
+    fn storage_mut(&mut self) -> (&mut S, &mut Runtime);
     fn cast_database(&self) -> &S::Database;
 }
 
@@ -136,6 +142,7 @@ pub trait Container {
 
 pub trait WithElement<E: Element + ?Sized>: Storage {
     fn container(&self) -> &E::Container;
+    fn container_mut(&mut self) -> &mut E::Container;
 }
 
 pub trait Element: 'static {
@@ -149,14 +156,19 @@ pub struct ElementId(u16);
 pub type ElementDb<T> = <<T as Element>::Storage as Storage>::Database;
 
 pub trait Query: Element {
-    type Input: Clone;
-    type Output: Clone;
+    type Arguments: Clone + Eq;
+    type Output: Clone + Eq;
 
-    /// Amount of stack space required by the
+    /// Amount of stack space required by the query.
     const REQUIRED_STACK: usize = 512 * 1024;
 
-    fn execute(db: &ElementDb<Self>, input: Self::Input) -> Self::Output;
+    /// Determines if this is an input query. If `true` this query cannot invoke any other queries.
+    const IS_INPUT: bool = false;
+
+    fn execute(db: &ElementDb<Self>, args: Self::Arguments) -> Self::Output;
 }
+
+pub trait Input: Query {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryPath {
@@ -173,29 +185,64 @@ pub trait Intern: Element {
 
 pub trait DatabaseExt: Database {
     #[inline]
-    fn query<Q: Query>(&self, input: Q::Input) -> &Q::Output
+    fn query<Q: Query>(&self, args: Q::Arguments) -> &Q::Output
     where
         Self: WithStorage<Q::Storage>,
         Q::Container: Borrow<QueryCache<Q>>,
-        Q::Input: Eq + std::hash::Hash,
+        Q::Arguments: Eq + std::hash::Hash,
     {
         let storage = self.storage();
         let container = storage.container();
         container
             .borrow()
-            .get_or_execute(self.cast_database(), input)
+            .get_or_execute(self.cast_database(), args)
     }
 
     #[inline]
-    fn spawn<Q: Query>(&self, input: Q::Input) -> QueryHandle<Q>
+    fn spawn<Q: Query>(&self, args: Q::Arguments) -> QueryHandle<Q>
     where
         Self: WithStorage<Q::Storage>,
         Q::Container: Borrow<QueryCache<Q>>,
-        Q::Input: Eq + std::hash::Hash,
+        Q::Arguments: Eq + std::hash::Hash,
     {
         let storage = self.storage();
         let container = storage.container();
-        container.borrow().spawn(self.cast_database(), input)
+        container.borrow().spawn(self.cast_database(), args)
+    }
+
+    #[inline]
+    fn set<I: Input>(&mut self, args: I::Arguments, value: I::Output, durability: Durability)
+    where
+        Self: WithStorage<I::Storage>,
+        I::Container: BorrowMut<QueryCache<I>>,
+        I::Arguments: Eq + std::hash::Hash,
+    {
+        assert!(I::IS_INPUT);
+        let (storage, runtime) = self.storage_mut();
+        let container = storage.container_mut();
+        container.borrow_mut().set(runtime, args, value, durability);
+    }
+
+    #[inline]
+    fn invalidate<I: Input>(&mut self, args: I::Arguments)
+    where
+        Self: WithStorage<I::Storage>,
+        I::Container: Borrow<QueryCache<I>> + BorrowMut<QueryCache<I>>,
+        I::Arguments: Eq + std::hash::Hash,
+    {
+        assert!(I::IS_INPUT);
+
+        let (output, info) = self.scope(|db| {
+            let storage = db.storage();
+            let container = storage.container();
+            container.borrow().execute_input(db.cast_database(), args.clone())
+        });
+
+        let (storage, runtime) = self.storage_mut();
+        let container = storage.container_mut();
+        container
+            .borrow_mut()
+            .set(runtime, args, output, info.durability);
     }
 
     fn intern<T: Intern>(&self, value: T::Value) -> T

@@ -1,4 +1,5 @@
 mod cycle;
+mod history;
 
 use std::{
     cell::RefCell,
@@ -18,12 +19,13 @@ use dashmap::DashMap;
 use smallvec::SmallVec;
 
 use crate::{
-    cache::{SlotId, SlotState},
+    cache::{FinishResult, SlotId, SlotState},
     durability::Durability,
+    revision::Revision,
     ElementDb, ElementId, Query, QueryPath,
 };
 
-use self::cycle::CycleGraph;
+use self::{cycle::CycleGraph, history::History};
 
 /// Smallest stack size to allocate for queries (in bytes).
 const MIN_STACK: usize = 32 * 1024 * 1024;
@@ -32,6 +34,7 @@ pub struct Runtime {
     stack_ids: StackIdAllocator,
 
     cycles: CycleGraph,
+    history: History,
 
     thread_scope: Option<Arc<ThreadScope>>,
     tasks: DashMap<QueryPath, Task>,
@@ -43,9 +46,10 @@ impl Runtime {
         Self {
             stack_ids: StackIdAllocator::new(),
             cycles: CycleGraph::default(),
+            history: History::new(),
             thread_scope: None,
-            tasks: Default::default(),
-            workers: ArcSwap::new(WorkerState::default().into()),
+            tasks: DashMap::with_capacity(1024),
+            workers: Default::default(),
         }
     }
 
@@ -64,8 +68,17 @@ impl Runtime {
     }
 
     fn drain_tasks(&mut self) {
-        std::mem::take(&mut self.tasks);
+        self.tasks.clear();
         std::mem::take(&mut self.workers);
+    }
+
+    #[inline]
+    pub(crate) fn current_revision(&self) -> Revision {
+        self.history.current()
+    }
+
+    pub(crate) fn update_input(&mut self, durability: Durability) {
+        self.history.update(durability);
     }
 
     #[inline]
@@ -86,11 +99,21 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn begin_query(&self, path: QueryPath, durability: Durability) -> StackId {
+    pub(crate) fn begin_query(
+        &self,
+        path: QueryPath,
+        durability: Durability,
+        is_input: bool,
+    ) -> StackId {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
             let stack = active.get_or_insert_with(|| ActiveStack::new(self.stack_ids.allocate()));
-            stack.queries.push(QueryData::new(path, durability));
+            stack.queries.push(QueryData {
+                path,
+                durability,
+                is_input,
+                dependency_count: 0,
+            });
             stack.id
         })
     }
@@ -105,7 +128,10 @@ impl Runtime {
             let dependencies_start = stack.dependencies.len() - query.dependency_count;
             let dependencies = &stack.dependencies[dependencies_start..];
 
-            with_info(ExecutionInfo { dependencies })
+            with_info(ExecutionInfo {
+                durability: query.durability,
+                dependencies,
+            })
         })
     }
 
@@ -122,6 +148,9 @@ impl Runtime {
         ACTIVE.with(|active| {
             if let Some(active) = active.borrow_mut().as_mut() {
                 let Some(query) = active.queries.last_mut() else { return };
+
+                assert!(!query.is_input, "queries may not invoke other queries");
+
                 query.dependency_count += 1;
                 active.dependencies.push(dependency);
             }
@@ -144,18 +173,15 @@ impl Runtime {
         db: &ElementDb<Q>,
         path: QueryPath,
         slot: &crate::cache::Slot<Q>,
+        last_verified: Option<Revision>,
     ) {
-        self.begin_query(path, Durability::Constant);
-
-        let input = slot.input_unchecked().clone();
-
-        let output = stacker::maybe_grow(
-            usize::max(Q::REQUIRED_STACK, 32 * 1024),
-            usize::max(Q::REQUIRED_STACK, MIN_STACK),
-            || Q::execute(db, input),
-        );
-
-        let result = self.end_query(|info| slot.write_output(output, info));
+        let result = if let Some(result) = self.verify(slot, last_verified) {
+            result
+        } else {
+            self.execute_with_info(db, path, slot, |output, info| {
+                slot.write_output(output, info, self.current_revision())
+            })
+        };
 
         if result.has_blocking {
             self.wake_query(slot.state());
@@ -163,17 +189,57 @@ impl Runtime {
     }
 
     #[inline]
+    fn verify<Q: Query>(
+        &self,
+        slot: &crate::cache::Slot<Q>,
+        last_verified: Option<Revision>,
+    ) -> Option<FinishResult> {
+        let _last_verified = last_verified?;
+        let output = unsafe { slot.output_unchecked() };
+
+        if self
+            .history
+            .maybe_changed_since(output.revision, output.durability)
+        {
+            return None;
+        }
+
+        unsafe { Some(slot.backdate(self.current_revision())) }
+    }
+
+    pub(crate) unsafe fn execute_with_info<Q: Query, R>(
+        &self,
+        db: &ElementDb<Q>,
+        path: QueryPath,
+        slot: &crate::cache::Slot<Q>,
+        callback: impl FnOnce(Q::Output, ExecutionInfo) -> R,
+    ) -> R {
+        self.begin_query(path, Durability::Constant, Q::IS_INPUT);
+
+        let args = slot.arguments_unchecked();
+
+        let output = stacker::maybe_grow(
+            usize::max(Q::REQUIRED_STACK, 32 * 1024),
+            usize::max(Q::REQUIRED_STACK, MIN_STACK),
+            || Q::execute(db, args.clone()),
+        );
+
+        self.end_query(|info| callback(output, info))
+    }
+
+    #[inline]
     pub(crate) unsafe fn spawn<'a, Q: Query>(
         &'a self,
         db: &'a ElementDb<Q>,
-        slot: &'a crate::cache::Slot<Q>,
         path: QueryPath,
+        slot: &'a crate::cache::Slot<Q>,
+        last_verified: Option<Revision>,
         stack: StackId,
     ) {
         let func = move || {
             ACTIVE.with(|active| {
                 let old = active.borrow_mut().replace(ActiveStack::new(stack));
-                self.execute(db, path, slot);
+                self.execute(db, path, slot, last_verified);
                 *active.borrow_mut() = old;
                 self.free_stack(stack);
             })
@@ -254,7 +320,7 @@ impl Runtime {
         // if the query has been spawned in the runtime, try executing it immediately
         if let Some((_, task)) = self.tasks.remove(&path) {
             task.run();
-            if state.is_ready(Acquire) {
+            if state.is_ready(self.current_revision(), Acquire) {
                 return;
             }
         }
@@ -284,7 +350,7 @@ impl Runtime {
         // keep running other tasks until the query completes
         {
             let mut next_query = None;
-            while !state.is_ready(Relaxed) {
+            while !state.is_ready(self.current_revision(), Relaxed) {
                 if let Some(query) = next_query.take().or_else(|| self.next_query()) {
                     if let Some((_, task)) = self.tasks.remove(&query) {
                         task.run();
@@ -309,12 +375,12 @@ impl Runtime {
 
         ACTIVE.with(|active| active.borrow_mut().replace(stack));
 
-        assert!(state.is_ready(Acquire));
+        assert!(state.is_ready(self.current_revision(), Acquire));
     }
 
     fn wait_on_query(&self, state: &SlotState, validate: impl FnOnce() -> bool) {
         let key = self as *const _ as usize;
-        let validate = || !state.is_ready(Relaxed) && validate();
+        let validate = || !state.is_ready(self.current_revision(), Relaxed) && validate();
         unsafe { parking_lot_core::park(key, validate, || {}, |_, _| {}, park_token(state), None) };
     }
 
@@ -424,16 +490,7 @@ struct QueryData {
     /// the active stack.
     dependency_count: usize,
     durability: Durability,
-}
-
-impl QueryData {
-    fn new(path: QueryPath, durability: Durability) -> Self {
-        Self {
-            path,
-            dependency_count: 0,
-            durability,
-        }
-    }
+    is_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -475,6 +532,7 @@ impl StackIdAllocator {
 }
 
 pub struct ExecutionInfo<'a> {
+    pub durability: Durability,
     pub dependencies: &'a [Dependency],
 }
 
@@ -498,6 +556,7 @@ struct WorkerState {
 impl WorkerState {
     pub fn add(&self, stealer: Stealer<QueryPath>) -> Self {
         let mut stealers = SmallVec::with_capacity(self.stealers.len());
+        stealers.extend(self.stealers.iter().cloned());
         stealers.push(stealer);
         Self { stealers }
     }

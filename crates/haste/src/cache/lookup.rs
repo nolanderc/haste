@@ -17,22 +17,22 @@ pub struct HashLookup {
 impl HashLookup {
     pub(super) fn get_or_allocate<Q: Query>(
         &self,
-        input: Q::Input,
+        args: Q::Arguments,
         slots: &Arena<Slot<Q>>,
-        stack: impl FnOnce() -> StackId,
+        stack: impl FnOnce() -> Option<StackId>,
     ) -> LookupResult
     where
-        Q::Input: Hash + Eq,
+        Q::Arguments: Hash + Eq,
     {
         #[inline(always)]
-        unsafe fn get_input<Q: Query>(slots: &Arena<Slot<Q>>, index: u32) -> &Q::Input {
-            slots.get_unchecked(index as usize).input_unchecked()
+        unsafe fn get_arguments<Q: Query>(slots: &Arena<Slot<Q>>, index: u32) -> &Q::Arguments {
+            slots.get_unchecked(index as usize).arguments_unchecked()
         }
 
         let result = self.shards.get_or_insert(
-            fxhash::hash64(&input),
-            |index| unsafe { get_input(slots, index) == &input },
-            |index| unsafe { fxhash::hash64(get_input(slots, index)) },
+            fxhash::hash64(&args),
+            |index| unsafe { get_arguments(slots, index) == &args },
+            |index| unsafe { fxhash::hash64(get_arguments(slots, index)) },
         );
 
         match result {
@@ -41,15 +41,20 @@ impl HashLookup {
                 claim: None,
             },
             ShardResult::Insert(index, guard) => {
-                let stack = stack();
                 let slot = slots.get_or_allocate(index as usize);
-                unsafe { slot.init_claim(input, stack) }
+
+                let stack = stack();
+                if let Some(stack) = stack {
+                    unsafe { slot.init_claim(args, stack) }
+                } else {
+                    unsafe { slot.init(args) }
+                }
 
                 drop(guard);
 
                 LookupResult {
                     id: SlotId(index),
-                    claim: Some(stack),
+                    claim: stack,
                 }
             }
         }

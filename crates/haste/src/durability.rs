@@ -11,4 +11,6 @@ impl Durability {
     pub const DEFAULT: Self = Self::Medium;
     pub const LOWEST: Self = Self::Low;
     pub const HIGHEST: Self = Self::High;
+
+    pub const LEVELS: usize = Self::Constant as u8 as usize + 1;
 }

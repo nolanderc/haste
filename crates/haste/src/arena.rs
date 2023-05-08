@@ -120,6 +120,24 @@ impl<T> Arena<T> {
         unsafe { self.get_unchecked(index) }
     }
 
+    pub fn get_or_allocate_mut(&mut self, index: usize) -> &mut T
+    where
+        T: bytemuck::Zeroable,
+    {
+        self.ensure_in_bounds(index);
+        unsafe { self.get_unchecked_mut(index) }
+    }
+
+    /// # Safety
+    ///
+    /// The index must be in bounds.
+    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
+        unsafe { &mut *self.raw.as_ptr().cast::<T>().cast_mut().add(index) }
+    }
+
+    /// # Safety
+    ///
+    /// The index must be in bounds.
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         unsafe { &*self.raw.as_ptr().cast::<T>().add(index) }
     }

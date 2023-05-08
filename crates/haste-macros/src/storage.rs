@@ -57,6 +57,10 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                 fn container(&self) -> &<#types as haste::Element>::Container {
                     &self.#members
                 }
+
+                fn container_mut(&mut self) -> &mut <#types as haste::Element>::Container {
+                    &mut self.#members
+                }
             }
         )*
     });

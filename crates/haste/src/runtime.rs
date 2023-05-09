@@ -6,7 +6,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32},
     sync::{
         atomic::{
-            AtomicU64,
+            AtomicBool, AtomicU64,
             Ordering::{Acquire, Relaxed},
         },
         Arc, Mutex, Weak,
@@ -28,6 +28,8 @@ use crate::{
 
 use self::{cycle::CycleGraph, history::History};
 
+static BLOCKED_NANOS: AtomicU64 = AtomicU64::new(0);
+
 /// Smallest stack size to allocate for queries (in bytes).
 const MIN_STACK: usize = 32 * 1024 * 1024;
 
@@ -36,6 +38,8 @@ pub struct Runtime {
 
     cycles: CycleGraph,
     history: History,
+
+    running: AtomicBool,
 
     thread_scope: Option<Arc<ThreadScope>>,
     tasks: DashMap<ElementPath, Task>,
@@ -51,6 +55,7 @@ impl Runtime {
             stack_ids: StackIdAllocator::new(),
             cycles: CycleGraph::default(),
             history: History::new(),
+            running: AtomicBool::new(false),
             thread_scope: None,
             tasks: DashMap::with_capacity(1024),
             workers: Default::default(),
@@ -61,12 +66,14 @@ impl Runtime {
     pub(crate) unsafe fn enter(&mut self) {
         assert!(self.thread_scope.is_none(), "cannot nest scopes");
         self.thread_scope = Some(Arc::new(ThreadScope));
+        *self.running.get_mut() = true;
     }
 
     #[inline]
     pub(crate) unsafe fn exit(&mut self) {
         self.tasks.clear();
         std::mem::take(&mut self.workers);
+        *self.running.get_mut() = false;
         assert!(self.thread_scope.take().is_some(), "scope was not entered");
     }
 
@@ -339,6 +346,27 @@ impl Runtime {
         local.as_ref()
     }
 
+    pub fn drive(&self) {
+        while self.running.load(Relaxed) {
+            if let Some(query) = self.next_query() {
+                if let Some((_, task)) = self.tasks.remove(&query) {
+                    task.run(self);
+                }
+                continue;
+            }
+
+            self.wait_on_task(|| self.running.load(Relaxed));
+        }
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Relaxed);
+        self.wake_all();
+
+        let duration = std::time::Duration::from_nanos(BLOCKED_NANOS.load(Relaxed));
+        eprintln!("blocked: {:?}", duration);
+    }
+
     pub(crate) fn block_until_ready(
         &self,
         path: ElementPath,
@@ -375,23 +403,15 @@ impl Runtime {
             }
         }
 
-        // keep running other tasks until the query completes
+        // wait until the query completes
         {
-            let mut next_query = None;
             while !state.is_ready(self.current_revision(), Relaxed) {
-                if let Some(query) = next_query.take().or_else(|| self.next_query()) {
-                    if let Some((_, task)) = self.tasks.remove(&query) {
-                        task.run(self);
-                    }
-                    continue;
-                }
+                let validate = || state.set_blocking(Relaxed);
 
-                let validate = || {
-                    next_query = self.next_query();
-                    next_query.is_none() && state.set_blocking(Relaxed)
-                };
-
+                let start = std::time::Instant::now();
                 self.wait_on_query(state, validate);
+                let duration = start.elapsed();
+                BLOCKED_NANOS.fetch_add(duration.as_nanos() as u64, Relaxed);
             }
         }
 
@@ -409,8 +429,21 @@ impl Runtime {
 
     fn wait_on_query(&self, state: &SlotState, validate: impl FnOnce() -> bool) {
         let key = self as *const _ as usize;
-        let validate = || !state.is_ready(self.current_revision(), Relaxed) && validate();
         unsafe { parking_lot_core::park(key, validate, || {}, |_, _| {}, park_token(state), None) };
+    }
+
+    fn wait_on_task(&self, validate: impl FnOnce() -> bool) {
+        let key = self as *const _ as usize;
+        unsafe {
+            parking_lot_core::park(
+                key,
+                validate,
+                || {},
+                |_, _| {},
+                parking_lot_core::DEFAULT_PARK_TOKEN,
+                None,
+            )
+        };
     }
 
     fn wake_query(&self, state: &SlotState) {
@@ -430,7 +463,28 @@ impl Runtime {
     fn wake_one(&self) {
         let key = self as *const _ as usize;
         let callback = |_| parking_lot_core::DEFAULT_UNPARK_TOKEN;
-        unsafe { parking_lot_core::unpark_one(key, callback) };
+        let mut unparked = false;
+        unsafe {
+            parking_lot_core::unpark_filter(
+                key,
+                |token| {
+                    if unparked {
+                        parking_lot_core::FilterOp::Stop
+                    } else if token == parking_lot_core::DEFAULT_PARK_TOKEN {
+                        unparked = true;
+                        parking_lot_core::FilterOp::Unpark
+                    } else {
+                        parking_lot_core::FilterOp::Skip
+                    }
+                },
+                callback,
+            )
+        };
+    }
+
+    fn wake_all(&self) {
+        let key = self as *const _ as usize;
+        unsafe { parking_lot_core::unpark_all(key, parking_lot_core::DEFAULT_UNPARK_TOKEN) };
     }
 }
 

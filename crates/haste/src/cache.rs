@@ -91,7 +91,7 @@ impl<Q: Query> QueryCache<Q> {
         let claim = if claimed {
             ClaimResult::Claimed(None)
         } else {
-            slot.claim_blocking(runtime.current_stack(), runtime.current_revision())
+            slot.claim(runtime.current_stack(), runtime.current_revision())
         };
 
         let path = self.path(id);
@@ -127,7 +127,7 @@ impl<Q: Query> QueryCache<Q> {
             Some((stack, None))
         } else {
             let stack = runtime.allocate_stack();
-            match slot.claim_non_blocking(stack, runtime.current_revision()) {
+            match slot.claim(stack, runtime.current_revision()) {
                 ClaimResult::Ready | ClaimResult::Pending(_) => None,
                 ClaimResult::Claimed(last_verified) => Some((stack, last_verified)),
             }
@@ -283,16 +283,12 @@ impl<Q: Query> Slot<Q> {
         unsafe { &*self.state.get() }
     }
 
-    fn claim_blocking(&self, stack: StackId, revision: Revision) -> ClaimResult {
-        self.state().claim(stack, revision, true)
-    }
-
-    fn claim_non_blocking(&self, stack: StackId, revision: Revision) -> ClaimResult {
-        self.state().claim(stack, revision, false)
+    fn claim(&self, stack: StackId, revision: Revision) -> ClaimResult {
+        self.state().claim(stack, revision)
     }
 
     pub(crate) fn wait_output(&self, dependency: Dependency, runtime: &Runtime) -> &Q::Output {
-        match self.claim_blocking(runtime.current_stack(), runtime.current_revision()) {
+        match self.claim(runtime.current_stack(), runtime.current_revision()) {
             ClaimResult::Ready => {}
             ClaimResult::Pending(claimant) => {
                 runtime.block_until_ready(dependency.query(), claimant, self.state())

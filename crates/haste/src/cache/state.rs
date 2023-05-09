@@ -77,7 +77,7 @@ impl SlotState {
         state.last_verified() >= Some(revision)
     }
 
-    pub(super) fn claim(&self, stack: StackId, revision: Revision, block: bool) -> ClaimResult {
+    pub(super) fn claim(&self, stack: StackId, revision: Revision) -> ClaimResult {
         let mut state = decode(self.bits.load(Acquire));
 
         loop {

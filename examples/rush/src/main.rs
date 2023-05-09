@@ -23,16 +23,8 @@ fn main() {
         let text = Text::insert(db, TextData("hello".into()));
         assert_eq!(format!("{:?}", text.debug(db)), "\"hello\"");
 
-        let n = 2000;
-        let threads = 8;
-
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                for _ in 0..threads {
-                    binom(db, n, n / 2);
-                }
-            });
-        });
+        let n = 1000;
+        binom(db, n, n / 2);
     });
     let duration = start.elapsed();
     let count = COUNT.load(std::sync::atomic::Ordering::Relaxed);

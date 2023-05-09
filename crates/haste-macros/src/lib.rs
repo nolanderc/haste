@@ -1,10 +1,10 @@
 extern crate proc_macro;
 
 mod database;
+mod debug_with;
 mod intern;
 mod query;
 mod storage;
-mod debug_with;
 mod util;
 
 use std::cell::Cell;

@@ -388,8 +388,9 @@ impl Runtime {
 
                 let validate = || {
                     next_query = self.next_query();
-                    next_query.is_none()
+                    next_query.is_none() && state.set_blocking(Relaxed)
                 };
+
                 self.wait_on_query(state, validate);
             }
         }

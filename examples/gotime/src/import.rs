@@ -1,6 +1,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bstr::{BStr, ByteSlice};
+use haste::DisplayWith;
 use smallvec::SmallVec;
 
 use crate::{
@@ -9,18 +10,18 @@ use crate::{
     path::{NormalPath, NormalPathData},
     process,
     span::{FileRange, Span},
-    syntax,
-    util::future::{FutureExt, IteratorExt},
+    syntax, util,
+    util::TaskExt,
     Result, Storage,
 };
 
-pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<Vec<FileSet>> {
+pub fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<Vec<FileSet>> {
     let mut resolved = Vec::with_capacity(ast.imports.len());
 
-    let parent = ast.source.absolute(db).parent().unwrap();
-    let parent = NormalPath::new(db, parent).await?;
+    let parent = ast.source.lookup(db).absolute.parent().unwrap();
+    let parent = NormalPath::new(db, parent)?;
 
-    let go_mod = closest_go_mod(db, parent).await?;
+    let go_mod = closest_go_mod(db, parent)?;
     for import in ast.imports.iter() {
         resolved.push(
             resolve::spawn(db, import.path.text, go_mod).with_context(|error| {
@@ -30,22 +31,20 @@ pub async fn resolve_imports(db: &dyn crate::Db, ast: &syntax::File) -> Result<V
         );
     }
 
-    resolved.try_join_all().await
+    util::try_join_all(resolved)
 }
 
-#[haste::query]
-#[clone]
-pub async fn resolve(
+#[haste::query(clone)]
+pub fn resolve(
     db: &dyn crate::Db,
     import_name: Text,
     go_mod: Option<NormalPath>,
 ) -> Result<FileSet> {
-    resolve_impl(db, import_name, go_mod).await
+    resolve_impl(db, import_name, go_mod)
 }
 
-#[allow(clippy::needless_lifetimes)]
-pub async fn resolve_impl<'db>(
-    db: &'db dyn crate::Db,
+pub fn resolve_impl(
+    db: &dyn crate::Db,
     import_name: Text,
     go_mod: Option<NormalPath>,
 ) -> Result<FileSet> {
@@ -53,68 +52,65 @@ pub async fn resolve_impl<'db>(
 
     let mut checked_candidates = SmallVec::<[_; 8]>::new();
 
-    let mut try_candidate = |db: &'db dyn crate::Db, candidate: NormalPathData| {
+    let mut try_candidate = |db: &dyn crate::Db, candidate: NormalPathData| {
         let path = NormalPath::insert(db, candidate);
         checked_candidates.push(path);
-
-        async move {
-            if fs::is_dir(db, path).await {
-                Some(FileSet::insert(db, FileSetData::Directory(path)))
-            } else {
-                None
-            }
+        if fs::is_dir(db, path) {
+            Some(FileSet::insert(db, FileSetData::Directory(path)))
+        } else {
+            None
         }
     };
 
     // check the standard library first
-    let goroot = crate::process::go_var_path(db, "GOROOT").await?;
+    let goroot = crate::process::go_var_path(db, "GOROOT")?;
     let std_lib = goroot.join("src").join(name);
-    if let Some(files) = try_candidate(db, NormalPathData::new(db, &std_lib).await?).await {
+    if let Some(files) = try_candidate(db, NormalPathData::new(db, &std_lib)?) {
         return Ok(files);
     }
 
     // then vendored dependencies
     let mut vendor_candidate = go_mod;
     while let Some(mod_path) = vendor_candidate.take() {
-        let mod_dir = mod_path.absolute(db).parent().unwrap();
+        let mod_dir = mod_path.lookup(db).absolute.parent().unwrap();
 
         // maybe it is a submodule?
-        if let Some(module_name) = module_name(db, mod_path).await? {
+        if let Some(module_name) = module_name(db, mod_path)? {
             if let Some(suffix) = name.strip_prefix(module_name.get(db)) {
                 let suffix = suffix.trim_start_matches('/');
                 let sub_dir = mod_dir.join(suffix);
-                let candidate = NormalPathData::new(db, &sub_dir).await?;
-                if let Some(files) = try_candidate(db, candidate).await {
+                let candidate = NormalPathData::new(db, &sub_dir)?;
+                if let Some(files) = try_candidate(db, candidate) {
                     return Ok(files);
                 }
             }
         }
 
         let vendor_path = mod_dir.join("vendor").join(name);
-        let candidate = NormalPathData::new(db, &vendor_path).await?;
-        if let Some(files) = try_candidate(db, candidate).await {
+        let candidate = NormalPathData::new(db, &vendor_path)?;
+        if let Some(files) = try_candidate(db, candidate) {
             return Ok(files);
         }
 
         if let Some(parent) = mod_dir.parent() {
-            let parent = NormalPath::new(db, parent).await?;
-            vendor_candidate = closest_go_mod(db, parent).await?;
+            let parent = NormalPath::new(db, parent)?;
+            vendor_candidate = closest_go_mod(db, parent)?;
         }
     }
 
     // and GOPATH last (if coming from the standard library we don't want to reduce the query's
     // durability by depending on files outside the root directory)
-    let gopath = crate::process::go_var_path(db, "GOPATH").await?;
+    let gopath = crate::process::go_var_path(db, "GOPATH")?;
     let lib_path = gopath.join("src").join(name);
-    if let Some(files) = try_candidate(db, NormalPathData::new(db, &lib_path).await?).await {
+    if let Some(files) = try_candidate(db, NormalPathData::new(db, &lib_path)?) {
         return Ok(files);
     }
 
-    let mut error = error!("could not resolve the module `{import_name}`");
+    let mut error = error!("could not resolve the module `{}`", import_name.display(db));
     error = error.help("make sure that all dependencies are vendored using `go mod vendor`");
 
     for candidate in checked_candidates {
-        error = error.note(format!("not found in `{}`", candidate));
+        error = error.note(format!("not found in `{}`", candidate.lookup(db)));
     }
 
     Err(error)
@@ -122,7 +118,7 @@ pub async fn resolve_impl<'db>(
 
 /// In case our logic fails to resolve an import we fall back to the reference Go compiler.
 #[allow(dead_code)]
-async fn resolve_import_go_list(
+fn resolve_import_go_list(
     db: &dyn crate::Db,
     name: &str,
     go_mod: Option<NormalPath>,
@@ -133,37 +129,35 @@ async fn resolve_import_go_list(
         dir: PathBuf,
     }
 
-    let mod_dir = match go_mod.and_then(|path| path.absolute(db).parent()) {
-        Some(path) => Some(NormalPath::new(db, path).await?),
+    let mod_dir = match go_mod.and_then(|path| path.lookup(db).absolute.parent()) {
+        Some(path) => Some(NormalPath::new(db, path)?),
         None => None,
     };
-    let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_dir).await?;
+    let output = crate::process::go(db, ["list", "-find", "-json", "--", name], mod_dir)?;
     let pkg: GoListPackage = serde_json::from_slice(output).unwrap();
 
-    let dir_path = NormalPath::new(db, &pkg.dir).await?;
+    let dir_path = NormalPath::new(db, &pkg.dir)?;
     Ok(FileSet::insert(db, FileSetData::Directory(dir_path)))
 }
 
-#[haste::query]
-#[clone]
-pub async fn closest_go_mod(db: &dyn crate::Db, path: NormalPath) -> Result<Option<NormalPath>> {
-    let absolute = path.absolute(db);
+#[haste::query(clone)]
+pub fn closest_go_mod(db: &dyn crate::Db, path: NormalPath) -> Result<Option<NormalPath>> {
+    let absolute = &path.lookup(db).absolute;
 
-    let mod_path = NormalPath::new(db, &absolute.join("go.mod")).await?;
-    if fs::is_file(db, mod_path).await {
+    let mod_path = NormalPath::new(db, &absolute.join("go.mod"))?;
+    if fs::is_file(db, mod_path) {
         return Ok(Some(mod_path));
     }
 
     let Some(parent) = absolute.parent() else { return Ok(None) };
 
-    let parent_path = NormalPath::new(db, parent).await?;
-    closest_go_mod(db, parent_path).await
+    let parent_path = NormalPath::new(db, parent)?;
+    closest_go_mod(db, parent_path)
 }
 
-#[haste::query]
-#[clone]
-pub async fn module_name(db: &dyn crate::Db, path: NormalPath) -> Result<Option<Text>> {
-    let bytes = fs::read(db, path).await.as_ref()?;
+#[haste::query(clone)]
+pub fn module_name(db: &dyn crate::Db, path: NormalPath) -> Result<Option<Text>> {
+    let bytes = fs::read(db, path).as_ref()?;
 
     for line in bytes.lines() {
         let line = line.trim_start();
@@ -200,29 +194,27 @@ impl std::fmt::Debug for FileSetData {
 }
 
 impl FileSetData {
-    pub async fn sources(&self, db: &dyn crate::Db) -> Result<Arc<[NormalPath]>> {
+    pub fn sources(&self, db: &dyn crate::Db) -> Result<Arc<[NormalPath]>> {
         match self {
             FileSetData::Sources(sources) => Ok(sources.clone()),
-            FileSetData::Directory(dir_path) => sources_in_dir(db, *dir_path).await,
+            FileSetData::Directory(dir_path) => sources_in_dir(db, *dir_path),
         }
     }
 
-    pub async fn parse<'db>(&self, db: &'db dyn crate::Db) -> Result<Vec<&'db syntax::File>> {
-        self.sources(db)
-            .await?
-            .iter()
-            .map(|path| syntax::parse_file(db, *path))
-            .try_join_all()
-            .await
+    pub fn parse<'db>(&self, db: &'db dyn crate::Db) -> Result<Vec<&'db syntax::File>> {
+        util::try_join_all(
+            self.sources(db)?
+                .iter()
+                .map(|path| syntax::parse_file::spawn(db, *path)),
+        )
     }
 }
 
-#[haste::query]
-#[clone]
-pub async fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Result<FileSet> {
+#[haste::query(clone)]
+pub fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Result<FileSet> {
     assert!(!files.is_empty());
 
-    let data = if files.len() == 1 && fs::is_dir(db, files[0]).await {
+    let data = if files.len() == 1 && fs::is_dir(db, files[0]) {
         FileSetData::Directory(files[0])
     } else {
         let key = |path: &NormalPath| path.lookup(db);
@@ -247,43 +239,45 @@ pub async fn file_set(db: &dyn crate::Db, mut files: Arc<[NormalPath]>) -> Resul
     Ok(FileSet::insert(db, data))
 }
 
-#[haste::query]
-#[clone]
-pub async fn sources_in_dir(db: &dyn crate::Db, dir: NormalPath) -> Result<Arc<[NormalPath]>> {
-    let entries = fs::list_dir(db, dir).await.as_deref()?;
+#[haste::query(clone)]
+pub fn sources_in_dir(db: &dyn crate::Db, dir: NormalPath) -> Result<Arc<[NormalPath]>> {
+    let entries = fs::list_dir(db, dir).as_deref()?;
 
     let mut sources = Vec::with_capacity(entries.len());
     for &entry in entries {
-        if is_enabled_source_file(db, entry).await? {
+        if is_enabled_source_file(db, entry)? {
             sources.push(entry);
         }
     }
 
     if sources.is_empty() {
-        return Err(error!("no applicable source files found in `{dir}`",));
+        return Err(error!(
+            "no applicable source files found in `{}`",
+            dir.lookup(db)
+        ));
     }
 
     Ok(Arc::from(sources))
 }
 
-pub async fn is_enabled_source_file(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
-    if !is_go_source_file(db, path).await {
+pub fn is_enabled_source_file(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
+    if !is_go_source_file(db, path) {
         return Ok(false);
     }
 
-    if !is_source_enabled(db, path).await? {
+    if !is_source_enabled(db, path)? {
         return Ok(false);
     }
 
     Ok(true)
 }
 
-async fn is_go_source_file(db: &dyn crate::Db, path: NormalPath) -> bool {
+fn is_go_source_file(db: &dyn crate::Db, path: NormalPath) -> bool {
     let Some(extension) = path.extension(db) else { return false };
-    extension == "go" && fs::is_file(db, path).await
+    extension == "go" && fs::is_file(db, path)
 }
 
-async fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
+fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool> {
     let Some(stem) = path.file_stem(db) else { return Ok(false) };
     let name = stem.to_string_lossy();
     let name_bytes = name.as_bytes();
@@ -292,11 +286,11 @@ async fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool>
         return Ok(false);
     }
 
-    if !is_file_tag_enabled(db, &name).await? {
+    if !is_file_tag_enabled(db, &name)? {
         return Ok(false);
     }
 
-    let header = fs::read_header(db, path).await.as_ref()?;
+    let header = fs::read_header(db, path).as_ref()?;
     let constraints = match build_constraints(header) {
         Ok(constraints) => constraints,
         Err(offset) => {
@@ -312,7 +306,7 @@ async fn is_source_enabled(db: &dyn crate::Db, path: NormalPath) -> Result<bool>
     };
 
     if let Some(constraint) = constraints {
-        if !constraint.is_satisfied(db).await? {
+        if !constraint.is_satisfied(db)? {
             return Ok(false);
         }
     }
@@ -370,7 +364,7 @@ impl<'a> BuildConstraint<'a> {
         }
     }
 
-    async fn is_satisfied(&self, db: &dyn crate::Db) -> Result<bool> {
+    fn is_satisfied(&self, db: &dyn crate::Db) -> Result<bool> {
         let mut tags = Vec::new();
         self.populate_tags(&mut tags);
 
@@ -379,7 +373,7 @@ impl<'a> BuildConstraint<'a> {
 
         let mut satisfied_tags = HashSet::with_capacity(tags.len());
         for tag in tags {
-            if build_tag_enabled(db, &tag.to_str_lossy()).await? {
+            if build_tag_enabled(db, &tag.to_str_lossy())? {
                 satisfied_tags.insert(tag);
             }
         }
@@ -462,7 +456,7 @@ fn build_constraints(header: &str) -> Result<Option<BuildConstraint>, usize> {
     Ok(constraint)
 }
 
-async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
+fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
     let mut parts = name.split('_');
 
     // skip the name of the file
@@ -483,7 +477,7 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
 
     if GOOS_LIST.contains(&last) {
         // must be case (1)
-        return build_tag_enabled(db, last).await;
+        return build_tag_enabled(db, last);
     }
 
     if !GOARCH_LIST.contains(&last) {
@@ -491,7 +485,7 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    if !build_tag_enabled(db, last).await? {
+    if !build_tag_enabled(db, last)? {
         // case (2) and (3): the ARCH is not enabled
         return Ok(false);
     }
@@ -499,14 +493,14 @@ async fn is_file_tag_enabled(db: &dyn crate::Db, name: &str) -> Result<bool> {
     if let Some(first) = first {
         if GOOS_LIST.contains(&first) {
             // check case (3)
-            return build_tag_enabled(db, first).await;
+            return build_tag_enabled(db, first);
         }
     }
 
     Ok(true)
 }
 
-async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
+fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
     if tag == "gc" {
         // we pretend to be the reference Go Compiler (GC)
         return Ok(true);
@@ -524,7 +518,7 @@ async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
         }
     }
 
-    let goos = process::go_var(db, "GOOS").await.as_ref()?;
+    let goos = process::go_var(db, "GOOS").as_ref()?;
     if tag == goos
         || (tag == "linux" && goos == "android")
         || (tag == "solaris" && goos == "illumos")
@@ -533,7 +527,7 @@ async fn build_tag_enabled(db: &dyn crate::Db, tag: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    let goarch = process::go_var(db, "GOARCH").await.as_ref()?;
+    let goarch = process::go_var(db, "GOARCH").as_ref()?;
     if tag == goarch {
         return Ok(true);
     }

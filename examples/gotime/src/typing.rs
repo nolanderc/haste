@@ -4,7 +4,6 @@ mod eval;
 use std::sync::Arc;
 
 use bstr::BStr;
-use futures::future::BoxFuture;
 use smallvec::SmallVec;
 
 use crate::{
@@ -35,7 +34,7 @@ pub struct Storage(
 );
 
 #[haste::intern(Type)]
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Untyped(ConstantKind),
 
@@ -183,12 +182,9 @@ impl TypeKind {
         }
     }
 
-    pub async fn underlying_class(&self, db: &dyn crate::Db) -> Result<TypeClass> {
+    pub fn underlying_class(&self, db: &dyn crate::Db) -> Result<TypeClass> {
         if let Self::Declared(decl) = self {
-            Ok(underlying_type_for_decl(db, *decl)
-                .await?
-                .lookup(db)
-                .class())
+            Ok(underlying_type_for_decl(db, *decl)?.lookup(db).class())
         } else {
             Ok(self.class())
         }
@@ -230,11 +226,8 @@ impl TypeKind {
         matches!(self, TypeKind::Untyped(ConstantKind::Nil))
     }
 
-    pub async fn is_nillable(&self, db: &dyn crate::Db) -> Result<bool> {
-        Ok(self
-            .underlying_class(db)
-            .await?
-            .contains(TypeClass::NILLABLE))
+    pub fn is_nillable(&self, db: &dyn crate::Db) -> Result<bool> {
+        Ok(self.underlying_class(db)?.contains(TypeClass::NILLABLE))
     }
 
     pub fn is_ordered(&self) -> bool {
@@ -245,11 +238,11 @@ impl TypeKind {
         self.class().contains(TypeClass::UNTYPED)
     }
 
-    pub async fn length(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
+    pub fn length(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
         let mut kind = self;
 
         if let &TypeKind::Pointer(inner) = kind {
-            let inner_core = underlying_type(db, inner).await?;
+            let inner_core = underlying_type(db, inner)?;
             let inner_kind = inner_core.lookup(db);
             if let TypeKind::Array(_, _) = inner_kind {
                 kind = inner_kind;
@@ -269,11 +262,11 @@ impl TypeKind {
         }))
     }
 
-    pub async fn capacity(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
+    pub fn capacity(&self, db: &dyn crate::Db) -> Result<Option<Type>> {
         let mut kind = self;
 
         if let &TypeKind::Pointer(inner) = kind {
-            let inner_core = underlying_type(db, inner).await?;
+            let inner_core = underlying_type(db, inner)?;
             let inner_kind = inner_core.lookup(db);
             if let TypeKind::Array(_, _) = inner_kind {
                 kind = inner_kind;
@@ -333,12 +326,7 @@ impl Type {
         Self::insert(db, TypeKind::Untyped(ConstantKind::Boolean))
     }
 
-    pub fn structural_eq_boxed(self, db: &dyn crate::Db, other: Type) -> BoxFuture<Result<bool>> {
-        use futures::FutureExt;
-        self.structurally_equivalent(db, other).boxed()
-    }
-
-    pub async fn structurally_equivalent(self, db: &dyn crate::Db, other: Type) -> Result<bool> {
+    pub fn structurally_equivalent(self, db: &dyn crate::Db, other: Type) -> Result<bool> {
         if self == other {
             return Ok(true);
         }
@@ -347,10 +335,10 @@ impl Type {
         let mut other_kind = self.lookup(db);
 
         if let TypeKind::Declared(decl) = self_kind {
-            self_kind = underlying_type_for_decl(db, *decl).await?.lookup(db);
+            self_kind = underlying_type_for_decl(db, *decl)?.lookup(db);
         }
         if let TypeKind::Declared(decl) = other_kind {
-            other_kind = underlying_type_for_decl(db, *decl).await?.lookup(db);
+            other_kind = underlying_type_for_decl(db, *decl)?.lookup(db);
         }
 
         match (self_kind, other_kind) {
@@ -360,7 +348,7 @@ impl Type {
                 }
 
                 for (a, b) in a.fields.iter().zip(b.fields.iter()) {
-                    if !(a.name == b.name && a.typ.structural_eq_boxed(db, b.typ).await?) {
+                    if !(a.name == b.name && a.typ.structurally_equivalent(db, b.typ)?) {
                         return Ok(false);
                     }
                 }
@@ -368,17 +356,16 @@ impl Type {
                 Ok(true)
             }
 
-            (TypeKind::Pointer(a), TypeKind::Pointer(b)) => a.structural_eq_boxed(db, *b).await,
-            (TypeKind::Slice(a), TypeKind::Slice(b)) => a.structural_eq_boxed(db, *b).await,
-            (TypeKind::Map(a_key, a_value), TypeKind::Map(b_key, b_value)) => {
-                Ok(a_key.structural_eq_boxed(db, *b_key).await?
-                    && a_value.structural_eq_boxed(db, *b_value).await?)
-            }
+            (TypeKind::Pointer(a), TypeKind::Pointer(b)) => a.structurally_equivalent(db, *b),
+            (TypeKind::Slice(a), TypeKind::Slice(b)) => a.structurally_equivalent(db, *b),
+            (TypeKind::Map(a_key, a_value), TypeKind::Map(b_key, b_value)) => Ok(a_key
+                .structurally_equivalent(db, *b_key)?
+                && a_value.structurally_equivalent(db, *b_value)?),
             (TypeKind::Channel(a_kind, a), TypeKind::Channel(b_kind, b)) => {
-                Ok(a_kind == b_kind && a.structural_eq_boxed(db, *b).await?)
+                Ok(a_kind == b_kind && a.structurally_equivalent(db, *b)?)
             }
             (TypeKind::Array(a_len, a), TypeKind::Array(b_len, b)) => {
-                Ok(a_len == b_len && a.structural_eq_boxed(db, *b).await?)
+                Ok(a_len == b_len && a.structurally_equivalent(db, *b)?)
             }
 
             _ => Ok(false),
@@ -567,17 +554,23 @@ impl std::fmt::Display for BuiltinFunction {
 
 pub type TypeList = SmallVec<[Type; 4]>;
 
-impl std::fmt::Debug for TypeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+impl haste::DebugWith<dyn crate::Db + '_> for TypeKind {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        haste::DisplayWith::fmt(self, db, f)
     }
 }
 
-impl std::fmt::Display for TypeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl haste::DisplayWith<dyn crate::Db + '_> for Type {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        haste::DisplayWith::fmt(self.lookup(db), db, f)
+    }
+}
+
+impl haste::DisplayWith<dyn crate::Db + '_> for TypeKind {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TypeKind::Untyped(untyped) => match untyped.default_type() {
-                Some(typ) => typ.fmt(f),
+                Some(typ) => typ.fmt(db, f),
                 None => write!(f, "nil"),
             },
             TypeKind::Builtin(builtin) => write!(f, "builtin[{:?}]", builtin),
@@ -598,35 +591,44 @@ impl std::fmt::Display for TypeKind {
             TypeKind::Complex64 => write!(f, "complex64"),
             TypeKind::Complex128 => write!(f, "complex128"),
             TypeKind::String => write!(f, "string"),
-            TypeKind::Pointer(inner) => write!(f, "*{inner}"),
-            TypeKind::Slice(inner) => write!(f, "[]{inner}"),
-            TypeKind::Array(len, inner) => write!(f, "[{len}]{inner}"),
-            TypeKind::Map(key, value) => write!(f, "map[{key}]{value}"),
-            TypeKind::Channel(syntax::ChannelKind::SendRecv, inner) => write!(f, "chan {inner}"),
-            TypeKind::Channel(syntax::ChannelKind::Send, inner) => write!(f, "chan<- {inner}"),
-            TypeKind::Channel(syntax::ChannelKind::Recv, inner) => write!(f, "<-chan {inner}"),
-            TypeKind::Function(func) => func.fmt(f),
-            TypeKind::Struct(strukt) => strukt.fmt(f),
-            TypeKind::Interface(interface) => interface.fmt(f),
-            TypeKind::Declared(decl) => decl.fmt(f),
+            TypeKind::Pointer(inner) => write!(f, "*{}", inner.display(db)),
+            TypeKind::Slice(inner) => write!(f, "[]{}", inner.display(db)),
+            TypeKind::Array(len, inner) => write!(f, "[{len}]{}", inner.display(db)),
+            TypeKind::Map(key, value) => write!(f, "map[{}]{}", key.display(db), value.display(db)),
+            TypeKind::Channel(syntax::ChannelKind::SendRecv, inner) => {
+                write!(f, "chan {}", inner.display(db))
+            }
+            TypeKind::Channel(syntax::ChannelKind::Send, inner) => {
+                write!(f, "chan<- {}", inner.display(db))
+            }
+            TypeKind::Channel(syntax::ChannelKind::Recv, inner) => {
+                write!(f, "<-chan {}", inner.display(db))
+            }
+            TypeKind::Function(func) => func.fmt(db, f),
+            TypeKind::Struct(strukt) => strukt.fmt(db, f),
+            TypeKind::Interface(interface) => interface.fmt(db, f),
+            TypeKind::Declared(decl) => decl.fmt(db, f),
         }
     }
 }
 
-impl std::fmt::Display for FunctionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_with_name(f, None)
+impl haste::DisplayWith<dyn crate::Db + '_> for FunctionType {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_with_name(db, f, None)
     }
 }
 
 impl FunctionType {
     fn fmt_with_name(
         &self,
+        db: &dyn crate::Db,
         f: &mut std::fmt::Formatter<'_>,
         name: Option<Text>,
     ) -> std::fmt::Result {
+        use haste::DisplayWith;
+
         if let Some(name) = name {
-            write!(f, "func {name}(")?;
+            write!(f, "func {}(", name.display(db))?;
         } else {
             write!(f, "func(")?;
         }
@@ -638,20 +640,20 @@ impl FunctionType {
             if self.variadic && i == self.inputs - 1 {
                 write!(f, "...")?;
             }
-            write!(f, "{}", self.types[i])?;
+            write!(f, "{}", self.types[i].display(db))?;
         }
         write!(f, ")")?;
 
         match self.outputs() {
             [] => {}
-            [single] => write!(f, " {single}")?,
+            [single] => write!(f, " {}", single.display(db))?,
             outputs => {
                 write!(f, " (")?;
                 for (i, output) in outputs.iter().enumerate() {
                     if i != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", output)?;
+                    write!(f, "{}", output.display(db))?;
                 }
                 write!(f, ")")?;
             }
@@ -660,8 +662,8 @@ impl FunctionType {
     }
 }
 
-impl std::fmt::Display for StructType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl haste::DisplayWith<dyn crate::Db + '_> for StructType {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "struct {{")?;
 
         for (i, field) in self.fields.iter().enumerate() {
@@ -672,15 +674,15 @@ impl std::fmt::Display for StructType {
             }
 
             if field.embedded {
-                write!(f, "{}", field.typ)?;
+                write!(f, "{}", field.typ.display(db))?;
             } else if let Some(name) = field.name {
-                write!(f, "{} {}", name, field.typ)?;
+                write!(f, "{} {}", name.display(db), field.typ.display(db))?;
             } else {
-                write!(f, "_ {}", field.typ)?;
+                write!(f, "_ {}", field.typ.display(db))?;
             }
 
             if let Some(tag) = field.tag {
-                write!(f, " {:?}", tag)?;
+                write!(f, " {:?}", haste::DebugWith::debug(&tag, db))?;
             }
         }
 
@@ -692,8 +694,8 @@ impl std::fmt::Display for StructType {
     }
 }
 
-impl std::fmt::Display for InterfaceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl haste::DisplayWith<dyn crate::Db + '_> for InterfaceType {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Error => write!(f, "error"),
             Self::Methods(methods) => {
@@ -710,7 +712,7 @@ impl std::fmt::Display for InterfaceType {
                         write!(f, "; ")?;
                     }
 
-                    method.signature.fmt_with_name(f, Some(method.name))?;
+                    method.signature.fmt_with_name(db, f, Some(method.name))?;
                 }
 
                 write!(f, " }}")
@@ -750,19 +752,17 @@ impl InferredType {
 }
 
 /// Get the type of the given symbol
-pub async fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Result<Signature> {
+pub fn signature(db: &dyn crate::Db, symbol: naming::GlobalSymbol) -> Result<Signature> {
     match symbol {
         naming::GlobalSymbol::Package(package) => Ok(Signature::Package(package)),
         naming::GlobalSymbol::Builtin(builtin) => Ok(builtin_signature(db, builtin)),
-        naming::GlobalSymbol::Decl(decl) => decl_signature(db, decl).await,
+        naming::GlobalSymbol::Decl(decl) => decl_signature(db, decl),
     }
 }
 
-#[haste::query]
-#[clone]
-#[lookup(haste::query_cache::TrackedStrategy)]
-pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
-    let mut ctx = TypingContext::new(db, decl).await?;
+#[haste::query(clone)]
+pub fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signature> {
+    let mut ctx = TypingContext::new(db, decl)?;
     let path = ctx.path;
 
     let declaration = &ctx.ast.declarations[path.index];
@@ -773,20 +773,20 @@ pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signatur
             Ok(Signature::Type(inner))
         }
         naming::SingleDecl::TypeAlias(spec) => {
-            let inner = ctx.resolve_precise(spec.inner).await?;
+            let inner = ctx.resolve_precise(spec.inner)?;
             Ok(Signature::Type(inner))
         }
 
         naming::SingleDecl::VarDecl(_, Some(typ), _)
         | naming::SingleDecl::ConstDecl(_, Some(typ), _) => {
-            ctx.resolve_precise(typ).await.map(Signature::Value)
+            ctx.resolve_precise(typ).map(Signature::Value)
         }
 
         naming::SingleDecl::ConstDecl(_, _, expr) => {
-            let typ = match ctx.try_infer_expr_no_check(expr).await? {
+            let typ = match ctx.try_infer_expr_no_check(expr)? {
                 Some(typ) => typ,
                 None => {
-                    let typing = type_check_body(db, decl).await.as_ref()?;
+                    let typing = type_check_body(db, decl).as_ref()?;
                     typing.nodes[&expr.node].value()
                 }
             };
@@ -794,10 +794,10 @@ pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signatur
         }
 
         naming::SingleDecl::VarDecl(_, _, Some(AssignmentExpr::Single(expr))) => {
-            let typ = match ctx.try_infer_expr_no_check(expr).await? {
+            let typ = match ctx.try_infer_expr_no_check(expr)? {
                 Some(typ) => typ,
                 None => {
-                    let typing = type_check_body(db, decl).await.as_ref()?;
+                    let typing = type_check_body(db, decl).as_ref()?;
                     typing.nodes[&expr.node].value()
                 }
             };
@@ -809,7 +809,7 @@ pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signatur
         }
 
         naming::SingleDecl::VarDecl(_, _, Some(AssignmentExpr::Destruct(expr))) => {
-            let types = ctx.infer_assignment(expr).await?;
+            let types = ctx.infer_assignment(expr)?;
             let typ = match types.get(path.sub.col as usize).copied() {
                 Some(typ) => typ,
                 None => {
@@ -840,7 +840,7 @@ pub async fn decl_signature(db: &dyn crate::Db, decl: DeclId) -> Result<Signatur
         )),
 
         naming::SingleDecl::Function(func) | naming::SingleDecl::Method(func) => {
-            let func = ctx.resolve_signature(func.signature).await?;
+            let func = ctx.resolve_signature(func.signature)?;
             Ok(Signature::Value(TypeKind::Function(func).insert(db)))
         }
     }
@@ -911,37 +911,38 @@ pub struct TypingInfo {
 /// Type-check the entire symbol, returning the types of all applicable syntax nodes (types and
 /// expressions).
 #[haste::query]
-#[lookup(haste::query_cache::TrackedStrategy)]
-pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingInfo> {
-    let mut ctx = TypingContext::new(db, decl).await?;
+pub fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingInfo> {
+    use haste::DisplayWith;
+
+    let mut ctx = TypingContext::new(db, decl)?;
     let path = ctx.path;
 
     let declaration = &ctx.ast.declarations[path.index];
 
     match path.sub.lookup_in(declaration) {
         naming::SingleDecl::TypeDef(spec) | naming::SingleDecl::TypeAlias(spec) => {
-            ctx.resolve_precise(spec.inner).await?;
+            ctx.resolve_precise(spec.inner)?;
             ctx.finish()
         }
 
         naming::SingleDecl::VarDecl(_, typ, Some(AssignmentExpr::Single(expr)))
         | naming::SingleDecl::ConstDecl(_, typ, expr) => {
             if let Some(typ) = typ {
-                let actual_type = ctx.resolve_type(typ).await?;
-                ctx.check_expr(expr, actual_type).await?;
+                let actual_type = ctx.resolve_type(typ)?;
+                ctx.check_expr(expr, actual_type)?;
             } else {
-                ctx.infer_expr(expr).await?;
+                ctx.infer_expr(expr)?;
             }
             ctx.finish()
         }
 
         naming::SingleDecl::VarDecl(_, typ, Some(AssignmentExpr::Destruct(expr))) => {
             let expected = match typ {
-                Some(typ) => Some(ctx.resolve_type(typ).await?),
+                Some(typ) => Some(ctx.resolve_type(typ)?),
                 None => None,
             };
 
-            let types = ctx.infer_assignment(expr).await?;
+            let types = ctx.infer_assignment(expr)?;
             let mut found_type = match types.get(path.sub.col as usize).copied() {
                 Some(typ) => typ,
                 None => {
@@ -966,11 +967,14 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
                     return Err(error!("type mismatch in variable declaration")
                         .label(
                             path.span_in_ast(ctx.ast),
-                            format!("expected value of type `{expected}`"),
+                            format!("expected value of type `{}`", expected.display(db)),
                         )
                         .label(
                             ctx.node_span(expr),
-                            format!("found multi-valued expression of type `{found_type}`"),
+                            format!(
+                                "found multi-valued expression of type `{}`",
+                                found_type.display(db)
+                            ),
                         ));
                 }
             }
@@ -983,7 +987,7 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
         }
 
         naming::SingleDecl::VarDecl(_, Some(typ), None) => {
-            ctx.resolve_type(typ).await?;
+            ctx.resolve_type(typ)?;
             ctx.finish()
         }
 
@@ -997,42 +1001,38 @@ pub async fn type_check_body(db: &dyn crate::Db, decl: DeclId) -> Result<TypingI
 
         naming::SingleDecl::Function(func) | naming::SingleDecl::Method(func) => {
             if let Some(body) = func.body {
-                ctx.check_function(func.signature, body).await?;
+                ctx.check_function(func.signature, body)?;
             } else {
-                ctx.resolve_signature(func.signature).await?;
+                ctx.resolve_signature(func.signature)?;
             }
             ctx.finish()
         }
     }
 }
 
-async fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
+fn underlying_type(db: &dyn crate::Db, typ: Type) -> Result<Type> {
     match typ.lookup(db) {
-        &TypeKind::Declared(decl) => underlying_type_for_decl(db, decl).await,
+        &TypeKind::Declared(decl) => underlying_type_for_decl(db, decl),
         _ => Ok(typ),
     }
 }
 
-#[haste::query]
-#[clone]
-#[lookup(haste::query_cache::TrackedStrategy)]
-async fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
-    let inner = inner_type_for_decl(db, decl).await?;
-    underlying_type(db, inner).await
+#[haste::query(clone)]
+fn underlying_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
+    let inner = inner_type_for_decl(db, decl)?;
+    underlying_type(db, inner)
 }
 
-#[haste::query]
-#[clone]
-#[lookup(haste::query_cache::TrackedStrategy)]
-async fn inner_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
-    let mut ctx = TypingContext::new(db, decl).await?;
+#[haste::query(clone)]
+fn inner_type_for_decl(db: &dyn crate::Db, decl: DeclId) -> Result<Type> {
+    let mut ctx = TypingContext::new(db, decl)?;
     let path = ctx.path;
 
     let declaration = &ctx.ast.declarations[path.index];
 
     match path.sub.lookup_in(declaration) {
         naming::SingleDecl::TypeDef(spec) | naming::SingleDecl::TypeAlias(spec) => {
-            ctx.resolve_precise(spec.inner).await
+            ctx.resolve_precise(spec.inner)
         }
 
         _ => Err(error!("expected a type, but found a value")
@@ -1112,15 +1112,13 @@ impl ConstValue {
     }
 }
 
-#[haste::query]
-#[clone]
-#[lookup(haste::query_cache::TrackedStrategy)]
-async fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
-    let mut ctx = EvalContext::new(db, decl).await?;
+#[haste::query(clone)]
+fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
+    let mut ctx = EvalContext::new(db, decl)?;
     let path = ctx.path;
     let declaration = &ctx.ast.declarations[path.index];
     match path.sub.lookup_in(declaration) {
-        naming::SingleDecl::ConstDecl(_, _, expr) => ctx.eval(expr).await,
+        naming::SingleDecl::ConstDecl(_, _, expr) => ctx.eval(expr),
 
         naming::SingleDecl::TypeDef(_) | naming::SingleDecl::TypeAlias(_) => {
             Err(error!("cannot evaluate constant")
@@ -1139,20 +1137,21 @@ async fn const_value(db: &dyn crate::Db, decl: DeclId) -> Result<ConstValue> {
     }
 }
 
-#[haste::query]
-#[clone]
-async fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &'static str) -> Result<bool> {
+#[haste::query(clone)]
+fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &'static str) -> Result<bool> {
     use crate::import::FileSetData;
     use std::ffi::OsStr;
 
-    if decl.name(db).base.get(db) != name || decl.package(db).name.get(db) != "unsafe" {
+    let data = decl.lookup(db);
+
+    if data.name.base.get(db) != name || data.package.name.get(db) != "unsafe" {
         return Ok(false);
     }
 
-    let FileSetData::Directory(dir) = decl.package(db).files.lookup(db) else { return Ok(false) };
+    let FileSetData::Directory(dir) = data.package.files.lookup(db) else { return Ok(false) };
 
-    let goroot = crate::process::go_var_path(db, "GOROOT").await?;
-    let Ok(suffix) = dir.absolute(db).strip_prefix(goroot) else { return Ok(false) };
+    let goroot = crate::process::go_var_path(db, "GOROOT")?;
+    let Ok(suffix) = dir.lookup(db).absolute.strip_prefix(goroot) else { return Ok(false) };
 
     if suffix != OsStr::new("src/unsafe") {
         return Ok(false);
@@ -1161,7 +1160,7 @@ async fn is_unsafe_decl(db: &dyn crate::Db, decl: DeclId, name: &'static str) ->
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, haste::DebugWith)]
 pub enum Selection {
     /// A struct field.
     Field(Type),
@@ -1172,22 +1171,25 @@ pub enum Selection {
 
 type SelectionList = SmallVec<[Selection; 2]>;
 
-#[haste::query]
-#[clone]
-async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
+#[haste::query(clone)]
+fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<Selection>> {
+    use haste::{DebugWith, DisplayWith};
+
     let mut inner = typ;
 
     while let TypeKind::Pointer(pointee) = inner.lookup(db) {
         inner = *pointee;
     }
 
-    let members = recursive_members(db, inner).await.as_ref()?;
+    let members = recursive_members(db, inner).as_ref()?;
     let Some(selection) = members.get(&name) else { return Ok(None) };
 
     if selection.len() > 1 {
         return Err(error!(
-            "ambiguous selection `{typ}.{name}`: multiple alternatives ({:?})",
-            selection
+            "ambiguous selection `{}.{}`: multiple alternatives ({:?})",
+            typ.display(db),
+            name.display(db),
+            (&selection.as_slice()).debug(db)
         ));
     }
 
@@ -1195,7 +1197,7 @@ async fn resolve_selector(db: &dyn crate::Db, typ: Type, name: Text) -> Result<O
 }
 
 #[haste::query]
-async fn recursive_members(db: &dyn crate::Db, typ: Type) -> Result<HashMap<Text, SelectionList>> {
+fn recursive_members(db: &dyn crate::Db, typ: Type) -> Result<HashMap<Text, SelectionList>> {
     let mut selections = HashMap::<Text, SelectionList>::default();
 
     let mut curr_depth = TypeList::new();
@@ -1212,13 +1214,13 @@ async fn recursive_members(db: &dyn crate::Db, typ: Type) -> Result<HashMap<Text
                 curr = *inner;
             }
             if let TypeKind::Declared(decl) = curr.lookup(db) {
-                let inner = inner_type_for_decl(db, *decl).await?;
+                let inner = inner_type_for_decl(db, *decl)?;
                 if let TypeKind::Pointer(inner) = inner.lookup(db) {
                     curr_depth.push(*inner);
                 }
             }
 
-            let members = selection_members(db, curr).await.as_ref()?;
+            let members = selection_members(db, curr).as_ref()?;
             for (&name, list) in members.selections.iter() {
                 if selections.contains_key(&name) {
                     continue;
@@ -1251,7 +1253,7 @@ struct SelectionMembers {
 }
 
 #[haste::query]
-async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<SelectionMembers> {
+fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<SelectionMembers> {
     let mut selections = IndexMap::<Text, SelectionList>::new();
     let mut embedded = TypeList::new();
 
@@ -1262,14 +1264,14 @@ async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<Selectio
     };
 
     if let &TypeKind::Declared(decl) = typ.lookup(db) {
-        let methods = naming::method_set(db, decl).await?;
+        let methods = naming::method_set(db, decl)?;
 
         let decl_data = decl.lookup(db);
 
         for method in methods.iter() {
             let method_decl = DeclId::new(db, decl_data.package, method);
 
-            let decl_type = match decl_signature(db, method_decl).await? {
+            let decl_type = match decl_signature(db, method_decl)? {
                 Signature::Value(typ) => typ,
                 _ => unreachable!("methods must be values"),
             };
@@ -1283,7 +1285,7 @@ async fn selection_members(db: &dyn crate::Db, mut typ: Type) -> Result<Selectio
             add_candidate(method.base, Selection::Method(method_type));
         }
 
-        typ = underlying_type_for_decl(db, decl).await?;
+        typ = underlying_type_for_decl(db, decl)?;
     }
 
     match typ.lookup(db) {
@@ -1321,10 +1323,10 @@ pub enum InterfaceError {
     },
 }
 
-impl std::fmt::Display for InterfaceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl haste::DisplayWith<dyn crate::Db + '_> for InterfaceError {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InterfaceError::MissingMethod(name) => write!(f, "missing method `{name}`"),
+            InterfaceError::MissingMethod(name) => write!(f, "missing method `{}`", name.get(db)),
             InterfaceError::WrongSignature {
                 method,
                 found,
@@ -1332,21 +1334,24 @@ impl std::fmt::Display for InterfaceError {
             } => {
                 write!(
                     f,
-                    "expected a method `{method}` with signature `{expected}`, but found `{found}`"
+                    "expected a method `{}` with signature `{}`, but found `{}`",
+                    method.get(db),
+                    expected.display(db),
+                    found.display(db),
                 )
             }
         }
     }
 }
 
-async fn satisfies_interface(
+fn satisfies_interface(
     db: &dyn crate::Db,
     typ: Type,
     interface: &InterfaceType,
 ) -> Result<Result<(), InterfaceError>> {
     let mut buffer = None;
     for method in interface.methods(db, &mut buffer) {
-        let Some(selection) = resolve_selector(db, typ, method.name).await? else {
+        let Some(selection) = resolve_selector(db, typ, method.name)? else {
             // missing method
             return Ok(Err(InterfaceError::MissingMethod(method.name)));
         };
@@ -1372,17 +1377,13 @@ async fn satisfies_interface(
 }
 
 #[haste::query]
-async fn method_signature(
-    db: &dyn crate::Db,
-    typ: Type,
-    name: Text,
-) -> Result<Option<FunctionType>> {
+fn method_signature(db: &dyn crate::Db, typ: Type, name: Text) -> Result<Option<FunctionType>> {
     let core = if let &TypeKind::Declared(decl) = typ.lookup(db) {
-        if let Some(method) = declared_method_signature(db, decl, name).await? {
+        if let Some(method) = declared_method_signature(db, decl, name)? {
             return Ok(Some(method));
         }
 
-        underlying_type_for_decl(db, decl).await?
+        underlying_type_for_decl(db, decl)?
     } else {
         typ
     };
@@ -1399,17 +1400,17 @@ async fn method_signature(
     Ok(None)
 }
 
-async fn declared_method_signature(
+fn declared_method_signature(
     db: &dyn crate::Db,
     decl: DeclId,
     name: Text,
 ) -> Result<Option<FunctionType>> {
-    let methods = naming::method_set(db, decl).await?;
+    let methods = naming::method_set(db, decl)?;
     let Some(method) = methods.get(name) else { return Ok(None) };
 
-    let method_decl = DeclId::new(db, decl.package(db), method);
+    let method_decl = DeclId::new(db, decl.lookup(db).package, method);
 
-    let method_type = match decl_signature(db, method_decl).await? {
+    let method_type = match decl_signature(db, method_decl)? {
         Signature::Value(typ) => typ,
         _ => unreachable!("methods must be values"),
     };
@@ -1418,34 +1419,33 @@ async fn declared_method_signature(
     Ok(Some(func.without_receiver()))
 }
 
-#[haste::query]
-#[clone]
-async fn comparable(db: &dyn crate::Db, typ: Type) -> Result<bool> {
+#[haste::query(clone)]
+fn comparable(db: &dyn crate::Db, typ: Type) -> Result<bool> {
     let kind = typ.lookup(db);
     if kind.class().contains(TypeClass::TRIVIALLY_COMPARABLE) {
         return Ok(true);
     }
 
     match kind {
-        TypeKind::Array(_, inner) => comparable(db, *inner).await,
+        TypeKind::Array(_, inner) => comparable(db, *inner),
         TypeKind::Struct(strukt) => {
             for field in strukt.fields.iter() {
-                if !comparable(db, field.typ).await? {
+                if !comparable(db, field.typ)? {
                     return Ok(false);
                 }
             }
             Ok(true)
         }
         TypeKind::Declared(decl) => {
-            let core = underlying_type_for_decl(db, *decl).await?;
-            comparable(db, core).await
+            let core = underlying_type_for_decl(db, *decl)?;
+            comparable(db, core)
         }
         _ => Ok(false),
     }
 }
 
-async fn ordered(db: &dyn crate::Db, typ: Type) -> Result<bool> {
-    let core = underlying_type(db, typ).await?;
+fn ordered(db: &dyn crate::Db, typ: Type) -> Result<bool> {
+    let core = underlying_type(db, typ)?;
     let kind = core.lookup(db);
     Ok(kind.class().contains(TypeClass::TRIVIALLY_ORDERED))
 }

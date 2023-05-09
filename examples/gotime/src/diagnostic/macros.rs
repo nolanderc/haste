@@ -15,5 +15,5 @@ mod exported {
     }
 }
 
-pub(crate) use error;
 pub(crate) use bug;
+pub(crate) use error;

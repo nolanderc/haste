@@ -12,8 +12,7 @@ use crate::{
     path::NormalPath,
     span::Span,
     syntax::{self, DeclKind, ExprId, FuncDecl, Node, NodeId, SpanId, TypeId},
-    util::future::IteratorExt,
-    Diagnostic, HashSet, Result,
+    util, Diagnostic, HashSet, Result,
 };
 
 use self::context::NamingContext;
@@ -35,10 +34,8 @@ pub struct Storage(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclData {
     /// The package where the decl is found.
-    #[clone]
     pub package: PackageId,
     /// Uniquely identifies the decl within the package.
-    #[clone]
     pub name: DeclName,
 }
 
@@ -59,12 +56,12 @@ impl DeclName {
     }
 }
 
-impl std::fmt::Display for DeclName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl haste::DisplayWith<dyn crate::Db + '_> for DeclName {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(receiver) = self.receiver {
-            write!(f, "{}.{}", receiver, self.base)
+            write!(f, "{}.{}", receiver.get(db), self.base.get(db))
         } else {
-            write!(f, "{}", self.base)
+            write!(f, "{}", self.base.get(db))
         }
     }
 }
@@ -76,8 +73,8 @@ pub struct PackageId {
 }
 
 impl PackageId {
-    pub async fn from_files(db: &dyn crate::Db, files: FileSet) -> Result<Self> {
-        let name = package_name(db, files).await?;
+    pub fn from_files(db: &dyn crate::Db, files: FileSet) -> Result<Self> {
+        let name = package_name(db, files)?;
         Ok(Self { files, name })
     }
 }
@@ -105,33 +102,42 @@ impl DeclId {
         Self::new(db, package, DeclName::plain(name))
     }
 
-    async fn span(self, db: &dyn crate::Db) -> Result<Option<Span>> {
-        let Some(path) = self.try_get_path(db).await? else { return Ok(None) };
-        let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+    fn span(self, db: &dyn crate::Db) -> Result<Option<Span>> {
+        let Some(path) = self.try_get_path(db)? else { return Ok(None) };
+        let ast = syntax::parse_file(db, path.source).as_ref()?;
         Ok(Some(path.span_in_ast(ast)))
     }
 
-    async fn try_get_path(self, db: &dyn crate::Db) -> Result<Option<DeclPath>> {
+    fn try_get_path(self, db: &dyn crate::Db) -> Result<Option<DeclPath>> {
         let data = self.lookup(db);
-        let scope = package_scope(db, data.package.files).await.as_ref()?;
+        let scope = package_scope(db, data.package.files).as_ref()?;
         Ok(scope.get(&data.name).copied())
     }
 
-    pub async fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
-        match self.try_get_path(db).await? {
+    pub fn path(self, db: &dyn crate::Db) -> Result<DeclPath> {
+        match self.try_get_path(db)? {
             Some(path) => Ok(path),
-            None => Err(error!(
-                "`{}` is not a member of `{}`",
-                self.name(db).base,
-                self.package(db).name,
-            )),
+            None => {
+                let data = self.lookup(db);
+                Err(error!(
+                    "`{}` is not a member of `{}`",
+                    data.name.base.get(db),
+                    data.package.name.get(db),
+                ))
+            }
         }
     }
 }
 
-impl std::fmt::Display for DeclData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.package.name, self.name)
+impl haste::DisplayWith<dyn crate::Db + '_> for DeclData {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.package.name.get(db), self.name.display(db))
+    }
+}
+
+impl haste::DisplayWith<dyn crate::Db + '_> for DeclId {
+    fn fmt(&self, db: &dyn crate::Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.lookup(db).fmt(db, f)
     }
 }
 
@@ -172,8 +178,8 @@ pub struct SubIndex {
 }
 
 impl DeclPath {
-    pub async fn span(&self, db: &dyn crate::Db) -> Result<Span> {
-        let ast = syntax::parse_file(db, self.source).await.as_ref()?;
+    pub fn span(&self, db: &dyn crate::Db) -> Result<Span> {
+        let ast = syntax::parse_file(db, self.source).as_ref()?;
         Ok(self.span_in_ast(ast))
     }
 
@@ -267,36 +273,35 @@ pub enum FileMember {
 }
 
 impl FileMember {
-    async fn span(self, db: &dyn crate::Db, ast: &syntax::File) -> Span {
+    fn span(self, db: &dyn crate::Db, ast: &syntax::File) -> Span {
         match self {
             FileMember::Import(_, span) => ast.span(None, span),
-            FileMember::Decl(decl) => decl.span(db).await.unwrap().unwrap(),
+            FileMember::Decl(decl) => decl.span(db).unwrap().unwrap(),
         }
     }
 }
 
 #[haste::query]
-pub async fn file_scope(
-    db: &dyn crate::Db,
-    path: NormalPath,
-) -> Result<IndexMap<DeclName, FileMember>> {
-    let ast = syntax::parse_file(db, path).await.as_ref()?;
-    let resolved_imports = import::resolve_imports(db, ast).await?;
+pub fn file_scope(db: &dyn crate::Db, path: NormalPath) -> Result<IndexMap<DeclName, FileMember>> {
+    use haste::DisplayWith;
+
+    let ast = syntax::parse_file(db, path).as_ref()?;
+    let resolved_imports = import::resolve_imports(db, ast)?;
 
     let mut scope = IndexMap::default();
     let mut register = |name: DeclName, member: FileMember| {
         if let Some(previous) = scope.insert(name, member) {
-            return Err(async move {
-                error!("the declaration `{name}` is defined twice")
-                    .label(previous.span(db, ast).await, "first declared here")
-                    .label(member.span(db, ast).await, "then redeclared here")
-            });
+            return Err(
+                error!("the declaration `{}` is defined twice", name.display(db))
+                    .label(previous.span(db, ast), "first declared here")
+                    .label(member.span(db, ast), "then redeclared here"),
+            );
         }
         Ok(())
     };
 
     for (import, &files) in ast.imports.iter().zip(resolved_imports.iter()) {
-        let package_name = package_name(db, files).await?;
+        let package_name = package_name(db, files)?;
         let package = PackageId {
             files,
             name: package_name,
@@ -309,7 +314,7 @@ pub async fn file_scope(
                 DeclName::plain(name)
             }
             syntax::PackageName::Implicit => {
-                let exported = exported_decls(db, files).await.as_ref()?;
+                let exported = exported_decls(db, files).as_ref()?;
 
                 for &name in exported.iter() {
                     if name.receiver.is_some() {
@@ -317,18 +322,14 @@ pub async fn file_scope(
                     }
 
                     let decl = DeclData { package, name }.insert(db);
-                    if let Err(error) = register(name, FileMember::Decl(decl)) {
-                        return Err(error.await);
-                    }
+                    register(name, FileMember::Decl(decl))?
                 }
 
                 continue;
             }
         };
 
-        if let Err(error) = register(name, FileMember::Import(package, import.path.span)) {
-            return Err(error.await);
-        }
+        register(name, FileMember::Import(package, import.path.span))?
     }
 
     Ok(scope)
@@ -336,8 +337,8 @@ pub async fn file_scope(
 
 /// Get all names exported by a package.
 #[haste::query]
-pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<DeclName>> {
-    let scope = package_scope(db, files).await.as_ref()?;
+pub fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<DeclName>> {
+    let scope = package_scope(db, files).as_ref()?;
     let mut exports = Vec::with_capacity(scope.len());
     for &name in scope.keys() {
         if name.base.get(db).starts_with(char::is_uppercase) {
@@ -350,11 +351,10 @@ pub async fn exported_decls(db: &dyn crate::Db, files: FileSet) -> Result<Vec<De
 
 /// Get all names defined within a single package.
 #[haste::query]
-pub async fn package_scope(
-    db: &dyn crate::Db,
-    files: FileSet,
-) -> Result<IndexMap<DeclName, DeclPath>> {
-    let asts = files.lookup(db).parse(db).await?;
+pub fn package_scope(db: &dyn crate::Db, files: FileSet) -> Result<IndexMap<DeclName, DeclPath>> {
+    use haste::DisplayWith;
+
+    let asts = files.lookup(db).parse(db)?;
 
     let mut scope = IndexMap::default();
     let mut conflicts = IndexMap::default();
@@ -487,7 +487,7 @@ pub async fn package_scope(
 
     let mut combined = Vec::with_capacity(conflicts.len());
     for (name, decls) in conflicts {
-        let mut error = error!("the name `{name}` is defined multiple times");
+        let mut error = error!("the name `{}` is defined multiple times", name.display(db));
         let file_count = decls
             .iter()
             .map(|decl| decl.source)
@@ -495,7 +495,7 @@ pub async fn package_scope(
             .len();
 
         for decl in decls {
-            let ast = syntax::parse_file(db, decl.source).await.as_ref()?;
+            let ast = syntax::parse_file(db, decl.source).as_ref()?;
             let message = if file_count > 1 {
                 let filename = decl.source.file_name(db).unwrap();
                 format!("one definition in `{}`", filename.to_string_lossy())
@@ -534,17 +534,17 @@ impl MethodSet {
 
 /// For each declaration in a package, its set of methods.
 #[haste::query]
-pub async fn package_methods(
+pub fn package_methods(
     db: &dyn crate::Db,
     package: FileSet,
 ) -> Result<crate::HashMap<Text, Arc<MethodSet>>> {
-    async fn signature_span(db: &dyn crate::Db, path: DeclPath, index: usize) -> Result<Span> {
-        let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+    fn signature_span(db: &dyn crate::Db, path: DeclPath, index: usize) -> Result<Span> {
+        let ast = syntax::parse_file(db, path.source).as_ref()?;
         let decl = &ast.declarations[path.index];
         Ok(ast.span(Some(path.index), decl.nodes.spans()[index]))
     }
 
-    let package_scope = package_scope(db, package).await.as_ref()?;
+    let package_scope = package_scope(db, package).as_ref()?;
 
     let mut methods = crate::HashMap::default();
 
@@ -561,12 +561,10 @@ pub async fn package_methods(
 
                 let Some(receiver_path) = package_scope.get(&receiver_name) else {
                     return Err(error!("expected a declared type defined in the same package")
-                        .label(signature_span(db, path, 0).await?, ""));
+                        .label(signature_span(db, path, 0)?, ""));
                 };
 
-                let ast = syntax::parse_file(db, receiver_path.source)
-                    .await
-                    .as_ref()?;
+                let ast = syntax::parse_file(db, receiver_path.source).as_ref()?;
 
                 let decl = &ast.declarations[receiver_path.index];
                 let SingleDecl::TypeAlias(alias) = receiver_path.sub.lookup_in(decl) else {
@@ -575,14 +573,14 @@ pub async fn package_methods(
 
                 let Node::Name(Some(inner_name)) = decl.nodes.kind(alias.inner) else {
                     return Err(error!("expected a declared type defined in the same package")
-                        .label(signature_span(db, path, 0).await?, ""));
+                        .label(signature_span(db, path, 0)?, ""));
                 };
 
                 receiver = inner_name;
 
                 if !visited.insert(receiver) {
                     return Err(error!("cycle expected while resolving receiver type")
-                        .label(signature_span(db, path, 0).await?, ""));
+                        .label(signature_span(db, path, 0)?, ""));
                 }
             }
 
@@ -602,10 +600,11 @@ pub async fn package_methods(
 
                 return Err(error!(
                     "duplicate method definition of `{}` for `{}`",
-                    name.base, receiver
+                    name.base.get(db),
+                    receiver.get(db),
                 )
-                .label(signature_span(db, old_path, 1).await?, "first definition")
-                .label(signature_span(db, path, 1).await?, "second definition"));
+                .label(signature_span(db, old_path, 1)?, "first definition")
+                .label(signature_span(db, path, 1)?, "second definition"));
             }
         }
     }
@@ -614,28 +613,26 @@ pub async fn package_methods(
 }
 
 /// Get the set of methods defined for a type.
-#[haste::query]
-#[clone]
-#[lookup(haste::query_cache::TrackedStrategy)]
-pub async fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSet>> {
-    let methods = package_methods(db, decl.package(db).files).await.as_ref()?;
-    match methods.get(&decl.name(db).base) {
+#[haste::query(clone)]
+pub fn method_set(db: &dyn crate::Db, decl: DeclId) -> Result<Arc<MethodSet>> {
+    let data = decl.lookup(db);
+    let methods = package_methods(db, data.package.files).as_ref()?;
+    match methods.get(&data.name.base) {
         Some(set) => Ok(set.clone()),
         None => Ok(Default::default()),
     }
 }
 
-#[haste::query]
-#[clone]
-pub async fn package_name(db: &dyn crate::Db, files: FileSet) -> Result<Text> {
+#[haste::query(clone)]
+pub fn package_name(db: &dyn crate::Db, files: FileSet) -> Result<Text> {
     let file_data = files.lookup(db);
-    let paths = file_data.sources(db).await?;
+    let paths = file_data.sources(db)?;
 
-    let package_names = paths
-        .iter()
-        .map(|path| syntax::parse_package_name::spawn(db, *path))
-        .try_join_all()
-        .await?;
+    let package_names = util::try_join_all(
+        paths
+            .iter()
+            .map(|path| syntax::parse_package_name::spawn(db, *path)),
+    )?;
 
     let (expected_name, _) = package_names[0];
 
@@ -645,15 +642,22 @@ pub async fn package_name(db: &dyn crate::Db, files: FileSet) -> Result<Text> {
         if name != expected_name {
             return Err(error!(
                 "files `{}` and `{}` are part of different packages",
-                paths[0], paths[i],
+                paths[0].lookup(db),
+                paths[i].lookup(db),
             )
             .label(
                 package_names[0].1,
-                format!("this is part of the `{}` package", package_names[0].0),
+                format!(
+                    "this is part of the `{}` package",
+                    package_names[0].0.get(db)
+                ),
             )
             .label(
                 package_names[i].1,
-                format!("this is part of the `{}` package", package_names[i].0),
+                format!(
+                    "this is part of the `{}` package",
+                    package_names[i].0.get(db)
+                ),
             ));
         }
     }
@@ -768,13 +772,12 @@ pub struct Local {
 
 /// For each node in the given decl, the symbol it references.
 #[haste::query]
-#[lookup(haste::query_cache::TrackedStrategy)]
-pub async fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<NodeId, Symbol>> {
-    let path = id.path(db).await?;
-    let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+pub fn decl_symbols(db: &dyn crate::Db, id: DeclId) -> Result<IndexMap<NodeId, Symbol>> {
+    let path = id.path(db)?;
+    let ast = syntax::parse_file(db, path.source).as_ref()?;
     let decl = &ast.declarations[path.index];
 
-    let mut context = NamingContext::new(db, ast, path.index, id.package(db)).await?;
+    let mut context = NamingContext::new(db, ast, path.index, id.lookup(db).package)?;
 
     match path.sub.lookup_in(decl) {
         SingleDecl::TypeDef(spec) | SingleDecl::TypeAlias(spec) => {

@@ -1,35 +1,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{spanned::Spanned, Result};
+use syn::Result;
 
 pub fn intern(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let id_ident = syn::parse2::<syn::Ident>(attr)?;
 
     let data_input = syn::parse2::<syn::DeriveInput>(item.clone())?;
-
-    let strukt = match &data_input.data {
-        syn::Data::Struct(strukt) => strukt,
-        syn::Data::Enum(_) | syn::Data::Union(_) => {
-            return Err(syn::Error::new_spanned(
-                data_input.ident,
-                "expected a struct",
-            ))
-        }
-    };
-
-    let mut members = Vec::with_capacity(strukt.fields.len());
-    let mut types = Vec::with_capacity(strukt.fields.len());
-
-    for (i, field) in strukt.fields.iter().enumerate() {
-        members.push(match &field.ident {
-            Some(ident) => syn::Member::Named(ident.clone()),
-            None => syn::Member::Unnamed(syn::Index {
-                index: i as u32,
-                span: field.ty.span(),
-            }),
-        });
-        types.push(&field.ty);
-    }
 
     let mut tokens = TokenStream::new();
 
@@ -64,7 +40,7 @@ pub fn intern(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                 haste::DatabaseExt::intern::<Self>(db, value)
             }
 
-            pub fn lookup(self, db: &haste::ElementDb<Self>) -> &#data_ident {
+            pub fn lookup<'db>(self, db: &'db haste::ElementDb<Self>) -> &'db #data_ident {
                 haste::DatabaseExt::lookup(db, self)
             }
         }
@@ -75,7 +51,7 @@ pub fn intern(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             }
         }
 
-        impl haste::fmt::DebugWith<haste::ElementDb<Self>> for #id_ident {
+        impl haste::fmt::DebugWith<haste::ElementDb<'_, Self>> for #id_ident {
             fn fmt(&self, db: &haste::ElementDb<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 use haste::macro_helper::DebugFallback as _;
                 std::fmt::Debug::fmt(&haste::fmt::macro_helper::HasteDebug::<#data_ident, haste::ElementDb<Self>>::haste_debug(self.lookup(db), db), f)

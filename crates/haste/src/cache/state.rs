@@ -86,14 +86,6 @@ impl SlotState {
             }
 
             if let Some(id) = state.stack {
-                if block {
-                    let new_state = self.set_flag(flags::BLOCKING, Relaxed);
-                    if new_state != state {
-                        state = new_state;
-                        continue;
-                    }
-                }
-
                 return ClaimResult::Pending(id);
             }
 
@@ -123,6 +115,11 @@ impl SlotState {
         FinishResult {
             has_blocking: parts.flags() & flags::BLOCKING != 0,
         }
+    }
+
+    pub(crate) fn set_blocking(&self, order: Ordering) -> bool {
+        let parts = self.set_flag(flags::BLOCKING, order);
+        parts.stack.is_some()
     }
 
     fn set_flag(&self, flags: u32, order: Ordering) -> Parts {

@@ -72,7 +72,7 @@ pub mod macro_helper {
     where
         T: super::DebugWith<DB>,
     {
-        pub fn haste_debug<'a, 'b: 'a>(value: &'a T, db: &'a DB) -> super::DebugAdapter<'a, T, DB> {
+        pub fn haste_debug<'a, 'b: 'a>(value: &'a T, db: &'b DB) -> super::DebugAdapter<'a, T, DB> {
             value.debug(db)
         }
     }

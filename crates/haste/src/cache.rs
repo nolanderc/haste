@@ -333,7 +333,7 @@ enum ClaimResult {
 pub struct SlotId(u32);
 
 impl SlotId {
-    fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.0 as usize
     }
 }

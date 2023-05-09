@@ -12,9 +12,9 @@ use std::borrow::{Borrow, BorrowMut};
 
 pub use cache::{QueryCache, SlotId};
 pub use durability::Durability;
+pub use fmt::*;
 pub use interner::{InternId, Interner, ValueInterner};
 pub use runtime::{Dependency, LastChange, Runtime};
-pub use fmt::*;
 
 pub use haste_macros::*;
 
@@ -37,7 +37,7 @@ pub trait StorageList<DB> {
 macro_rules! storage_list_tuple_impl {
     ($($T:ident)*) => {
         #[allow(unused_variables, non_snake_case, clippy::unused_unit)]
-        impl<DB, $($T: Storage),*> StorageList<DB> for ($($T,)*)
+        impl<DB, $($T: Storage + 'static),*> StorageList<DB> for ($($T,)*)
         where
             $(DB: WithStorage<$T>),*
         {
@@ -122,8 +122,8 @@ impl<DB: StaticDatabase> DatabaseStorage<DB> {
     }
 }
 
-pub trait Storage: Sized + 'static {
-    type Database: Database + ?Sized;
+pub trait Storage: Sized {
+    type Database<'a>: Database + ?Sized + 'a;
 
     fn new<DB>(router: &mut StorageRouter<DB>) -> Self
     where
@@ -133,7 +133,7 @@ pub trait Storage: Sized + 'static {
 pub trait WithStorage<S: Storage>: Database {
     fn storage(&self) -> &S;
     fn storage_mut(&mut self) -> (&mut S, &mut Runtime);
-    fn cast_database(&self) -> &S::Database;
+    fn cast_database(&self) -> &S::Database<'_>;
 }
 
 pub struct StorageRouter<DB> {
@@ -169,7 +169,7 @@ pub trait WithElement<E: Element + ?Sized>: Storage {
     fn container_mut(&mut self) -> &mut E::Container;
 }
 
-pub trait Element: 'static {
+pub trait Element {
     type Storage: WithElement<Self>;
     type Container;
 }
@@ -177,11 +177,11 @@ pub trait Element: 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ElementId(u16);
 
-pub type ElementDb<T> = <<T as Element>::Storage as Storage>::Database;
+pub type ElementDb<'a, T> = <<T as Element>::Storage as Storage>::Database<'a>;
 
 pub trait Query: Element {
     type Arguments: Clone + Eq + 'static;
-    type Output: Clone + Eq + 'static;
+    type Output: Eq + 'static;
     type View<'a>;
 
     /// Amount of stack space required by the query.
@@ -197,10 +197,16 @@ pub trait Query: Element {
 
 pub trait Input: Query {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ElementPath {
     pub(crate) element: ElementId,
     pub(crate) slot: SlotId,
+}
+
+impl std::fmt::Debug for ElementPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.element.0, self.slot.index())
+    }
 }
 
 pub trait Intern: Element {
@@ -212,10 +218,11 @@ pub trait Intern: Element {
 
 pub trait DatabaseExt: Database {
     #[inline]
-    fn query<Q: Query>(&self, args: Q::Arguments) -> &Q::Output
+    fn query<'a, Q: Query>(&'a self, args: Q::Arguments) -> &Q::Output
     where
         Self: WithStorage<Q::Storage>,
-        Q::Container: Borrow<QueryCache<Q>>,
+        Q: 'a,
+        Q::Container: Borrow<QueryCache<Q>> + 'a,
         Q::Arguments: Eq + std::hash::Hash,
     {
         let storage = self.storage();
@@ -285,10 +292,11 @@ pub trait DatabaseExt: Database {
         T::from_id(id)
     }
 
-    fn lookup<T: Intern>(&self, interned: T) -> &T::Value
+    fn lookup<'a, T: Intern>(&'a self, interned: T) -> &T::Value
     where
         Self: WithStorage<T::Storage>,
-        T::Container: Interner<T::Value>,
+        T::Storage: 'a,
+        T::Container: Interner<T::Value> + 'a,
     {
         let storage = self.storage();
         let container = storage.container();

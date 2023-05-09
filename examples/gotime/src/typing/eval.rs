@@ -1,4 +1,4 @@
-use futures::{future::BoxFuture, FutureExt};
+use haste::DisplayWith;
 
 use crate::{
     diagnostic::bug,
@@ -24,12 +24,12 @@ pub struct EvalContext<'a> {
 }
 
 impl<'a> EvalContext<'a> {
-    pub async fn new(db: &'a dyn crate::Db, decl: DeclId) -> Result<EvalContext<'a>> {
-        let path = decl.path(db).await?;
-        let ast = syntax::parse_file(db, path.source).await.as_ref()?;
+    pub fn new(db: &'a dyn crate::Db, decl: DeclId) -> Result<EvalContext<'a>> {
+        let path = decl.path(db)?;
+        let ast = syntax::parse_file(db, path.source).as_ref()?;
         let nodes = &ast.declarations[path.index].nodes;
-        let references = naming::decl_symbols(db, decl).await.as_ref()?;
-        let types = super::type_check_body(db, decl).await.as_ref()?;
+        let references = naming::decl_symbols(db, decl).as_ref()?;
+        let types = super::type_check_body(db, decl).as_ref()?;
 
         Ok(Self {
             decl,
@@ -42,11 +42,7 @@ impl<'a> EvalContext<'a> {
         })
     }
 
-    fn eval_boxed(&mut self, expr: ExprId) -> BoxFuture<Result<ConstValue>> {
-        self.eval(expr).boxed()
-    }
-
-    pub async fn eval(&mut self, expr: ExprId) -> Result<ConstValue> {
+    pub fn eval(&mut self, expr: ExprId) -> Result<ConstValue> {
         match self.nodes.kind(expr) {
             Node::Name(name) | Node::Selector(_, syntax::Identifier { text: name, .. }) => {
                 let Some(&symbol) = self.references.get(&expr.node) else {
@@ -72,7 +68,7 @@ impl<'a> EvalContext<'a> {
                             _ => Err(error!("the value cannot be known at compile-time")
                                 .label(self.node_span(expr), "")),
                         },
-                        GlobalSymbol::Decl(decl) => super::const_value(self.db, decl).await,
+                        GlobalSymbol::Decl(decl) => super::const_value(self.db, decl),
                     },
                 }
             }
@@ -88,7 +84,7 @@ impl<'a> EvalContext<'a> {
             Node::FloatSmall(value) => Ok(ConstValue::number(value.get())),
 
             Node::Unary(op, expr) => {
-                let value = self.eval_boxed(expr).await?;
+                let value = self.eval(expr)?;
                 match op {
                     syntax::UnaryOperator::Plus => Ok(value),
                     syntax::UnaryOperator::Minus => match value {
@@ -119,14 +115,14 @@ impl<'a> EvalContext<'a> {
                 use syntax::BinaryOperator as BinOp;
 
                 let interleaved = self.nodes.indirect(exprs);
-                let mut lhs = self.eval_boxed(interleaved[0]).await?;
+                let mut lhs = self.eval(interleaved[0])?;
 
                 let start = interleaved[0];
                 let mut end = interleaved[0];
 
                 for pair in interleaved[1..].chunks_exact(2) {
                     let Node::BinaryOp(op) = self.nodes.kind(pair[0]) else { unreachable!() };
-                    let rhs = self.eval_boxed(pair[1]).await?;
+                    let rhs = self.eval(pair[1])?;
 
                     lhs = match op {
                         BinOp::LogicalOr => ConstValue::Bool(lhs.bool() || rhs.bool()),
@@ -280,9 +276,9 @@ impl<'a> EvalContext<'a> {
                             _ => None,
                         },
                         Some(Symbol::Global(GlobalSymbol::Decl(decl))) => {
-                            if super::is_unsafe_decl(self.db, *decl, "Sizeof").await? {
+                            if super::is_unsafe_decl(self.db, *decl, "Sizeof")? {
                                 Some(ConstFunc::Sizeof)
-                            } else if super::is_unsafe_decl(self.db, *decl, "Offsetof").await? {
+                            } else if super::is_unsafe_decl(self.db, *decl, "Offsetof")? {
                                 Some(ConstFunc::Offsetof)
                             } else {
                                 None
@@ -301,7 +297,7 @@ impl<'a> EvalContext<'a> {
                 let exprs = self.nodes.indirect(args);
 
                 let value = match func {
-                    ConstFunc::IntCast => match self.eval_boxed(exprs[0]).await? {
+                    ConstFunc::IntCast => match self.eval(exprs[0])? {
                         ConstValue::Number(value) if value.imag().is_zero() => {
                             ConstValue::number(value.real().trunc_ref())
                         }
@@ -330,7 +326,7 @@ impl<'a> EvalContext<'a> {
                                 _ => None,
                             },
                             TypeKind::Untyped(ConstantKind::String) => {
-                                match self.eval_boxed(exprs[0]).await? {
+                                match self.eval(exprs[0])? {
                                     ConstValue::String(string) => Some(string.len() as u64),
                                     _ => None,
                                 }
@@ -341,8 +337,10 @@ impl<'a> EvalContext<'a> {
                         match len {
                             Some(len) => ConstValue::number(len),
                             None => {
-                                return Err(error!("length not known at compile-time")
-                                    .label(self.node_span(exprs[0]), format!("found `{typ}`")))
+                                return Err(error!("length not known at compile-time").label(
+                                    self.node_span(exprs[0]),
+                                    format!("found `{}`", typ.display(self.db)),
+                                ))
                             }
                         }
                     }
@@ -365,8 +363,10 @@ impl<'a> EvalContext<'a> {
                         match len {
                             Some(len) => ConstValue::number(len),
                             None => {
-                                return Err(error!("length not known at compile-time")
-                                    .label(self.node_span(exprs[0]), format!("found `{typ}`")))
+                                return Err(error!("length not known at compile-time").label(
+                                    self.node_span(exprs[0]),
+                                    format!("found `{}`", typ.display(self.db)),
+                                ))
                             }
                         }
                     }

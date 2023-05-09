@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 haste = { path = "../../crates/haste" }
+tikv-jemallocator = { version = "0.5.0", features = ["background_threads"] }

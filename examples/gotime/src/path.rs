@@ -26,35 +26,35 @@ impl AsRef<Path> for NormalPathData {
 }
 
 impl NormalPath {
-    pub async fn new(db: &dyn crate::Db, path: &Path) -> Result<Self> {
-        let data = NormalPathData::new(db, path).await?;
+    pub fn new(db: &dyn crate::Db, path: &Path) -> Result<Self> {
+        let data = NormalPathData::new(db, path)?;
         Ok(Self::insert(db, data))
     }
 
     pub fn file_name(self, db: &dyn crate::Db) -> Option<&OsStr> {
-        self.absolute(db).file_name()
+        self.lookup(db).absolute.file_name()
     }
 
     pub fn extension(self, db: &dyn crate::Db) -> Option<&OsStr> {
-        self.absolute(db).extension()
+        self.lookup(db).absolute.extension()
     }
 
     pub fn file_stem(self, db: &dyn crate::Db) -> Option<&OsStr> {
-        self.absolute(db).file_stem()
+        self.lookup(db).absolute.file_stem()
     }
 }
 
 impl NormalPathData {
-    pub async fn new(db: &dyn crate::Db, path: &Path) -> Result<Self> {
-        let absolute = Self::normalize(db, path).await?;
+    pub fn new(db: &dyn crate::Db, path: &Path) -> Result<Self> {
+        let absolute = Self::normalize(db, path)?;
         Ok(Self { absolute })
     }
 
-    async fn normalize<'a>(db: &dyn crate::Db, path: &Path) -> Result<PathBuf> {
+    fn normalize(db: &dyn crate::Db, path: &Path) -> Result<PathBuf> {
         let mut normalized = PathBuf::new();
 
         if path.is_relative() {
-            normalized = crate::process::current_dir(db, ()).await.clone()?;
+            normalized = crate::process::current_dir(db).clone()?;
         }
 
         for component in path.components() {

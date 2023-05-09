@@ -13,8 +13,8 @@
 
 use std::num::NonZeroU32;
 
+use crate::integer::NonMaxU32;
 use bstr::{BStr, ByteSlice};
-use haste::integer::NonMaxU32;
 
 use crate::span::FileRange;
 

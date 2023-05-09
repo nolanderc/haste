@@ -1,9 +1,9 @@
 use std::{borrow::Cow, ops::Range};
 
+use crate::integer::NonMaxU32;
 use arrayvec::ArrayVec;
 use bstr::{BString, ByteSlice, ByteVec};
 use fxhash::FxHashMap;
-use haste::integer::NonMaxU32;
 use smallvec::SmallVec;
 
 use crate::{
@@ -40,7 +40,7 @@ pub fn parse_package_name(
     }
 }
 
-pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
+pub fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate::Result<File> {
     let tokens = crate::token::tokenize(source);
 
     let mut parser = Parser {
@@ -62,7 +62,7 @@ pub async fn parse(db: &dyn crate::Db, source: &BStr, path: NormalPath) -> crate
     parser.data.node.spans.reserve(expected_node_count);
     parser.data.node.indirect.reserve(expected_node_count);
 
-    match parser.file().await {
+    match parser.file() {
         Ok(file) => {
             let nodes = match file.declarations.iter().next() {
                 None => 0,
@@ -553,7 +553,7 @@ impl<'a> Parser<'a> {
         if let Some(id) = NodeId::new(index) {
             id
         } else {
-            panic!("exhausted node IDs in `{}`", self.path);
+            panic!("exhausted node IDs in `{}`", self.path.lookup(self.db));
         }
     }
 
@@ -583,7 +583,7 @@ impl<'a> Parser<'a> {
         Ok(range)
     }
 
-    async fn file(&mut self) -> Result<File> {
+    fn file(&mut self) -> Result<File> {
         let package = self.package()?;
         let imports = self.imports()?;
 
@@ -591,7 +591,7 @@ impl<'a> Parser<'a> {
             self.db,
             self.path,
             imports.iter().map(|import| import.path.text),
-        ).await;
+        );
 
         let declarations = self.declarations()?;
         self.expect_eof()?;

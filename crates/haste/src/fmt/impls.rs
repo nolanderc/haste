@@ -2,37 +2,37 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::DebugWith;
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for &T {
+impl<DB: ?Sized, T: DebugWith<DB> + ?Sized> DebugWith<DB> for &T {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         T::fmt(*self, db, f)
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for &mut T {
+impl<DB: ?Sized, T: DebugWith<DB> + ?Sized> DebugWith<DB> for &mut T {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         T::fmt(*self, db, f)
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for Box<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for Box<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         T::fmt(&**self, db, f)
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for std::rc::Rc<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for std::rc::Rc<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         T::fmt(&**self, db, f)
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for std::sync::Arc<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for std::sync::Arc<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         T::fmt(&**self, db, f)
     }
 }
 
-impl<DB, T: DebugWith<DB>, const N: usize> DebugWith<DB> for [T; N] {
+impl<DB: ?Sized, T: DebugWith<DB>, const N: usize> DebugWith<DB> for [T; N] {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut list = f.debug_list();
         for value in self.iter() {
@@ -42,7 +42,7 @@ impl<DB, T: DebugWith<DB>, const N: usize> DebugWith<DB> for [T; N] {
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for [T] {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for [T] {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut list = f.debug_list();
         for value in self.iter() {
@@ -52,7 +52,7 @@ impl<DB, T: DebugWith<DB>> DebugWith<DB> for [T] {
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for Vec<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for Vec<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut list = f.debug_list();
         for value in self.iter() {
@@ -62,7 +62,7 @@ impl<DB, T: DebugWith<DB>> DebugWith<DB> for Vec<T> {
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for BTreeSet<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for BTreeSet<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut set = f.debug_set();
         for value in self.iter() {
@@ -72,7 +72,7 @@ impl<DB, T: DebugWith<DB>> DebugWith<DB> for BTreeSet<T> {
     }
 }
 
-impl<DB, T: DebugWith<DB>> DebugWith<DB> for HashSet<T> {
+impl<DB: ?Sized, T: DebugWith<DB>> DebugWith<DB> for HashSet<T> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut set = f.debug_set();
         for value in self.iter() {
@@ -82,7 +82,7 @@ impl<DB, T: DebugWith<DB>> DebugWith<DB> for HashSet<T> {
     }
 }
 
-impl<DB, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for BTreeMap<T, V> {
+impl<DB: ?Sized, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for BTreeMap<T, V> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut map = f.debug_map();
         for (key, value) in self.iter() {
@@ -92,7 +92,7 @@ impl<DB, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for BTreeMap<T, V> {
     }
 }
 
-impl<DB, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for HashMap<T, V> {
+impl<DB: ?Sized, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for HashMap<T, V> {
     fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut map = f.debug_map();
         for (key, value) in self.iter() {
@@ -105,7 +105,7 @@ impl<DB, T: DebugWith<DB>, V: DebugWith<DB>> DebugWith<DB> for HashMap<T, V> {
 macro_rules! impl_tuple {
     ($($T:ident)*) => {
         #[allow(unused_variables, non_snake_case, clippy::unused_unit)]
-        impl<DB, $($T: DebugWith<DB>),*> DebugWith<DB> for ($($T,)*) {
+        impl<DB: ?Sized, $($T: DebugWith<DB>),*> DebugWith<DB> for ($($T,)*) {
             fn fmt(&self, db: &DB, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 let ($($T,)*) = self;
 
@@ -131,4 +131,3 @@ impl_tuple!(A B C D E F G H);
 impl_tuple!(A B C D E F G H I);
 impl_tuple!(A B C D E F G H I J);
 impl_tuple!(A B C D E F G H I J K);
-

@@ -1,10 +1,10 @@
 pub mod parse;
-mod print;
+// mod print;
 
 use std::{ops::Range, sync::Arc};
 
+use crate::integer::{NonMaxU32, B32, U24};
 use bstr::BStr;
-use haste::integer::{NonMaxU32, B32, U24};
 
 use crate::{
     key::{Base, Key, KeyOps, KeySlice, KeyVec, Relative},
@@ -15,14 +15,14 @@ use crate::{
 };
 
 #[haste::query]
-pub async fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<File> {
-    let source = crate::source::source_text(db, path).await?;
-    self::parse::parse(db, &source, path).await
+pub fn parse_file(db: &dyn crate::Db, path: NormalPath) -> crate::Result<File> {
+    let source = crate::source::source_text(db, path)?;
+    self::parse::parse(db, &source, path)
 }
 
 #[haste::query]
-pub async fn parse_package_name(db: &dyn crate::Db, path: NormalPath) -> crate::Result<(Text, Span)> {
-    let source = crate::source::source_text(db, path).await?;
+pub fn parse_package_name(db: &dyn crate::Db, path: NormalPath) -> crate::Result<(Text, Span)> {
+    let source = crate::source::source_text(db, path)?;
     self::parse::parse_package_name(db, &source, path)
 }
 

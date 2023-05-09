@@ -36,7 +36,7 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
     tokens.extend(quote! {
         impl haste::Storage for #ident {
-            type Database = dyn crate::Db;
+            type Database<'a> = dyn crate::Db + 'a;
 
             fn new<DB>(router: &mut haste::StorageRouter<DB>) -> Self
             where

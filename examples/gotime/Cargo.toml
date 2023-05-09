@@ -2,11 +2,12 @@
 name = "gotime"
 version = "0.1.0"
 edition = "2021"
+default-run = "gotime"
 
 [dependencies]
 arrayvec = "0.7.2"
 bitflags = "2.0.2"
-clap = { version = "4.1.4", features = ["derive"] }
+clap = { version = "4.1.4", features = ["derive", "env"] }
 cpu-time = "1.0.0"
 crossbeam-utils = "0.8.15"
 dashmap = "5.4.0"
@@ -16,6 +17,7 @@ fxhash = "0.2.1"
 gmp-mpfr-sys = { version = "1.5.2", features = ["force-cross"] }
 hashbrown = { version = "0.13.2", features = ["raw"] }
 notify = "5.1.0"
+num_cpus = "1.15.0"
 phf = { version = "0.11.1", features = ["macros"] }
 pin-project = "1.0.12"
 rug = { version = "1.19.2", features = ["complex"] }
@@ -31,7 +33,7 @@ version = "1.2.0"
 
 [dependencies.haste]
 path = "../../crates/haste"
-features = ["metrics"]
+features = []
 
 [dev-dependencies]
 pretty_assertions = "1.3.0"

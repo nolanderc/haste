@@ -43,7 +43,7 @@ pub fn database(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
 
             fn storage_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
                 <<Self as haste::StaticDatabase>::StorageList as haste::StorageList<Self>>::storage_any(
-                    &self.storage.storages(), 
+                    &self.storage.storages(),
                     type_id,
                 )
             }
@@ -60,7 +60,7 @@ pub fn database(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                     (&mut list.#indices, runtime)
                 }
 
-                fn cast_database(&self) -> &<#storages as haste::Storage>::Database {
+                fn cast_database(&self) -> &<#storages as haste::Storage>::Database<'_> {
                     self
                 }
             }

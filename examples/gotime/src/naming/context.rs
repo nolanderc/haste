@@ -34,7 +34,7 @@ pub struct NamingContext<'db> {
 }
 
 impl<'db> NamingContext<'db> {
-    pub async fn new(
+    pub fn new(
         db: &'db dyn crate::Db,
         ast: &'db crate::syntax::File,
         decl: Key<syntax::Decl>,
@@ -54,8 +54,8 @@ impl<'db> NamingContext<'db> {
             node_indirect: nodes.view_indirect(),
             package,
 
-            package_scope: package_scope.await.as_ref()?,
-            file_scope: file_scope.await.as_ref()?,
+            package_scope: package_scope.as_ref()?,
+            file_scope: file_scope.as_ref()?,
             local_scope: LocalScope::with_capacity(nodes.len()),
 
             parameter_scopes: Default::default(),
@@ -121,9 +121,12 @@ impl<'db> NamingContext<'db> {
 
                         if let Some(previous) = self.labels.insert(name, label) {
                             self.emit(
-                                error!("a label with the name `{name}` already exists")
-                                    .label(self.node_span(previous), "old definition here")
-                                    .label(self.node_span(label), "new definition here"),
+                                error!(
+                                    "a label with the name `{}` already exists",
+                                    name.get(self.db)
+                                )
+                                .label(self.node_span(previous), "old definition here")
+                                .label(self.node_span(label), "new definition here"),
                             )
                         }
                     }
@@ -176,7 +179,8 @@ impl<'db> NamingContext<'db> {
                     self.resolved.insert(node, symbol);
                 } else {
                     self.emit(
-                        error!("undefined reference to `{}`", name).label(self.node_span(node), ""),
+                        error!("undefined reference to `{}`", name.get(self.db))
+                            .label(self.node_span(node), ""),
                     );
                 }
             }
@@ -191,7 +195,10 @@ impl<'db> NamingContext<'db> {
                 let resolved = self.resolved.get(&base);
                 if let Some(Symbol::Global(GlobalSymbol::Package(package))) = resolved {
                     if !name.get(self.db).starts_with(char::is_uppercase) {
-                        self.emit(error!("`{name}` is private").label(self.node_span(node), ""));
+                        self.emit(
+                            error!("`{}` is private", name.get(self.db))
+                                .label(self.node_span(node), ""),
+                        );
                         return;
                     }
 
@@ -364,7 +371,7 @@ impl<'db> NamingContext<'db> {
                 };
                 if !self.labels.contains_key(&name) {
                     self.emit(
-                        error!("target label `{name}` not found in scope")
+                        error!("target label `{}` not found in scope", name.get(self.db))
                             .label(self.span(label.span), ""),
                     );
                 }

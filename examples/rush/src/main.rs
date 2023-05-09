@@ -2,6 +2,9 @@ use std::sync::atomic::AtomicU32;
 
 use haste::{DatabaseExt as _, DebugWith};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[haste::database(Storage)]
 #[derive(Default)]
 struct Database {

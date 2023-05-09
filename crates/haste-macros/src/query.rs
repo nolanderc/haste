@@ -51,7 +51,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let view_type = if clone_flag.is_some() {
         quote! { #output_type }
     } else {
-        quote_spanned! { output_type.span()=> &'a #output_type }
+        quote_spanned! { output_type.span()=> &'db #output_type }
     };
 
     let view_body = if let Some(ident) = clone_flag {
@@ -82,7 +82,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         impl haste::Query for #ident {
             type Arguments = (#(#argument_types),*);
             type Output = #output_type;
-            type View<'a> = #view_type;
+            type View<'db> = #view_type;
 
             const IS_INPUT: bool = #is_input;
 
@@ -102,7 +102,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         impl #ident {
             pub fn spawn<'db>(
                 #db_ident: &'db #db_type,
-                #(#argument_idents: #argument_types),*
+                #(#argument_idents: #argument_types,)*
             ) -> haste::QueryHandle<'db, Self> {
                 haste::DatabaseExt::spawn::<#ident>(#db_ident, (#(#argument_idents),*))
             }
@@ -116,7 +116,7 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             impl #ident {
                 pub fn set(
                     #db_ident: &mut #db_type,
-                    #(#argument_idents: #argument_types),*,
+                    #(#argument_idents: #argument_types,)*
                     __output: #output_type,
                     __durability: haste::Durability,
                 ) {
@@ -128,9 +128,9 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
                     )
                 }
 
-                pub fn invalidate<'db>(
+                pub fn invalidate(
                     #db_ident: &mut #db_type,
-                    #(#argument_idents: #argument_types),*
+                    #(#argument_idents: #argument_types,)*
                 ) {
                     haste::DatabaseExt::invalidate::<#ident>(#db_ident, (#(#argument_idents),*))
                 }
@@ -138,14 +138,11 @@ pub fn query(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
         });
     }
 
-    signature.output_type = syn::parse2(if clone_flag.is_some() {
-        quote! { #output_type }
-    } else {
-        quote_spanned! { output_type.span()=> &#output_type }
-    })?;
-
     tokens.extend(quote! {
-        #signature {
+        #vis fn #ident<'db>(
+            #db_ident: &'db #db_type,
+            #(#argument_idents: #argument_types,)*
+        ) -> #view_type {
             let output = haste::DatabaseExt::query::<#ident>(#db_ident, (#(#argument_idents),*));
             <#ident as haste::Query>::view(output)
         }
@@ -216,22 +213,32 @@ impl ToTokens for QuerySignature {
 }
 
 struct QueryParameter {
+    mutable: Option<Token![mut]>,
     ident: syn::Ident,
     typ: syn::Type,
 }
 
 impl ToTokens for QueryParameter {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let Self { ident, typ } = self;
-        tokens.extend(quote! { #ident: #typ });
+        let Self {
+            mutable,
+            ident,
+            typ,
+        } = self;
+        tokens.extend(quote! { #mutable #ident: #typ });
     }
 }
 
 impl Parse for QueryParameter {
     fn parse(input: syn::parse::ParseStream) -> Result<Self> {
+        let mutable = input.parse::<Option<Token![mut]>>()?;
         let ident = input.parse()?;
         input.parse::<Token![:]>()?;
         let typ = input.parse()?;
-        Ok(Self { ident, typ })
+        Ok(Self {
+            mutable,
+            ident,
+            typ,
+        })
     }
 }

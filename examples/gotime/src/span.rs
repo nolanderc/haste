@@ -1,5 +1,4 @@
-use haste::integer::NonMaxU32;
-
+use crate::integer::NonMaxU32;
 use crate::path::NormalPath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

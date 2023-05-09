@@ -6,7 +6,6 @@ pub(crate) use self::macros::*;
 use std::{fmt::Write, sync::Arc};
 
 use bstr::{BStr, ByteSlice};
-use haste::DatabaseExt;
 use smallvec::SmallVec;
 
 use crate::{
@@ -181,9 +180,9 @@ struct Stats {
 }
 
 impl Diagnostic {
-    pub async fn write(&self, db: &dyn crate::Db, out: &mut impl Write) -> std::fmt::Result {
+    pub fn write(&self, db: &dyn crate::Db, out: &mut impl Write) -> std::fmt::Result {
         // for each source file: get its text and line numbers
-        let sources = self.get_source_infos(db).await;
+        let sources = self.get_source_infos(db);
 
         let mut stats = Stats::default();
 
@@ -319,8 +318,7 @@ impl Label {
 
         let start_column =
             (range.start.get() as usize - start_line_range.start).min(start_line_text.len());
-        let end_column =
-            (range.end.get() as usize - end_line_range.start).min(end_line_text.len());
+        let end_column = (range.end.get() as usize - end_line_range.start).min(end_line_text.len());
 
         let start_end_column = if start_line == end_line {
             end_column.min(start_line_text.len())
@@ -482,7 +480,7 @@ impl SourceFileInfo<'_> {
 type SourceSet<'db> = HashMap<NormalPath, SourceFileInfo<'db>>;
 
 impl Diagnostic {
-    async fn get_source_infos<'db>(&self, db: &'db dyn crate::Db) -> SourceSet<'db> {
+    fn get_source_infos<'db>(&self, db: &'db dyn crate::Db) -> SourceSet<'db> {
         let mut sources = HashSet::default();
 
         let mut visited = HashSet::default();
@@ -519,7 +517,7 @@ impl Diagnostic {
                 };
 
                 if sources.insert(path) {
-                    line_starts::prefetch(db, path);
+                    line_starts::spawn(db, path);
                 }
             }
         }
@@ -528,12 +526,10 @@ impl Diagnostic {
         infos.reserve(sources.len());
 
         for source in sources {
-            let text = source_text(db, source)
-                .await
-                .expect("span pointed to path that did not exist");
-            let line_starts = line_starts(db, source).await.as_ref().unwrap().as_slice();
+            let text = source_text(db, source).expect("span pointed to path that did not exist");
+            let line_starts = line_starts(db, source).as_ref().unwrap().as_slice();
 
-            let display_path = db.fmt(source).to_string();
+            let display_path = source.lookup(db).to_string();
 
             infos.insert(
                 source,

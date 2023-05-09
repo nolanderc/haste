@@ -5,7 +5,7 @@ use syn::{spanned::Spanned, Result};
 pub fn debug_with(input: syn::DeriveInput) -> Result<TokenStream> {
     let mut tokens = TokenStream::new();
 
-    let db_type = quote! { <Storage as haste::Storage>::Database };
+    let db_type = quote! { <Storage as haste::Storage>::Database<'_> };
     let ident = &input.ident;
 
     let mut patterns = TokenStream::new();
@@ -64,7 +64,7 @@ fn debug_fields(ident: &syn::Ident, fields: &syn::Fields, db_type: &TokenStream)
     let debugs = idents.iter().zip(types).map(|(ident, typ)| {
         quote! {
             haste::fmt::macro_helper::HasteDebug::<#typ, #db_type>::haste_debug(
-                #ident, 
+                #ident,
                 __db,
             )
         }

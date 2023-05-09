@@ -1,5 +1,3 @@
-use haste::DatabaseExt;
-
 use super::*;
 
 use std::fmt::Write;
@@ -82,10 +80,10 @@ where
 
 impl File {
     pub fn display_pretty<'a>(&'a self, db: &'a dyn crate::Db) -> impl std::fmt::Display + 'a {
-        db.fmt(crate::util::display_fn(move |f| {
+        crate::util::display_fn(move |f| {
             let mut writer = PrettyWriter::new(f);
             self.write_pretty(&mut writer)
-        }))
+        })
     }
 
     fn write_pretty(&self, out: &mut PrettyWriter<impl Write>) -> std::fmt::Result {

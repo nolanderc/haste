@@ -1,8 +1,10 @@
 mod cycle;
 mod history;
+mod coro;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell, UnsafeCell},
+    mem::MaybeUninit,
     num::{NonZeroU16, NonZeroU32},
     sync::{
         atomic::{
@@ -19,6 +21,7 @@ use dashmap::DashMap;
 use smallvec::SmallVec;
 
 use crate::{
+    arena::Arena,
     cache::{SlotId, SlotState},
     durability::Durability,
     revision::Revision,
@@ -28,13 +31,12 @@ use crate::{
 
 use self::{cycle::CycleGraph, history::History};
 
-static BLOCKED_NANOS: AtomicU64 = AtomicU64::new(0);
-
 /// Smallest stack size to allocate for queries (in bytes).
-const MIN_STACK: usize = 32 * 1024 * 1024;
+const MIN_STACK: usize = 32 * 1024;
 
 pub struct Runtime {
     stack_ids: StackIdAllocator,
+    stacks: Arena<UnsafeCell<MaybeUninit<context::stack::ProtectedFixedSizeStack>>>,
 
     cycles: CycleGraph,
     history: History,
@@ -44,6 +46,7 @@ pub struct Runtime {
     thread_scope: Option<Arc<ThreadScope>>,
     tasks: DashMap<ElementPath, Task>,
     workers: ArcSwap<WorkerState>,
+    suspended: DashMap<ElementPath, SuspendState>,
 }
 
 unsafe impl Send for Runtime {}
@@ -53,12 +56,14 @@ impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
             stack_ids: StackIdAllocator::new(),
+            stacks: Arena::with_capacity(1 << 32),
             cycles: CycleGraph::default(),
             history: History::new(),
             running: AtomicBool::new(false),
             thread_scope: None,
             tasks: DashMap::with_capacity(1024),
             workers: Default::default(),
+            suspended: DashMap::with_capacity(1024),
         }
     }
 
@@ -92,7 +97,7 @@ impl Runtime {
     }
 
     #[inline]
-    pub(crate) fn free_stack(&self, stack: StackId) {
+    pub(crate) unsafe fn free_stack(&self, stack: StackId) {
         self.stack_ids.free(stack)
     }
 
@@ -262,6 +267,7 @@ impl Runtime {
             path,
             last_verified,
             stack,
+            min_stack_size: usize::max(MIN_STACK, Q::REQUIRED_STACK),
         };
 
         let task = Task {
@@ -274,7 +280,6 @@ impl Runtime {
                     let old = active.borrow_mut().replace(ActiveStack::new(state.stack));
                     runtime.execute(db, slot, state.path, state.last_verified);
                     *active.borrow_mut() = old;
-                    runtime.free_stack(state.stack);
                 })
             },
             drop: |state| unsafe { state.slot::<Q>().release_claim() },
@@ -335,11 +340,17 @@ impl Runtime {
             let worker = Worker::new_lifo();
             let stealer = worker.stealer();
 
-            self.workers.rcu(|workers| workers.add(stealer.clone()));
+            let mut index = 0;
+            self.workers.rcu(|workers| {
+                let state;
+                (state, index) = workers.add(stealer.clone());
+                state
+            });
 
             *local = Some(LocalQueue {
                 thread_scope: Arc::downgrade(scope),
                 worker,
+                index,
             });
         }
 
@@ -362,9 +373,6 @@ impl Runtime {
     pub fn stop(&self) {
         self.running.store(false, Relaxed);
         self.wake_all();
-
-        let duration = std::time::Duration::from_nanos(BLOCKED_NANOS.load(Relaxed));
-        eprintln!("blocked: {:?}", duration);
     }
 
     pub(crate) fn block_until_ready(
@@ -403,18 +411,9 @@ impl Runtime {
             }
         }
 
-        // wait until the query completes
-        {
-            while !state.is_ready(self.current_revision(), Relaxed) {
-                let validate = || state.set_blocking(Relaxed);
+        self.wait_on_query(path, state, current);
 
-                let start = std::time::Instant::now();
-                self.wait_on_query(state, validate);
-                let duration = start.elapsed();
-                BLOCKED_NANOS.fetch_add(duration.as_nanos() as u64, Relaxed);
-            }
-        }
-
+        // restore the current stack
         let mut stack = self
             .cycles
             .remove(current)
@@ -427,9 +426,71 @@ impl Runtime {
         assert!(state.is_ready(self.current_revision(), Acquire));
     }
 
-    fn wait_on_query(&self, state: &SlotState, validate: impl FnOnce() -> bool) {
+    fn wait_on_query(&self, path: ElementPath, state: &SlotState, stack: StackId) {
+        let worker = self
+            .with_local(|local| local.index)
+            .expect("not within a thread scope");
+
+        let entry = self.suspended.entry(path);
+
+        if !state.set_blocking(Relaxed) && state.is_ready(self.current_revision(), Relaxed) {
+            return;
+        }
+
+        let suspend = SuspendedStack { id: stack, worker };
+        entry.or_default().stacks.push(suspend);
+
+        // yield back to the scheduler if we are a child task
+        if let Some(mut transfer) = TRANSFER.with(|t| t.take()) {
+            loop {
+                transfer = unsafe { transfer.context.resume(0) };
+                if state.is_ready(self.current_revision(), Relaxed) {
+                    break;
+                }
+            }
+            TRANSFER.with(|t| t.set(Some(transfer)));
+            return;
+        }
+
+        // scheduler loop:
+        while !state.is_ready(self.current_revision(), Relaxed) {
+            if let Some(query) = self.next_query() {
+                if let Some((_, task)) = self.tasks.remove(&query) {
+                    self.start_task(task);
+                }
+                continue;
+            }
+        }
+
         let key = self as *const _ as usize;
+        let validate = || state.set_blocking(Relaxed);
         unsafe { parking_lot_core::park(key, validate, || {}, |_, _| {}, park_token(state), None) };
+    }
+
+    fn start_task(&self, task: Task) {
+        type TaskInit<'a> = (Task, &'a Runtime);
+
+        extern "C" fn exec_task(transfer: context::Transfer) -> ! {
+            let (task, runtime) = unsafe { (transfer.data as *const TaskInit).read() };
+
+            loop {}
+        }
+
+        let stack_id = task.state.stack;
+
+        let fixed = context::stack::ProtectedFixedSizeStack::new(task.state.min_stack_size)
+            .expect("could not allocate stack for task");
+
+        let stack = self.stacks.get_or_allocate(stack_id.0.get() as usize);
+        let stack = unsafe { (*stack.get()).write(fixed) };
+
+        let context = unsafe { context::Context::new(stack, exec_task) };
+
+        unsafe {
+            context.resume(&(task, self) as *const TaskInit as usize);
+        }
+
+        unsafe { self.free_stack(stack_id) }
     }
 
     fn wait_on_task(&self, validate: impl FnOnce() -> bool) {
@@ -493,12 +554,17 @@ fn park_token(state: &SlotState) -> parking_lot_core::ParkToken {
 }
 
 thread_local! {
+    static TRANSFER: Cell<Option<context::Transfer>> = Cell::new(None);
+}
+
+thread_local! {
     static LOCAL_QUEUE: RefCell<Option<LocalQueue>> = RefCell::new(None);
 }
 
 struct LocalQueue {
     thread_scope: Weak<ThreadScope>,
     worker: Worker<ElementPath>,
+    index: usize,
 }
 
 thread_local! {
@@ -632,7 +698,8 @@ struct Task {
 
 impl Task {
     fn run(self, runtime: &Runtime) {
-        (self.execute)(runtime, &self.state)
+        (self.execute)(runtime, &self.state);
+        std::mem::forget(self);
     }
 }
 
@@ -656,6 +723,8 @@ struct TaskState {
     last_verified: Option<Revision>,
     /// Stack which should be used when executing the query.
     stack: StackId,
+    /// Requested stack size.
+    min_stack_size: usize,
 }
 
 impl TaskState {
@@ -674,12 +743,23 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    pub fn add(&self, stealer: Stealer<ElementPath>) -> Self {
+    pub fn add(&self, stealer: Stealer<ElementPath>) -> (Self, usize) {
         let mut stealers = SmallVec::with_capacity(self.stealers.len());
+        let index = stealers.len();
         stealers.extend(self.stealers.iter().cloned());
         stealers.push(stealer);
-        Self { stealers }
+        (Self { stealers }, index)
     }
 }
 
 struct ThreadScope;
+
+#[derive(Default)]
+struct SuspendState {
+    stacks: SmallVec<[SuspendedStack; 2]>,
+}
+
+struct SuspendedStack {
+    id: StackId,
+    worker: usize,
+}

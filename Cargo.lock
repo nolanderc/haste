@@ -183,6 +183,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acbf1af155f9b9ef647e42cdc158db4b64a1b61f743629225fde6f3e0be2a7c7"
 
 [[package]]
+name = "context"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0adf149597f6e75ab7c41ec360dd1a74c86667cf0ef09bd3c207d508665f60e8"
+dependencies = [
+ "cc",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpu-time"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,6 +464,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytemuck",
+ "context",
  "crossbeam-deque",
  "dashmap",
  "fastrand",

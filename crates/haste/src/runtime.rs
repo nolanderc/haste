@@ -1,42 +1,46 @@
+mod coro;
 mod cycle;
 mod history;
-mod coro;
 
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
-    mem::MaybeUninit,
+    cell::{Cell, RefCell},
     num::{NonZeroU16, NonZeroU32},
+    ptr::NonNull,
     sync::{
         atomic::{
             AtomicBool, AtomicU64,
             Ordering::{Acquire, Relaxed},
         },
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_deque::{Stealer, Worker};
+use crossbeam_channel::Sender;
+use crossbeam_deque::{Injector, Stealer, Worker};
 use dashmap::DashMap;
-use smallvec::SmallVec;
+use hashbrown::HashMap;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    arena::Arena,
     cache::{SlotId, SlotState},
     durability::Durability,
     revision::Revision,
-    util::DynPointer,
+    util::{CallOnDrop, DynPointer},
     Database, Element, ElementDb, ElementId, ElementPath, Query,
 };
 
-use self::{cycle::CycleGraph, history::History};
+use self::{
+    coro::{Coroutine, Yielder},
+    cycle::CycleGraph,
+    history::History,
+};
 
 /// Smallest stack size to allocate for queries (in bytes).
-const MIN_STACK: usize = 32 * 1024;
+const MIN_STACK: usize = 16 * 1024;
 
 pub struct Runtime {
     stack_ids: StackIdAllocator,
-    stacks: Arena<UnsafeCell<MaybeUninit<context::stack::ProtectedFixedSizeStack>>>,
 
     cycles: CycleGraph,
     history: History,
@@ -44,6 +48,7 @@ pub struct Runtime {
     running: AtomicBool,
 
     thread_scope: Option<Arc<ThreadScope>>,
+    injector: Injector<ElementPath>,
     tasks: DashMap<ElementPath, Task>,
     workers: ArcSwap<WorkerState>,
     suspended: DashMap<ElementPath, SuspendState>,
@@ -56,11 +61,11 @@ impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
             stack_ids: StackIdAllocator::new(),
-            stacks: Arena::with_capacity(1 << 32),
             cycles: CycleGraph::default(),
             history: History::new(),
             running: AtomicBool::new(false),
             thread_scope: None,
+            injector: Injector::new(),
             tasks: DashMap::with_capacity(1024),
             workers: Default::default(),
             suspended: DashMap::with_capacity(1024),
@@ -76,10 +81,14 @@ impl Runtime {
 
     #[inline]
     pub(crate) unsafe fn exit(&mut self) {
-        self.tasks.clear();
-        std::mem::take(&mut self.workers);
+        assert!(self.thread_scope.is_some(), "scope was not entered");
         *self.running.get_mut() = false;
-        assert!(self.thread_scope.take().is_some(), "scope was not entered");
+        self.tasks.clear();
+        self.cycles.clear();
+        std::mem::take(&mut self.workers);
+        self.suspended.clear();
+        self.thread_scope = None;
+        self.stack_ids = StackIdAllocator::new();
     }
 
     #[inline]
@@ -197,7 +206,33 @@ impl Runtime {
         };
 
         if result.has_blocking {
-            self.wake_query(slot.state());
+            if let Some((_, suspended)) = self.suspended.remove(&path) {
+                let workers = self.workers.load();
+
+                let mut parked = false;
+                let mut blocked = SmallBitSet::with_capacity(workers.len());
+
+                for stack in suspended.stacks {
+                    if stack.worker == u32::MAX {
+                        parked = true;
+                        continue;
+                    }
+
+                    let worker = workers.get(stack.worker);
+
+                    _ = worker.sender.send(stack.id);
+
+                    if worker.blocked.load(Relaxed) {
+                        blocked.set(stack.worker as usize);
+                    }
+                }
+
+                if parked {
+                    self.wake_query(slot.state());
+                }
+
+                self.wake_blocked(&blocked);
+            }
         }
     }
 
@@ -243,8 +278,8 @@ impl Runtime {
 
         let args = slot.arguments_unchecked();
 
-        let output = stacker::maybe_grow(
-            usize::max(Q::REQUIRED_STACK, 32 * 1024),
+        let output = coro::maybe_grow(
+            usize::max(Q::REQUIRED_STACK, 8 * 1024),
             usize::max(Q::REQUIRED_STACK, MIN_STACK),
             || Q::execute(db, args.clone()),
         );
@@ -272,14 +307,17 @@ impl Runtime {
 
         let task = Task {
             state,
-            execute: |runtime, state| {
+            execute: |state| {
                 let db = unsafe { state.database::<Q>() };
                 let slot = unsafe { state.slot::<Q>() };
+
+                let runtime = db.runtime();
 
                 ACTIVE.with(|active| {
                     let old = active.borrow_mut().replace(ActiveStack::new(state.stack));
                     runtime.execute(db, slot, state.path, state.last_verified);
                     *active.borrow_mut() = old;
+                    runtime.free_stack(state.stack)
                 })
             },
             drop: |state| unsafe { state.slot::<Q>().release_claim() },
@@ -289,31 +327,43 @@ impl Runtime {
     }
 
     fn spawn_task(&self, query: ElementPath, task: Task) {
-        self.with_local(|local| local.worker.push(query))
-            .expect("spawned query outside thread scope");
+        assert!(
+            self.thread_scope.is_some(),
+            "cannot spawn tasks outside a thread scope"
+        );
         self.tasks.insert(query, task);
-        self.wake_one();
+        self.injector.push(query);
+        self.wake_task();
     }
 
-    fn next_query(&self) -> Option<ElementPath> {
-        self.with_local(|local| local.worker.pop().or_else(|| self.try_steal_task(local)))?
+    fn next_query(&self, local: &Worker<ElementPath>) -> Option<ElementPath> {
+        local.pop().or_else(|| self.try_steal_task(local))
     }
 
-    fn try_steal_task(&self, local: &LocalQueue) -> Option<ElementPath> {
-        let workers = self.workers.load();
-        let stealers = workers.stealers.as_slice();
-
-        let first = fastrand::usize(0..stealers.len());
-        let (before, after) = stealers.split_at(first);
-
+    fn try_steal_task(&self, local: &Worker<ElementPath>) -> Option<ElementPath> {
         loop {
             let mut retry = false;
 
-            for stealer in before.iter().chain(after) {
+            match self.injector.steal_batch_and_pop(local) {
+                crossbeam_deque::Steal::Empty => {}
+                crossbeam_deque::Steal::Success(query) => return Some(query),
+                crossbeam_deque::Steal::Retry => retry = true,
+            }
+
+            let workers = self.workers.load();
+            let workers = workers.data.as_slice();
+
+            let first = fastrand::usize(0..workers.len());
+            let (before, after) = workers.split_at(first);
+
+            let order = after.iter().chain(before);
+
+            for worker in order {
                 use crossbeam_deque::Steal;
-                match stealer.steal_batch_and_pop(&local.worker) {
-                    Steal::Empty => continue,
-                    Steal::Success(task) => return Some(task),
+
+                match worker.stealer.steal_batch_and_pop(local) {
+                    Steal::Empty => {}
+                    Steal::Success(query) => return Some(query),
                     Steal::Retry => retry = true,
                 }
             }
@@ -324,55 +374,93 @@ impl Runtime {
         }
     }
 
-    fn with_local<R>(&self, callback: impl FnOnce(&LocalQueue) -> R) -> Option<R> {
-        LOCAL_QUEUE.with(|local| Some(callback(self.init_local(&mut local.borrow_mut())?)))
-    }
+    fn init_worker(&self, data: WorkerData) -> u32 {
+        let mut index = 0;
 
-    fn init_local<'a>(&self, local: &'a mut Option<LocalQueue>) -> Option<&'a LocalQueue> {
-        let scope = self.thread_scope.as_ref()?;
+        self.workers.rcu(|workers| {
+            let state;
+            (state, index) = workers.add(data.clone());
+            state
+        });
 
-        let recreate = match local.as_ref() {
-            None => true,
-            Some(local) => local.thread_scope.as_ptr() != Arc::as_ptr(scope),
-        };
-
-        if recreate {
-            let worker = Worker::new_lifo();
-            let stealer = worker.stealer();
-
-            let mut index = 0;
-            self.workers.rcu(|workers| {
-                let state;
-                (state, index) = workers.add(stealer.clone());
-                state
-            });
-
-            *local = Some(LocalQueue {
-                thread_scope: Arc::downgrade(scope),
-                worker,
-                index,
-            });
-        }
-
-        local.as_ref()
+        index
     }
 
     pub fn drive(&self) {
+        assert!(self.thread_scope.is_some(), "not within a thread scope");
+        YIELDER.with(|y| {
+            assert!(y.get().is_none(), "cannot nest thread scope");
+        });
+
+        let blocked = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let worker = Worker::new_lifo();
+
+        let index = self.init_worker(WorkerData {
+            blocked: blocked.clone(),
+            sender,
+            stealer: worker.stealer(),
+        });
+
+        let mut suspended = HashMap::new();
+
+        let mut next_suspended = None;
+
         while self.running.load(Relaxed) {
-            if let Some(query) = self.next_query() {
-                if let Some((_, task)) = self.tasks.remove(&query) {
-                    task.run(self);
+            if let Some(stack) = next_suspended.take().or_else(|| receiver.try_recv().ok()) {
+                if let Some(task) = suspended.remove(&stack) {
+                    self.poll_task(task, &mut suspended);
                 }
                 continue;
             }
 
-            self.wait_on_task(|| self.running.load(Relaxed));
+            if let Some(query) = self.next_query(&worker) {
+                if let Some((_, task)) = self.tasks.remove(&query) {
+                    let task = self.create_task(task, index);
+                    self.poll_task(task, &mut suspended);
+                }
+                continue;
+            }
+
+            blocked.store(true, Relaxed);
+            self.wait_on_task(index, || {
+                next_suspended = receiver.try_recv().ok();
+                next_suspended.is_none() && self.running.load(Relaxed)
+            });
+            blocked.store(false, Relaxed);
+        }
+    }
+
+    fn create_task(&self, task: Task, worker: u32) -> SuspendedTask {
+        let coro = Coroutine::new(task.state.min_stack_size, move |yielder| {
+            YIELDER.with(|y| {
+                y.set(Some(StaticYielder {
+                    raw: NonNull::new(yielder).unwrap(),
+                    worker,
+                }))
+            });
+
+            let _guard = CallOnDrop::new(move || YIELDER.with(|y| y.set(None)));
+
+            task.run();
+        })
+        .expect("could not allocate stack space for query");
+
+        SuspendedTask { coro }
+    }
+
+    fn poll_task(&self, mut task: SuspendedTask, suspended: &mut HashMap<StackId, SuspendedTask>) {
+        match task.coro.resume() {
+            std::ops::ControlFlow::Break(()) => {}
+            std::ops::ControlFlow::Continue(stack) => {
+                suspended.insert(stack, task);
+            }
         }
     }
 
     pub fn stop(&self) {
         self.running.store(false, Relaxed);
-        self.wake_all();
+        self.wake_all_workers();
     }
 
     pub(crate) fn block_until_ready(
@@ -383,7 +471,7 @@ impl Runtime {
     ) {
         // if the query has been spawned in the runtime, try executing it immediately
         if let Some((_, task)) = self.tasks.remove(&path) {
-            task.run(self);
+            task.run();
             if state.is_ready(self.current_revision(), Acquire) {
                 return;
             }
@@ -427,9 +515,15 @@ impl Runtime {
     }
 
     fn wait_on_query(&self, path: ElementPath, state: &SlotState, stack: StackId) {
-        let worker = self
-            .with_local(|local| local.index)
-            .expect("not within a thread scope");
+        let (worker, yielder) = YIELDER.with(|y| match y.take() {
+            None => (u32::MAX, None),
+            Some(yielder) => (yielder.worker, Some(yielder.raw)),
+        });
+        let _guard = CallOnDrop::new(|| {
+            if let Some(raw) = yielder {
+                YIELDER.with(|y| y.set(Some(StaticYielder { raw, worker })))
+            }
+        });
 
         let entry = self.suspended.entry(path);
 
@@ -441,74 +535,37 @@ impl Runtime {
         entry.or_default().stacks.push(suspend);
 
         // yield back to the scheduler if we are a child task
-        if let Some(mut transfer) = TRANSFER.with(|t| t.take()) {
+        if let Some(yielder) = yielder {
             loop {
-                transfer = unsafe { transfer.context.resume(0) };
+                unsafe { (*yielder.as_ptr()).yield_(stack) };
                 if state.is_ready(self.current_revision(), Relaxed) {
                     break;
                 }
             }
-            TRANSFER.with(|t| t.set(Some(transfer)));
             return;
         }
 
-        // scheduler loop:
-        while !state.is_ready(self.current_revision(), Relaxed) {
-            if let Some(query) = self.next_query() {
-                if let Some((_, task)) = self.tasks.remove(&query) {
-                    self.start_task(task);
-                }
-                continue;
+        // block until the query is completed otherwise
+        loop {
+            let validate = || !state.is_ready(self.current_revision(), Relaxed);
+            unsafe {
+                parking_lot_core::park(
+                    self.query_key(),
+                    validate,
+                    || {},
+                    |_, _| {},
+                    park_token(state),
+                    None,
+                )
+            };
+
+            if state.is_ready(self.current_revision(), Relaxed) {
+                break;
             }
         }
-
-        let key = self as *const _ as usize;
-        let validate = || state.set_blocking(Relaxed);
-        unsafe { parking_lot_core::park(key, validate, || {}, |_, _| {}, park_token(state), None) };
-    }
-
-    fn start_task(&self, task: Task) {
-        type TaskInit<'a> = (Task, &'a Runtime);
-
-        extern "C" fn exec_task(transfer: context::Transfer) -> ! {
-            let (task, runtime) = unsafe { (transfer.data as *const TaskInit).read() };
-
-            loop {}
-        }
-
-        let stack_id = task.state.stack;
-
-        let fixed = context::stack::ProtectedFixedSizeStack::new(task.state.min_stack_size)
-            .expect("could not allocate stack for task");
-
-        let stack = self.stacks.get_or_allocate(stack_id.0.get() as usize);
-        let stack = unsafe { (*stack.get()).write(fixed) };
-
-        let context = unsafe { context::Context::new(stack, exec_task) };
-
-        unsafe {
-            context.resume(&(task, self) as *const TaskInit as usize);
-        }
-
-        unsafe { self.free_stack(stack_id) }
-    }
-
-    fn wait_on_task(&self, validate: impl FnOnce() -> bool) {
-        let key = self as *const _ as usize;
-        unsafe {
-            parking_lot_core::park(
-                key,
-                validate,
-                || {},
-                |_, _| {},
-                parking_lot_core::DEFAULT_PARK_TOKEN,
-                None,
-            )
-        };
     }
 
     fn wake_query(&self, state: &SlotState) {
-        let key = self as *const _ as usize;
         let wake_token = park_token(state);
         let filter = |token| {
             if token == wake_token {
@@ -518,21 +575,34 @@ impl Runtime {
             }
         };
         let callback = |_| parking_lot_core::DEFAULT_UNPARK_TOKEN;
-        unsafe { parking_lot_core::unpark_filter(key, filter, callback) };
+        unsafe { parking_lot_core::unpark_filter(self.query_key(), filter, callback) };
     }
 
-    fn wake_one(&self) {
-        let key = self as *const _ as usize;
+    fn wait_on_task(&self, worker: u32, validate: impl FnOnce() -> bool) {
+        unsafe {
+            parking_lot_core::park(
+                self.task_key(),
+                validate,
+                || {},
+                |_, _| {},
+                parking_lot_core::ParkToken(worker as usize),
+                None,
+            )
+        };
+    }
+
+    fn wake_task(&self) {
         let callback = |_| parking_lot_core::DEFAULT_UNPARK_TOKEN;
-        let mut unparked = false;
+        unsafe { parking_lot_core::unpark_one(self.task_key(), callback) };
+    }
+
+    fn wake_blocked(&self, workers: &SmallBitSet) {
+        let callback = |_| parking_lot_core::DEFAULT_UNPARK_TOKEN;
         unsafe {
             parking_lot_core::unpark_filter(
-                key,
+                self.task_key(),
                 |token| {
-                    if unparked {
-                        parking_lot_core::FilterOp::Stop
-                    } else if token == parking_lot_core::DEFAULT_PARK_TOKEN {
-                        unparked = true;
+                    if workers.get(token.0) {
                         parking_lot_core::FilterOp::Unpark
                     } else {
                         parking_lot_core::FilterOp::Skip
@@ -543,9 +613,18 @@ impl Runtime {
         };
     }
 
-    fn wake_all(&self) {
-        let key = self as *const _ as usize;
-        unsafe { parking_lot_core::unpark_all(key, parking_lot_core::DEFAULT_UNPARK_TOKEN) };
+    fn wake_all_workers(&self) {
+        unsafe {
+            parking_lot_core::unpark_all(self.task_key(), parking_lot_core::DEFAULT_UNPARK_TOKEN);
+        }
+    }
+
+    fn query_key(&self) -> usize {
+        self as *const _ as usize + 1
+    }
+
+    fn task_key(&self) -> usize {
+        self as *const _ as usize + 2
     }
 }
 
@@ -554,17 +633,21 @@ fn park_token(state: &SlotState) -> parking_lot_core::ParkToken {
 }
 
 thread_local! {
-    static TRANSFER: Cell<Option<context::Transfer>> = Cell::new(None);
+    static WORKER: Cell<Option<u32>> = Cell::new(None);
 }
 
 thread_local! {
-    static LOCAL_QUEUE: RefCell<Option<LocalQueue>> = RefCell::new(None);
+    static YIELDER: Cell<Option<StaticYielder>> = Cell::new(None);
 }
 
-struct LocalQueue {
-    thread_scope: Weak<ThreadScope>,
-    worker: Worker<ElementPath>,
-    index: usize,
+#[derive(Clone, Copy)]
+struct StaticYielder {
+    raw: NonNull<Yielder<(), StackId>>,
+    worker: u32,
+}
+
+struct SuspendedTask {
+    coro: Coroutine<(), StackId>,
 }
 
 thread_local! {
@@ -697,8 +780,8 @@ struct Task {
 }
 
 impl Task {
-    fn run(self, runtime: &Runtime) {
-        (self.execute)(runtime, &self.state);
+    fn run(self) {
+        (self.execute)(&self.state);
         std::mem::forget(self);
     }
 }
@@ -709,7 +792,7 @@ impl Drop for Task {
     }
 }
 
-type ExecuteFn = fn(&Runtime, &TaskState);
+type ExecuteFn = fn(&TaskState);
 type DropFn = fn(&TaskState);
 
 struct TaskState {
@@ -739,17 +822,34 @@ impl TaskState {
 
 #[derive(Default)]
 struct WorkerState {
-    stealers: SmallVec<[Stealer<ElementPath>; 32]>,
+    data: SmallVec<[WorkerData; 32]>,
 }
 
 impl WorkerState {
-    pub fn add(&self, stealer: Stealer<ElementPath>) -> (Self, usize) {
-        let mut stealers = SmallVec::with_capacity(self.stealers.len());
-        let index = stealers.len();
-        stealers.extend(self.stealers.iter().cloned());
-        stealers.push(stealer);
-        (Self { stealers }, index)
+    pub fn add(&self, new: WorkerData) -> (Self, u32) {
+        let index = u32::try_from(self.data.len()).expect("exhausted number of workers");
+
+        let mut data = SmallVec::with_capacity(self.data.len());
+        data.extend(self.data.iter().cloned());
+        data.push(new);
+
+        (Self { data }, index)
     }
+
+    pub fn get(&self, index: u32) -> &WorkerData {
+        &self.data[index as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+#[derive(Clone)]
+struct WorkerData {
+    stealer: Stealer<ElementPath>,
+    sender: Sender<StackId>,
+    blocked: Arc<AtomicBool>,
 }
 
 struct ThreadScope;
@@ -761,5 +861,63 @@ struct SuspendState {
 
 struct SuspendedStack {
     id: StackId,
-    worker: usize,
+    worker: u32,
+}
+
+struct SmallBitSet {
+    words: SmallVec<[u64; 4]>,
+}
+
+impl SmallBitSet {
+    pub fn with_capacity(len: usize) -> Self {
+        Self {
+            words: smallvec![0; (len + 63) / 64],
+        }
+    }
+
+    pub fn set(&mut self, index: usize) {
+        self.words[index / 64] |= Self::mask(index);
+    }
+
+    pub fn get(&self, index: usize) -> bool {
+        self.words[index / 64] & Self::mask(index) != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(i, word)| {
+            let mut word = *word;
+            let mut index = i * 64;
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+
+                let offset = word.trailing_zeros();
+                word >>= offset;
+                word >>= 1;
+                index += offset as usize;
+                let next = index;
+                index += 1;
+
+                Some(next)
+            })
+        })
+    }
+
+    fn mask(index: usize) -> u64 {
+        1 << (index % 64)
+    }
+}
+
+#[test]
+fn small_bitset() {
+    let mut bits = SmallBitSet::with_capacity(128);
+    bits.set(1);
+    bits.set(64);
+    bits.set(127);
+    bits.set(13);
+    bits.set(78);
+
+    assert_eq!(bits.iter().collect::<Vec<_>>(), [1, 13, 64, 78, 127]);
 }

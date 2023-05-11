@@ -23,15 +23,17 @@ fn main() {
         let text = Text::insert(db, TextData("hello".into()));
         assert_eq!(format!("{:?}", text.debug(db)), "\"hello\"");
 
-        let n = 300;
-        let threads = 8;
+        let n = 2000;
+        let threads = 1;
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                for _ in 0..threads {
-                    binom(db, n, n / 2);
-                }
-            });
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    db.storage.runtime().drive();
+                });
+            }
+            binom(db, n, n / 2);
+            db.storage.runtime().stop();
         });
     });
     let duration = start.elapsed();

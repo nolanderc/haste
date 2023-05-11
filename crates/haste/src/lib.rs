@@ -185,7 +185,7 @@ pub trait Query: Element {
     type View<'a>;
 
     /// Amount of stack space required by the query.
-    const REQUIRED_STACK: usize = 512 * 1024;
+    const REQUIRED_STACK: usize = 16 * 1024;
 
     /// Determines if this is an input query. If `true` this query cannot invoke any other queries.
     const IS_INPUT: bool = false;

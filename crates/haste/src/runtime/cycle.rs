@@ -60,6 +60,10 @@ impl CycleGraph {
         Some(block.stack)
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.blocks.clear()
+    }
+
     fn detect_cycle(&self, start: StackId) -> Option<StackId> {
         let mut tortoise = start;
         let mut hare = self.blocks.get(&start)?.blocked_on;

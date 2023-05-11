@@ -11,6 +11,8 @@ use context::{
     Context, Transfer,
 };
 
+use crate::util::CallOnDrop;
+
 pub struct Coroutine<Output, Yield = ()> {
     #[allow(dead_code)]
     stack: ProtectedFixedSizeStack,
@@ -30,14 +32,14 @@ impl<Output, Yield> Coroutine<Output, Yield> {
         }))
     }
 
-    fn with_stack<F>(stack: ProtectedFixedSizeStack, f: F) -> Self
+    fn with_stack<F>(stack: ProtectedFixedSizeStack, func: F) -> Self
     where
         F: FnOnce(&mut Yielder<Output, Yield>) -> Never,
     {
         let context = unsafe { Context::new(&stack, Self::entry_point::<F>) };
 
         // initialize the coroutine with the function
-        let f = MaybeUninit::new(f);
+        let f = MaybeUninit::new(CoroInit { func });
         let transfer = unsafe { context.resume(f.as_ptr() as usize) };
 
         Self {
@@ -57,9 +59,13 @@ impl<Output, Yield> Coroutine<Output, Yield> {
         };
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let f: F = unsafe { (yielder.transfer.data as *const F).read() };
+            let init = unsafe { (yielder.transfer.data as *const CoroInit<F>).read() };
+
+            let func = init.func;
+
             yielder.resume(0);
-            f(&mut yielder)
+
+            func(&mut yielder)
         }));
 
         match result {
@@ -79,7 +85,18 @@ impl<Output, Yield> Coroutine<Output, Yield> {
             .take()
             .expect("coroutine resumed after it already terminated");
 
-        let transfer = unsafe { context.resume(0) };
+        let transfer = {
+            let old_stack = STACK.with(|stack| {
+                stack.replace(Some(StackAddr {
+                    top: self.stack.top() as usize,
+                    bottom: self.stack.bottom() as usize,
+                }))
+            });
+
+            let _guard = CallOnDrop::new(move || STACK.with(|stack| stack.set(old_stack)));
+
+            unsafe { context.resume(0) }
+        };
 
         if transfer.data == PANIC {
             let payload = PANIC_PAYLOAD
@@ -93,18 +110,21 @@ impl<Output, Yield> Coroutine<Output, Yield> {
             std::panic::resume_unwind(payload);
         }
 
-        if transfer.data & 1 == 1 {
-            self.context = Some(transfer.context);
+        let tag = transfer.data & 0b11;
+        let addr = transfer.data & !0b11;
 
-            let addr = transfer.data & !1;
-            let yield_ = unsafe { &mut *(addr as *mut AlignedTransfer<Yield>) };
-            let yield_ = yield_.0.take().unwrap();
-
-            return ControlFlow::Continue(yield_);
+        match tag {
+            tag::YIELD => {
+                self.context = Some(transfer.context);
+                let yield_ = unsafe { &mut *(addr as *mut AlignedTransfer<Yield>) };
+                ControlFlow::Continue(yield_.0.take().unwrap())
+            }
+            tag::FINISH => {
+                let output = unsafe { &mut *(addr as *mut AlignedTransfer<Output>) };
+                ControlFlow::Break(output.0.take().unwrap())
+            }
+            _ => unreachable!("invalid tag: {tag}"),
         }
-
-        let output = unsafe { &mut *(transfer.data as *mut AlignedTransfer<Output>) };
-        ControlFlow::Break(output.0.take().unwrap())
     }
 }
 
@@ -124,23 +144,33 @@ thread_local! {
 
 type PanicPayload = Box<dyn std::any::Any + Send>;
 
+struct CoroInit<F> {
+    func: F,
+}
+
 pub enum Never {}
 
-pub struct Yielder<Output, Yield> {
+pub struct Yielder<Output, Yield = ()> {
     transfer: ManuallyDrop<Transfer>,
     _phantom: PhantomData<(*const Output, *const Yield)>,
+}
+
+#[derive(Clone, Copy)]
+pub struct StackAddr {
+    pub top: usize,
+    pub bottom: usize,
 }
 
 impl<Output, Yield> Yielder<Output, Yield> {
     pub fn yield_(&mut self, value: Yield) {
         let mut aligned = AlignedTransfer(Some(value));
-        self.resume(aligned.addr(true))
+        self.resume(aligned.addr(tag::YIELD))
     }
 
     fn finish(&mut self, output: Output) -> ! {
         let mut aligned = AlignedTransfer(Some(output));
         loop {
-            self.resume(aligned.addr(false))
+            self.resume(aligned.addr(tag::FINISH));
         }
     }
 
@@ -159,13 +189,19 @@ impl<Output, Yield> Yielder<Output, Yield> {
 struct AlignedTransfer<T>(Option<T>);
 
 impl<T> AlignedTransfer<T> {
-    fn addr(&mut self, yield_: bool) -> usize {
-        (self as *mut Self as usize) | (yield_ as usize)
+    fn addr(&mut self, tag: usize) -> usize {
+        assert!(tag < 4);
+        (self as *mut Self as usize) | tag
     }
 }
 
 const PANIC: usize = 0;
 const CANCEL: usize = 1;
+
+mod tag {
+    pub const YIELD: usize = 0;
+    pub const FINISH: usize = 1;
+}
 
 #[test]
 fn range_generator() -> Result<(), StackError> {
@@ -188,4 +224,44 @@ fn range_generator() -> Result<(), StackError> {
     assert_eq!(gen.resume(), ControlFlow::Break(()));
 
     Ok(())
+}
+
+pub fn maybe_grow<F, R>(red_zone: usize, stack_size: usize, callback: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if remaining_stack().unwrap_or(0) > red_zone {
+        return callback();
+    }
+
+    let mut coro =
+        Coroutine::new(stack_size, move |_yielder| callback()).expect("could not allocate stack");
+
+    loop {
+        match coro.resume() {
+            std::ops::ControlFlow::Continue(()) => unreachable!(),
+            std::ops::ControlFlow::Break(value) => return value,
+        }
+    }
+}
+
+pub fn remaining_stack() -> Option<usize> {
+    if let Some(stack) = STACK.with(|s| s.get()) {
+        let current = psm::stack_pointer() as usize;
+
+        if !(stack.bottom <= current && current <= stack.top) {
+            return None;
+        }
+
+        match psm::StackDirection::new() {
+            psm::StackDirection::Ascending => Some(stack.top - current),
+            psm::StackDirection::Descending => Some(current - stack.bottom),
+        }
+    } else {
+        stacker::remaining_stack()
+    }
+}
+
+thread_local! {
+    static STACK: Cell<Option<StackAddr>> = Cell::new(None);
 }

@@ -33,3 +33,25 @@ impl DynPointer {
         ptr.assume_init()
     }
 }
+
+pub struct CallOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for CallOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f()
+        }
+    }
+}
+
+impl<F: FnOnce()> CallOnDrop<F> {
+    pub fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+
+    #[allow(dead_code)]
+    pub fn cancel(mut self) {
+        self.0.take();
+        std::mem::forget(self);
+    }
+}

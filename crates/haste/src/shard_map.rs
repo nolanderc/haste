@@ -1,96 +1,129 @@
-use dashmap::RwLock;
-use std::{
-    hash::{BuildHasher, Hash, Hasher},
-    sync::atomic::AtomicUsize,
+use std::sync::{
+    atomic::{AtomicU64, Ordering::Relaxed},
+    RwLock, RwLockWriteGuard,
 };
 
 use crossbeam_utils::CachePadded;
 use hashbrown::raw::RawTable;
 
-type BuildHasherDefault = std::hash::BuildHasherDefault<ahash::AHasher>;
-
-pub struct ShardMap<T, Hasher = BuildHasherDefault> {
-    pub(crate) shards: Box<[CachePadded<Shard<T>>]>,
-    hasher: Hasher,
+pub struct ShardLookup {
+    shards: Vec<CachePadded<RwLock<Shard>>>,
+    indices: IndexAllocator,
 }
 
-pub type Shard<T> = RwLock<RawTable<T>>;
-
-impl<T, Hasher> Default for ShardMap<T, Hasher>
-where
-    Hasher: Default,
-{
+impl Default for ShardLookup {
     fn default() -> Self {
-        Self::new()
-    }
-}
+        let thread_count = 1 + crate::runtime::executor::worker_threads();
+        let shard_count = (4 * thread_count * thread_count.ilog2() as usize).next_power_of_two();
 
-static SHARDS: AtomicUsize = AtomicUsize::new(0);
-
-fn get_shard_count() -> usize {
-    let old = SHARDS.load(std::sync::atomic::Ordering::Relaxed);
-    if old != 0 {
-        return old;
-    }
-
-    let threads = 1 + crate::runtime::executor::worker_threads();
-
-    let shard_count = (4 * threads).next_power_of_two();
-    SHARDS.store(shard_count, std::sync::atomic::Ordering::Relaxed);
-    shard_count
-}
-
-impl<T, Hasher> ShardMap<T, Hasher> {
-    pub fn new() -> Self
-    where
-        Hasher: Default,
-    {
-        let shard_count = get_shard_count();
-        let mut shards = Vec::with_capacity(shard_count);
-
-        for _ in 0..shard_count {
-            shards.push(CachePadded::new(Shard::new(RawTable::with_capacity(1024))));
-        }
-
-        assert!(shards.len().is_power_of_two());
+        let mut shards = Vec::new();
+        shards.resize_with(shard_count, || CachePadded::new(RwLock::new(Shard::new())));
 
         Self {
-            shards: shards.into(),
-            hasher: Default::default(),
+            shards,
+            indices: IndexAllocator {
+                next: AtomicU64::new(0),
+            },
         }
-    }
-
-    pub fn hash<U: ?Sized>(&self, value: &U) -> u64
-    where
-        U: Hash,
-        Hasher: BuildHasher,
-    {
-        hash_one(value, &self.hasher)
-    }
-
-    pub fn shard_index(&self, hash: u64) -> usize {
-        // get the highest bits of the hash to reduce the likelihood of hash collisions
-        let shards = self.shards.len();
-        let shard_bits = shards.ilog2();
-        let shift_amount = (64 - 7) - shard_bits;
-        (hash as usize >> shift_amount) & (shards - 1)
-    }
-
-    pub fn shard(&self, hash: u64) -> &Shard<T> {
-        &self.shards[self.shard_index(hash)]
-    }
-
-    pub fn shard_mut(&mut self, hash: u64) -> &mut Shard<T> {
-        &mut self.shards[self.shard_index(hash)]
     }
 }
 
-/// Use a hasher to hash a single value.
-fn hash_one<T: Hash + ?Sized, Hasher>(key: &T, builder: &Hasher) -> u64
-where
-    Hasher: BuildHasher,
-{
-    let mut state = builder.build_hasher();
-    key.hash(&mut state);
-    state.finish()
+impl ShardLookup {
+    /// Get the index of a value, possibly by inserting it into some other collection.
+    ///
+    /// `eq` determines if the inserted value is equal to the one at the given index. The index is
+    /// guaranteed to be protected by a read lock.
+    ///
+    /// `hasher` determines the hash of the value at the given index. The index is guaranteed to be
+    /// protected by a write lock.
+    pub fn get_or_insert(
+        &self,
+        hash: u64,
+        eq: impl Fn(u32) -> bool,
+        hasher: impl Fn(u32) -> u64,
+    ) -> ShardResult {
+        let shards = &self.shards;
+        let shard_handle = &shards[shard_index(hash, shards.len())];
+
+        let shard = shard_handle.read().unwrap();
+        if let Some(&old) = shard.entries.get(hash, |index| eq(*index)) {
+            return ShardResult::Cached(old);
+        }
+
+        let len_before = shard.entries.len();
+        drop(shard);
+        let mut shard = shard_handle.write().unwrap();
+        let len_after = shard.entries.len();
+
+        if len_before != len_after {
+            if let Some(&old) = shard.entries.get(hash, |index| eq(*index)) {
+                return ShardResult::Cached(old);
+            }
+        }
+
+        let index = if let Some(index) = shard.reserved.next() {
+            index
+        } else {
+            shard.reserved = self.indices.allocate(1024);
+            shard.reserved.next().unwrap()
+        };
+
+        shard.entries.insert(hash, index, |index| hasher(*index));
+
+        ShardResult::Insert(index, WriteGuard(shard))
+    }
+
+    pub fn get(&self, hash: u64, eq: impl Fn(u32) -> bool) -> Option<u32> {
+        let shards = &self.shards;
+        let shard_handle = &shards[shard_index(hash, shards.len())];
+        let shard = shard_handle.read().unwrap();
+        shard.entries.get(hash, |index| eq(*index)).copied()
+    }
+}
+
+pub enum ShardResult<'a> {
+    Cached(u32),
+    Insert(u32, WriteGuard<'a>),
+}
+
+pub struct WriteGuard<'a>(RwLockWriteGuard<'a, Shard>);
+
+fn shard_index(hash: u64, shard_count: usize) -> usize {
+    let shard_bits = shard_count.trailing_zeros();
+    // hashbrown uses the top 7 bits
+    let top_bits = hash >> (64 - 7 - shard_bits);
+    (top_bits as usize) & (shard_count - 1)
+}
+
+struct IndexAllocator {
+    next: AtomicU64,
+}
+
+impl IndexAllocator {
+    fn allocate(&self, count: u64) -> std::ops::Range<u32> {
+        let start = self.next.fetch_add(count, Relaxed);
+        let end = start + count;
+
+        let max = u64::from(u32::MAX);
+        if end > max {
+            self.next.store(max + 1, Relaxed);
+            panic!("exhausted IDs")
+        }
+
+        start as u32..end as u32
+    }
+}
+
+struct Shard {
+    entries: RawTable<u32>,
+    reserved: std::ops::Range<u32>,
+}
+
+impl Shard {
+    fn new() -> Self {
+        Self {
+            entries: RawTable::new(),
+            reserved: 0..0,
+        }
+    }
 }

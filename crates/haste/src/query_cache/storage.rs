@@ -372,18 +372,6 @@ impl<Q: Query> QuerySlot<Q> {
         );
     }
 
-    pub fn remove_output(&mut self, runtime: &mut Runtime)
-    where
-        Q: crate::Input,
-    {
-        if let Some(output) = self.get_output_mut() {
-            let durability = output.transitive.durability();
-            self.cell.remove_output(runtime, durability, |output| {
-                output.transitive.get_input_id()
-            });
-        }
-    }
-
     pub fn last_verified(&self) -> Option<Revision> {
         self.cell.last_verified()
     }

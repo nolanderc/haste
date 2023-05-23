@@ -223,28 +223,6 @@ impl<I, O> QueryCell<I, O> {
         self.state.changed_at.set(Some(current));
     }
 
-    pub fn remove_output(
-        &mut self,
-        runtime: &mut Runtime,
-        durability: Durability,
-        get_input_id: impl FnOnce(&O) -> Option<InputId>,
-    ) {
-        let state = self.state.addr.get_mut();
-        let output = self.output.get_mut();
-
-        if (*state & HAS_OUTPUT) == 0 {
-            return;
-        }
-
-        let input_id = get_input_id(unsafe { output.assume_init_ref() });
-        let current = runtime.update_input(input_id, durability);
-
-        unsafe { output.assume_init_drop() }
-        *state &= !HAS_OUTPUT;
-
-        self.state.changed_at.set(Some(current));
-    }
-
     /// # Safety
     ///
     /// The caller must have a claim on the query.

@@ -369,13 +369,6 @@ impl<T> Arena<T> {
         }
     }
 
-    pub fn push(&self, value: T) -> usize {
-        let index = self.raw.push_zeroed();
-        // SAFETY: we just pushed this index, so no other thread will write to the same slot.
-        unsafe { self.raw.get_unchecked(index).write_unique(value) };
-        index
-    }
-
     pub fn get(&self, index: usize) -> Option<&T> {
         self.raw.get(index)?.get()
     }
@@ -383,6 +376,14 @@ impl<T> Arena<T> {
     #[allow(dead_code)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.raw.get_mut(index)?.get_mut()
+    }
+
+    /// # Safety
+    ///
+    /// The caller ensures that the cell has never been written to before and that there are no
+    /// concurrent writes. Concurrent reads are allowed.
+    pub(crate) unsafe fn write_unique(&self, index: usize, value: T) -> &T {
+        self.raw.get_or_allocate(index).write_unique(value)
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{shard_map::ShardMap, Id, Query, TrackedReference};
+use crate::{shard_map::ShardLookup, Id, Query, TrackedReference};
 
 use super::storage::{QuerySlot, QueryStorage};
 
@@ -18,35 +18,12 @@ pub trait LookupStrategy<Q: Query>: Sync {
         input: &Q::Input,
         storage: &'a mut QueryStorage<Q>,
     ) -> Option<(Id, &'a mut QuerySlot<Q>)>;
-
-    /// Remove the slot with the given input from the mapping.
-    fn remove<'a>(
-        &mut self,
-        input: &Q::Input,
-        storage: &'a mut QueryStorage<Q>,
-    ) -> Option<(Id, &'a mut QuerySlot<Q>)>;
 }
 
 /// Uses the hash of the input as the key.
 #[derive(Default)]
 pub struct HashStrategy {
-    entries: ShardMap<Id>,
-}
-
-impl HashStrategy {
-    fn eq_fn<'a, Q>(
-        expected: &'a Q::Input,
-        storage: &'a QueryStorage<Q>,
-    ) -> impl Fn(&Id) -> bool + Copy + 'a
-    where
-        Q: Query,
-    {
-        move |key: &Id| {
-            // SAFETY: all entries are valid
-            let slot = unsafe { storage.get_slot_unchecked(*key) };
-            slot.input() == expected
-        }
-    }
+    entries: ShardLookup,
 }
 
 impl<Q: Query> LookupStrategy<Q> for HashStrategy
@@ -58,39 +35,28 @@ where
         input: Q::Input,
         storage: &'a QueryStorage<Q>,
     ) -> (Id, &'a QuerySlot<Q>) {
-        let eq_fn = Self::eq_fn(&input, storage);
-        let hash = self.entries.hash(&input);
+        let hash = fxhash::hash64(&input);
 
-        // First check if the value already exists.
-        let shard = self.entries.shard(hash).read();
-        if let Some(&id) = shard.get(hash, eq_fn) {
-            return (id, unsafe { storage.get_slot_unchecked(id) });
+        unsafe fn slot<Q: Query>(storage: &QueryStorage<Q>, index: u32) -> &QuerySlot<Q> {
+            storage.get_slot_unchecked(Id::try_from_usize(index as usize).unwrap())
         }
 
-        let len_before = shard.len();
-        drop(shard);
+        let result = self.entries.get_or_insert(
+            hash,
+            |index| unsafe { slot(storage, index).input_unchecked() == &input },
+            |index| unsafe { fxhash::hash64(slot(storage, index).input_unchecked()) },
+        );
 
-        let mut shard = self.entries.shard(hash).write();
-        let len_after = shard.len();
-
-        // Make sure the value was not inserted while we waited on the write lock
-        if len_before != len_after {
-            // a value has been inserted (we never remove values without `&mut self`, and we hold
-            // a `&self` so it must hold that `len_before <= len_after`)
-            if let Some(&id) = shard.get(hash, eq_fn) {
-                return (id, unsafe { storage.get_slot_unchecked(id) });
+        match result {
+            crate::shard_map::ShardResult::Cached(index) => {
+                let id = Id::try_from_usize(index as usize).unwrap();
+                (id, unsafe { storage.get_slot_unchecked(id) })
+            }
+            crate::shard_map::ShardResult::Insert(index, _write_guard) => {
+                let id = Id::try_from_usize(index as usize).unwrap();
+                (id, storage.init_slot(id, input))
             }
         }
-
-        let (id, slot) = storage.allocate_slot(input);
-
-        shard.insert(hash, id, |key| {
-            // SAFETY: all IDs in the cache are valid
-            let slot = unsafe { storage.get_slot_unchecked(*key) };
-            self.entries.hash(slot.input())
-        });
-
-        (id, slot)
     }
 
     fn get_mut<'a>(
@@ -98,25 +64,15 @@ where
         input: &<Q as Query>::Input,
         storage: &'a mut QueryStorage<Q>,
     ) -> Option<(Id, &'a mut QuerySlot<Q>)> {
-        let eq_fn = Self::eq_fn(input, storage);
-        let hash = self.entries.hash(&input);
+        let hash = fxhash::hash64(input);
+        let index = self.entries.get(hash, |index| unsafe {
+            storage
+                .get_slot_unchecked(Id::try_from_usize(index as usize).unwrap())
+                .input_unchecked()
+                == input
+        })?;
 
-        let shard = self.entries.shard_mut(hash).get_mut();
-        let id = *shard.get(hash, eq_fn)?;
-
-        Some((id, storage.slot_mut(id)))
-    }
-
-    fn remove<'a>(
-        &mut self,
-        input: &Q::Input,
-        storage: &'a mut QueryStorage<Q>,
-    ) -> Option<(Id, &'a mut QuerySlot<Q>)> {
-        let eq_fn = Self::eq_fn(input, storage);
-        let hash = self.entries.hash(&input);
-
-        let shard = self.entries.shard_mut(hash).get_mut();
-        let id = shard.remove_entry(hash, eq_fn)?;
+        let id = Id::try_from_usize(index as usize).unwrap();
 
         Some((id, storage.slot_mut(id)))
     }
@@ -148,13 +104,5 @@ where
         let id = input.id();
         let slot = storage.try_get_slot_mut(id)?;
         Some((id, slot))
-    }
-
-    fn remove<'a>(
-        &mut self,
-        input: &Q::Input,
-        storage: &'a mut QueryStorage<Q>,
-    ) -> Option<(Id, &'a mut QuerySlot<Q>)> {
-        self.get_mut(input, storage)
     }
 }

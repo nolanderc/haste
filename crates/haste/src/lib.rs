@@ -429,21 +429,6 @@ pub trait DatabaseExt: Database {
         cache.set(runtime, input, output, durability);
     }
 
-    /// Clear the value of an input.
-    fn remove<'db, Q>(&'db mut self, input: Q::Input)
-    where
-        Q: Input,
-        Q::Storage: 'static,
-        Q::Container: QueryCache<Query = Q> + 'db,
-        Self: WithStorage<Q::Storage>,
-    {
-        assert!(Q::IS_INPUT, "input queries must have `IS_INPUT == true`");
-
-        let (storage, runtime) = self.storage_mut();
-        let cache = storage.container_mut();
-        cache.remove(runtime, &input);
-    }
-
     /// Mark the query as invalid, forcing it to be re-evaluated in the next revision.
     fn invalidate<'db, Q>(&'db mut self, input: Q::Input)
     where

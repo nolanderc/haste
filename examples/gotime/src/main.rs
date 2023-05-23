@@ -1,4 +1,4 @@
-#![feature(type_alias_impl_trait)]
+#![feature(type_alias_impl_trait, impl_trait_in_assoc_type)]
 #![feature(trivial_bounds)]
 #![allow(clippy::manual_is_ascii_check)]
 #![allow(clippy::useless_format)]
@@ -18,7 +18,7 @@ use dashmap::DashSet;
 pub use diagnostic::{Diagnostic, Result};
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use haste::util::CallOnDrop;
-use haste::{Database as _, Durability};
+use haste::{Database as _, Durability, IngredientPath};
 use index_map::IndexMap;
 use naming::DeclName;
 use notify::Watcher;
@@ -270,8 +270,7 @@ fn main() {
     haste::enable_metrics(arguments.metrics);
 
     if let Some(path) = &arguments.script {
-        let mut db = std::mem::ManuallyDrop::new(Database::new());
-        run_script(&mut db, &arguments, path)
+        run_script(&arguments, path)
     } else if arguments.repeat {
         loop {
             let mut db = Database::new();
@@ -391,7 +390,7 @@ fn watch_loop(db: &mut Database, arguments: &Arguments) {
     }
 }
 
-fn run_script(db: &mut Database, arguments: &Arguments, path: &Path) {
+fn run_script(arguments: &Arguments, path: &Path) {
     #[derive(serde::Deserialize)]
     struct Script {
         steps: Vec<Step>,
@@ -400,15 +399,10 @@ fn run_script(db: &mut Database, arguments: &Arguments, path: &Path) {
     #[derive(serde::Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum Step {
-        Run,
+        Run { note: String },
         Replace { path: PathBuf, with: PathBuf },
         Append { path: PathBuf, text: String },
-    }
-
-    #[derive(serde::Serialize)]
-    struct Results {
-        seconds: Vec<f64>,
-        errors: Vec<bool>,
+        Restore { path: PathBuf },
     }
 
     fn read_file(path: &Path) -> Vec<u8> {
@@ -441,56 +435,99 @@ fn run_script(db: &mut Database, arguments: &Arguments, path: &Path) {
     let script_text = read_file(path);
     let script: Script = serde_json::from_slice(&script_text).expect("could not parse script");
 
+    #[derive(serde::Serialize)]
+    struct Results {
+        seconds: Vec<Vec<f64>>,
+        errors: Vec<bool>,
+        notes: Vec<String>,
+    }
+
     let mut results = Results {
         seconds: Vec::new(),
         errors: Vec::new(),
+        notes: Vec::new(),
     };
 
     let dir = path.parent().unwrap();
 
-    for step in script.steps {
-        match step {
-            Step::Run => haste::scope(db, |scope, db| {
-                let process = cpu_time::ProcessTime::now();
-                let start = std::time::Instant::now();
+    {
+        // warmup run
+        let mut db = Database::new();
+        haste::scope(&mut db, |scope, db| {
+            _ = scope.block_on(compile(db, arguments.config.clone()));
+        });
+    }
 
-                let result = scope.block_on(compile(db, arguments.config.clone()));
-                let duration = start.elapsed();
-                results.seconds.push(duration.as_secs_f64());
-                results.errors.push(result.is_err());
+    for iteration in 0..10 {
+        let mut db = Database::new();
+        let db = &mut db;
 
-                if let Err(diagnostic) = result {
-                    let mut string = String::with_capacity(4096);
-                    scope.block_on(diagnostic.write(db, &mut string)).unwrap();
-                    BufWriter::new(std::io::stderr().lock())
-                        .write_all(string.as_bytes())
-                        .unwrap();
+        let mut runs = 0;
+
+        eprintln!("iteration {iteration}");
+
+        for step in script.steps.iter() {
+            match step {
+                Step::Run { note } => haste::scope(db, |scope, db| {
+                    let process = cpu_time::ProcessTime::now();
+                    let start = std::time::Instant::now();
+
+                    let result = scope.block_on(compile(db, arguments.config.clone()));
+                    let duration = start.elapsed();
+
+                    if runs >= results.seconds.len() {
+                        results.seconds.push(Vec::new());
+                        results.errors.push(result.is_err());
+                        results.notes.push(note.clone());
+                    }
+
+                    results.seconds[runs].push(duration.as_secs_f64());
+
+                    if let Err(diagnostic) = result {
+                        let mut string = String::with_capacity(4096);
+                        scope.block_on(diagnostic.write(db, &mut string)).unwrap();
+                        BufWriter::new(std::io::stderr().lock())
+                            .write_all(string.as_bytes())
+                            .unwrap();
+                    }
+                    eprintln!("real: {duration:?} (cpu: {:?})", process.elapsed());
+
+                    runs += 1;
+                }),
+                Step::Replace { path, with } => {
+                    let path = make_normal(db, path);
+                    let new_text = read_file(&dir.join(with));
+                    let durability = db.path_durability_untracked(path);
+                    fs::read::set(db, path, Ok(new_text.into()), durability);
                 }
-                eprintln!("real: {duration:?} (cpu: {:?})", process.elapsed());
-            }),
-            Step::Replace { path, with } => {
-                let path = make_normal(db, &path);
-                let new_text = read_file(&dir.join(with));
-                let durability = db.path_durability_untracked(path);
-                fs::read::set(db, path, Ok(new_text.into()), durability);
-            }
-            Step::Append { path, text } => {
-                let path = make_normal(db, &path);
-                let old_text = haste::scope(db, |scope, db| {
-                    scope.block_on(fs::read(db, path)).clone().unwrap()
-                });
-                let mut new_text = Vec::with_capacity(old_text.len() + text.len());
-                new_text.extend_from_slice(&old_text);
-                new_text.extend_from_slice(text.as_bytes());
-                let durability = db.path_durability_untracked(path);
-                fs::read::set(db, path, Ok(new_text.into()), durability);
+                Step::Append { path, text } => {
+                    let path = make_normal(db, path);
+                    let old_text = haste::scope(db, |scope, db| {
+                        scope.block_on(fs::read(db, path)).clone().unwrap()
+                    });
+                    let mut new_text = Vec::with_capacity(old_text.len() + text.len());
+                    new_text.extend_from_slice(&old_text);
+                    new_text.extend_from_slice(text.as_bytes());
+                    let durability = db.path_durability_untracked(path);
+                    fs::read::set(db, path, Ok(new_text.into()), durability);
+                }
+                Step::Restore { path } => {
+                    let path = make_normal(db, path);
+                    fs::read::invalidate(db, path);
+                }
             }
         }
     }
 
+    let sample_name = arguments.config.package[0]
+        .file_stem()
+        .unwrap()
+        .to_string_lossy();
+    let script_name = path.file_stem().unwrap().to_string_lossy();
+
     let mut result_path = dir.join("results");
     std::fs::create_dir_all(&result_path).expect("could not create results directory");
-    result_path.push(path.file_name().unwrap());
+    result_path.push(format!("{sample_name}-{script_name}.json"));
     std::fs::write(&result_path, serde_json::to_vec_pretty(&results).unwrap())
         .expect("could not write results");
 }
@@ -530,7 +567,7 @@ fn run(db: &mut Database, arguments: &Arguments) {
         if arguments.critical_path {
             let root = scope.block_on(compile::dependency(db, arguments.config.clone()));
             let graph = DependencyGraph::collect(db, root);
-            graph.critical_path(db);
+            graph.parallel_critical_path(db, root.ingredient());
         }
     });
 
@@ -664,6 +701,126 @@ impl<'db> DependencyGraph<'db> {
                 crate::util::display_fn(|f| db.fmt_index(node.ingredient(), f))
             );
         }
+    }
+
+    fn parallel_critical_path(&self, db: &Database, root: IngredientPath) {
+        use std::collections::BinaryHeap;
+        use std::time::Duration;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct QueueItem {
+            time: Duration,
+            node: IngredientPath,
+        }
+
+        impl PartialOrd for QueueItem {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                other.time.partial_cmp(&self.time)
+            }
+        }
+
+        impl Ord for QueueItem {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.time.cmp(&self.time)
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct Progress {
+            next_dependency: usize,
+            blocked: usize,
+            time: Duration,
+        }
+
+        #[derive(Debug)]
+        struct Node<'a> {
+            dependencies: &'a [haste::Dependency],
+            processing_time: Duration,
+        }
+
+        let mut nodes = HashMap::<IngredientPath, Node>::default();
+
+        for (source, dependencies) in self.edges.iter() {
+            let source = source.ingredient();
+            nodes.insert(
+                source,
+                Node {
+                    dependencies,
+                    processing_time: Duration::from_nanos(db.get_info(source).unwrap().poll_nanos),
+                },
+            );
+        }
+
+        let mut start = HashMap::<IngredientPath, Duration>::default();
+        let mut progress = HashMap::<IngredientPath, Progress>::default();
+        let mut waiting = HashMap::<IngredientPath, Vec<IngredientPath>>::default();
+        let mut queue = BinaryHeap::<QueueItem>::new();
+
+        queue.push(QueueItem {
+            time: Duration::ZERO,
+            node: root,
+        });
+
+        while let Some(item) = queue.pop() {
+            let p = progress.entry(item.node).or_insert_with(Progress::default);
+            let node = &nodes[&item.node];
+
+            'outer: while p.next_dependency < node.dependencies.len() {
+                let group = node.dependencies[p.next_dependency].group();
+                while p.next_dependency < node.dependencies.len()
+                    && node.dependencies[p.next_dependency].group() == group
+                {
+                    let dependency = node.dependencies[p.next_dependency];
+                    let node = dependency.ingredient();
+
+                    match start.entry(node) {
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            if let Some(waiting) = waiting.get_mut(&node) {
+                                waiting.push(item.node);
+                                p.blocked += 1;
+                            } else {
+                                p.next_dependency += 1;
+                                continue 'outer;
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(item.time);
+                            queue.push(QueueItem {
+                                time: item.time,
+                                node,
+                            });
+                            waiting.insert(node, vec![item.node]);
+                            p.blocked += 1;
+                        }
+                    }
+
+                    p.next_dependency += 1;
+                }
+
+                break;
+            }
+
+            if p.next_dependency == node.dependencies.len() && p.blocked == 0 {
+                let end_time = item.time + node.processing_time;
+                p.time = end_time;
+                if let Some(parents) = waiting.remove(&item.node) {
+                    for parent in parents {
+                        let parent_progress = progress.get_mut(&parent).unwrap();
+                        parent_progress.blocked -= 1;
+                        parent_progress.time = std::cmp::max(parent_progress.time, end_time);
+                        if parent_progress.blocked == 0 {
+                            queue.push(QueueItem {
+                                time: parent_progress.time,
+                                node: parent,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let time = &progress[&root].time;
+        eprintln!("critical path: {time:?}");
     }
 
     fn save(&self, db: &Database, path: &Path) -> std::io::Result<()> {

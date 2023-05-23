@@ -149,6 +149,10 @@ impl Dependency {
             resource: self.resource,
         }
     }
+
+    pub fn group(self) -> Option<u16> {
+        Some(self.group_index?.raw.get())
+    }
 }
 
 /// All data required to execute a task

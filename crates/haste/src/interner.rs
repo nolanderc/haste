@@ -1,7 +1,7 @@
 use crate::{
     arena::{Arena, RawArena},
     integer::NonMaxU32,
-    shard_map::ShardMap,
+    shard_map::ShardLookup,
     Change, ContainerPath, LastChangeFuture,
 };
 
@@ -10,7 +10,7 @@ use std::hash::Hash;
 pub struct ArenaInterner<T> {
     path: ContainerPath,
     values: Arena<T>,
-    entries: ShardMap<NonMaxU32>,
+    entries: ShardLookup,
 }
 
 impl<T: Send + Sync + 'static> crate::StaticContainer for ArenaInterner<T> {
@@ -18,7 +18,7 @@ impl<T: Send + Sync + 'static> crate::StaticContainer for ArenaInterner<T> {
         Self {
             path,
             values: Arena::new(),
-            entries: ShardMap::new(),
+            entries: ShardLookup::default(),
         }
     }
 }
@@ -69,20 +69,6 @@ where
 }
 
 impl<T> ArenaInterner<T> {
-    fn eq_fn<'a>(&'a self, value: &'a T) -> impl Fn(&NonMaxU32) -> bool + 'a
-    where
-        T: Eq,
-    {
-        move |entry| self.get(*entry).unwrap() == value
-    }
-
-    fn hash_fn(&self) -> impl Fn(&NonMaxU32) -> u64 + '_
-    where
-        T: Hash,
-    {
-        move |entry| self.entries.hash(self.get(*entry).unwrap())
-    }
-
     /// Get a value in the interner.
     ///
     /// Returns `None` if the index has not previously been returned by [`Self::intern`].
@@ -95,31 +81,22 @@ impl<T> ArenaInterner<T> {
     where
         T: Hash + Eq,
     {
-        let hash = self.entries.hash(&value);
-        let shard = self.entries.shard(hash);
+        let hash = fxhash::hash64(&value);
+        let result = self.entries.get_or_insert(
+            hash,
+            |index| self.values.get(index as usize).unwrap() == &value,
+            |index| fxhash::hash64(self.values.get(index as usize).unwrap()),
+        );
 
-        // check if the value already exists in the interner
-        let table = shard.read();
-        if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-            return *old;
-        }
-
-        let len_before = table.len();
-        drop(table);
-        let mut table = shard.write();
-        let len_after = table.len();
-
-        if len_before != len_after {
-            if let Some(old) = table.get(hash, self.eq_fn(&value)) {
-                return *old;
+        let index = match result {
+            crate::shard_map::ShardResult::Cached(index) => index,
+            crate::shard_map::ShardResult::Insert(index, _write_guard) => {
+                unsafe { self.values.write_unique(index as usize, value) };
+                index
             }
-        }
+        };
 
-        // add the value into the interner, returing its key
-        let index = self.values.push(value);
-        let key = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
-        table.insert_entry(hash, key, self.hash_fn());
-        key
+        NonMaxU32::new(index).unwrap()
     }
 }
 
@@ -127,7 +104,7 @@ pub struct StringInterner {
     path: ContainerPath,
     bytes: RawArena<u8>,
     ranges: Arena<StringRange>,
-    entries: ShardMap<NonMaxU32>,
+    entries: ShardLookup,
 }
 
 unsafe impl Sync for StringInterner {}
@@ -225,7 +202,7 @@ impl crate::StaticContainer for StringInterner {
             path,
             bytes: RawArena::new(),
             ranges: Arena::new(),
-            entries: ShardMap::new(),
+            entries: ShardLookup::default(),
         }
     }
 }
@@ -236,7 +213,7 @@ impl<DB: ?Sized> crate::Container<DB> for StringInterner {
     }
 
     fn fmt(&self, id: crate::Id, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.get(id.raw).unwrap())
+        write!(f, "{:?}", self.get(id.raw.get()).unwrap())
     }
 
     fn last_change(&self, _db: &DB, _dep: crate::Dependency) -> LastChangeFuture {
@@ -268,7 +245,7 @@ impl crate::ElementContainer for StringInterner {
     }
 
     fn get_untracked(&self, id: crate::Id) -> Self::Ref<'_> {
-        self.get(id.raw).unwrap()
+        self.get(id.raw.get()).unwrap()
     }
 }
 
@@ -279,8 +256,8 @@ impl crate::ElementContainerRef for StringInterner {
 }
 
 impl StringInterner {
-    fn get(&self, raw: NonMaxU32) -> Option<&str> {
-        let range = self.ranges.get(raw.get() as usize)?;
+    fn get(&self, index: u32) -> Option<&str> {
+        let range = self.ranges.get(index as usize)?;
         if let Some(inline) = range.get_inline() {
             return Some(inline);
         }
@@ -302,33 +279,23 @@ impl StringInterner {
             "string exceeds maximum length"
         );
 
-        let hash = self.entries.hash(string);
-        let shard = self.entries.shard(hash);
+        let hash = fxhash::hash64(string);
+        let result = self.entries.get_or_insert(
+            hash,
+            |index| self.get(index).unwrap() == string,
+            |index| fxhash::hash64(self.get(index).unwrap()),
+        );
 
-        // check if the value already exists in the interner
-        let table = shard.read();
-        if let Some(old) = table.get(hash, self.eq_fn(string)) {
-            return *old;
-        }
-
-        let len_before = table.len();
-        drop(table);
-
-        let mut table = shard.write();
-        let len_after = table.len();
-
-        if len_before != len_after {
-            if let Some(old) = table.get(hash, self.eq_fn(string)) {
-                return *old;
+        let index = match result {
+            crate::shard_map::ShardResult::Cached(index) => index,
+            crate::shard_map::ShardResult::Insert(index, _write_guard) => {
+                let range = self.allocate_range(string);
+                unsafe { self.ranges.write_unique(index as usize, range) };
+                index
             }
-        }
+        };
 
-        // add the value into the interner, returing its ID
-        let range = self.allocate_range(string);
-        let index = self.ranges.push(range);
-        let id = NonMaxU32::new(index.try_into().unwrap()).expect("interner memory");
-        table.insert_entry(hash, id, self.hash_fn());
-        id
+        NonMaxU32::new(index).unwrap()
     }
 
     fn allocate_range(&self, string: &str) -> StringRange {
@@ -348,13 +315,5 @@ impl StringInterner {
                 StringRange::heap(offset as u32, string.len() as u32)
             }
         }
-    }
-
-    fn eq_fn<'a>(&'a self, value: &'a str) -> impl Fn(&NonMaxU32) -> bool + 'a {
-        move |entry| self.get(*entry) == Some(value)
-    }
-
-    fn hash_fn(&self) -> impl Fn(&NonMaxU32) -> u64 + '_ {
-        move |entry| self.entries.hash(self.get(*entry).unwrap())
     }
 }

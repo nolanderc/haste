@@ -49,10 +49,6 @@ pub trait QueryCache: DynQueryCache {
         durability: Durability,
     ) where
         Self::Query: crate::Input;
-
-    fn remove(&mut self, runtime: &mut Runtime, input: &<Self::Query as Query>::Input)
-    where
-        Self::Query: crate::Input;
 }
 
 pub trait DynQueryCache {
@@ -210,15 +206,6 @@ where
         }
 
         slot.set_output(output, durability, runtime);
-    }
-
-    fn remove(&mut self, runtime: &mut Runtime, input: &Q::Input)
-    where
-        Self::Query: crate::Input,
-    {
-        if let Some((_, slot)) = self.lookup.get_mut(input, &mut self.storage) {
-            slot.remove_output(runtime);
-        }
     }
 }
 

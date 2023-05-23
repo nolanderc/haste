@@ -1,12 +1,13 @@
 use std::sync::{
     atomic::{AtomicU64, Ordering::Relaxed},
-    Mutex, MutexGuard,
+    RwLock, RwLockWriteGuard,
 };
 
+use crossbeam_utils::CachePadded;
 use hashbrown::raw::RawTable;
 
 pub struct ShardLookup {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<CachePadded<RwLock<Shard>>>,
     indices: IndexAllocator,
 }
 
@@ -42,7 +43,7 @@ impl Default for ShardLookup {
         let shard_count = (4 * thread_count).next_power_of_two();
 
         let mut shards = Vec::new();
-        shards.resize_with(shard_count, || Mutex::new(Shard::new()));
+        shards.resize_with(shard_count, || CachePadded::new(RwLock::new(Shard::new())));
 
         Self {
             shards,
@@ -78,11 +79,22 @@ impl ShardLookup {
     ) -> ShardResult {
         let shards = &self.shards;
 
-        let shard = &shards[shard_index(hash, shards.len())];
-        let mut shard = shard.lock().unwrap();
+        let shard_handle = &shards[shard_index(hash, shards.len())];
 
+        let shard = shard_handle.read().unwrap();
         if let Some(&old) = shard.entries.get(hash, |index| eq(*index)) {
             return ShardResult::Cached(old);
+        }
+
+        let len_before = shard.entries.len();
+        drop(shard);
+        let mut shard = shard_handle.write().unwrap();
+        let len_after = shard.entries.len();
+
+        if len_before != len_after {
+            if let Some(&old) = shard.entries.get(hash, |index| eq(*index)) {
+                return ShardResult::Cached(old);
+            }
         }
 
         let index = if let Some(index) = shard.reserved.next() {
@@ -103,7 +115,7 @@ pub enum ShardResult<'a> {
     Insert(u32, WriteGuard<'a>),
 }
 
-pub struct WriteGuard<'a>(MutexGuard<'a, Shard>);
+pub struct WriteGuard<'a>(RwLockWriteGuard<'a, Shard>);
 
 fn shard_index(hash: u64, shard_count: usize) -> usize {
     let shard_bits = shard_count.trailing_zeros();

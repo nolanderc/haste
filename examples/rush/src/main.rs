@@ -29,7 +29,7 @@ fn main() {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
-                    db.storage.runtime().drive();
+                    db.storage.runtime().drive(threads);
                 });
             }
             binom(db, n, n / 2);

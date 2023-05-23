@@ -8,7 +8,7 @@ use std::{
     ptr::NonNull,
     sync::{
         atomic::{
-            AtomicBool, AtomicU64,
+            AtomicBool, AtomicU64, AtomicUsize,
             Ordering::{Acquire, Relaxed},
         },
         Arc, Mutex,
@@ -37,7 +37,7 @@ use self::{
 };
 
 /// Smallest stack size to allocate for queries (in bytes).
-const MIN_STACK: usize = 16 * 1024;
+const MIN_STACK: usize = 512 * 1024;
 
 pub struct Runtime {
     stack_ids: StackIdAllocator,
@@ -52,6 +52,7 @@ pub struct Runtime {
     tasks: DashMap<ElementPath, Task>,
     workers: ArcSwap<WorkerState>,
     suspended: DashMap<ElementPath, SuspendState>,
+    suspended_count: AtomicUsize,
 }
 
 unsafe impl Send for Runtime {}
@@ -61,7 +62,7 @@ impl Runtime {
     pub(crate) fn new() -> Self {
         Self {
             stack_ids: StackIdAllocator::new(),
-            cycles: CycleGraph::default(),
+            cycles: CycleGraph::new(),
             history: History::new(),
             running: AtomicBool::new(false),
             thread_scope: None,
@@ -69,6 +70,7 @@ impl Runtime {
             tasks: DashMap::with_capacity(1024),
             workers: Default::default(),
             suspended: DashMap::with_capacity(1024),
+            suspended_count: AtomicUsize::new(0),
         }
     }
 
@@ -278,9 +280,11 @@ impl Runtime {
 
         let args = slot.arguments_unchecked();
 
+        let min_stack_size = (2 * coro::current_stack_size().unwrap_or(0)).max(MIN_STACK);
+
         let output = coro::maybe_grow(
             usize::max(Q::REQUIRED_STACK, 8 * 1024),
-            usize::max(Q::REQUIRED_STACK, MIN_STACK),
+            usize::max(Q::REQUIRED_STACK, min_stack_size),
             || Q::execute(db, args.clone()),
         );
 
@@ -386,7 +390,7 @@ impl Runtime {
         index
     }
 
-    pub fn drive(&self) {
+    pub fn drive(&self, thread_count: usize) {
         assert!(self.thread_scope.is_some(), "not within a thread scope");
         YIELDER.with(|y| {
             assert!(y.get().is_none(), "cannot nest thread scope");
@@ -409,17 +413,24 @@ impl Runtime {
         while self.running.load(Relaxed) {
             if let Some(stack) = next_suspended.take().or_else(|| receiver.try_recv().ok()) {
                 if let Some(task) = suspended.remove(&stack) {
+                    self.suspended_count.fetch_sub(1, Relaxed);
                     self.poll_task(task, &mut suspended);
                 }
                 continue;
             }
 
-            if let Some(query) = self.next_query(&worker) {
-                if let Some((_, task)) = self.tasks.remove(&query) {
-                    let task = self.create_task(task, index);
-                    self.poll_task(task, &mut suspended);
+            let total_suspended = self.suspended_count.load(Relaxed);
+            if total_suspended < 4096
+                && (suspended.len() < 32
+                    || suspended.len() <= 2 * (total_suspended + thread_count - 1) / thread_count)
+            {
+                if let Some(query) = self.next_query(&worker) {
+                    if let Some((_, task)) = self.tasks.remove(&query) {
+                        let task = self.create_task(task, index);
+                        self.poll_task(task, &mut suspended);
+                    }
+                    continue;
                 }
-                continue;
             }
 
             blocked.store(true, Relaxed);
@@ -454,6 +465,7 @@ impl Runtime {
             std::ops::ControlFlow::Break(()) => {}
             std::ops::ControlFlow::Continue(stack) => {
                 suspended.insert(stack, task);
+                self.suspended_count.fetch_add(1, Relaxed);
             }
         }
     }

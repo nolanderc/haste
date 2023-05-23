@@ -474,7 +474,7 @@ fn run(db: &mut Database, arguments: &Arguments) {
     haste::scope(db, |db| {
         let result = std::thread::scope(|scope| {
             for _ in 0..arguments.workers {
-                scope.spawn(|| db.storage.runtime().drive());
+                scope.spawn(|| db.storage.runtime().drive(arguments.workers));
             }
             let result = compile(db, arguments.config.clone());
             db.storage.runtime().stop();

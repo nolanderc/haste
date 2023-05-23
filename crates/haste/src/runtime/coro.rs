@@ -1,9 +1,11 @@
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::ControlFlow,
     panic::AssertUnwindSafe,
+    sync::Mutex,
 };
 
 use context::{
@@ -13,9 +15,11 @@ use context::{
 
 use crate::util::CallOnDrop;
 
+static RECYCLED_STACKS: Mutex<BTreeMap<usize, ProtectedFixedSizeStack>> =
+    Mutex::new(BTreeMap::new());
+
 pub struct Coroutine<Output, Yield = ()> {
-    #[allow(dead_code)]
-    stack: ProtectedFixedSizeStack,
+    stack: ManuallyDrop<ProtectedFixedSizeStack>,
     context: Option<Context>,
     _phantom: PhantomData<(*const Output, *const Yield)>,
 }
@@ -25,7 +29,16 @@ impl<Output, Yield> Coroutine<Output, Yield> {
     where
         F: FnOnce(&mut Yielder<Output, Yield>) -> Output,
     {
-        let stack = ProtectedFixedSizeStack::new(usize::max(size, 4 * 4096))?;
+        let mut stacks = RECYCLED_STACKS.lock().unwrap();
+        let stack = if let Some((&found_size, _)) = stacks.range(size..).next() {
+            let stack = stacks.remove(&found_size).unwrap();
+            drop(stacks);
+            stack
+        } else {
+            drop(stacks);
+            ProtectedFixedSizeStack::new(usize::max(size, 4 * 4096))?
+        };
+
         Ok(Self::with_stack(stack, move |yielder| {
             let output = f(yielder);
             yielder.finish(output)
@@ -43,7 +56,7 @@ impl<Output, Yield> Coroutine<Output, Yield> {
         let transfer = unsafe { context.resume(f.as_ptr() as usize) };
 
         Self {
-            stack,
+            stack: ManuallyDrop::new(stack),
             context: Some(transfer.context),
             _phantom: PhantomData,
         }
@@ -132,6 +145,11 @@ impl<Output, Yield> Drop for Coroutine<Output, Yield> {
     fn drop(&mut self) {
         if let Some(context) = self.context.take() {
             unsafe { context.resume(CANCEL) };
+        }
+
+        let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
+        if let Ok(mut stacks) = RECYCLED_STACKS.lock() {
+            stacks.insert(stack.len(), stack);
         }
     }
 }
@@ -260,6 +278,10 @@ pub fn remaining_stack() -> Option<usize> {
     } else {
         stacker::remaining_stack()
     }
+}
+
+pub fn current_stack_size() -> Option<usize> {
+    STACK.with(|s| s.get()).map(|s| s.top - s.bottom)
 }
 
 thread_local! {

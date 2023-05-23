@@ -4,7 +4,6 @@ use crate::ElementPath;
 
 use super::{ActiveStack, StackId};
 
-#[derive(Default)]
 pub(super) struct CycleGraph {
     // For each stack, the stack it is blocked on.
     blocks: DashMap<StackId, Block>,
@@ -16,6 +15,12 @@ pub(super) struct Block {
 }
 
 impl CycleGraph {
+    pub fn new() -> Self {
+        Self {
+            blocks: DashMap::new(),
+        }
+    }
+
     pub fn insert(&self, block: Block) -> Option<Cycle> {
         let source = block.stack.id;
         let blocked_on = block.blocked_on;
